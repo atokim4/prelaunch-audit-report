@@ -1,0 +1,116 @@
+[
+  {
+    "url": "https://example.com/",
+    "finalUrl": "https://example.com/",
+    "auditedAt": "2026-11-09T01:57:07.540Z",
+    "score": 64,
+    "grade": "D",
+    "counts": {
+      "critical": 0,
+      "high": 0,
+      "medium": 4,
+      "low": 6,
+      "info": 0
+    },
+    "stack": {
+      "frameworks": [],
+      "hosting": [
+        "Cloudflare"
+      ]
+    },
+    "metrics": {
+      "ttfbMs": 47,
+      "htmlBytes": 577,
+      "htmlTransferBytes": 334,
+      "redirects": 0,
+      "scriptsReferenced": 1,
+      "stylesheetsReferenced": 0,
+      "imagesReferenced": 0,
+      "scriptsScanned": 1,
+      "jsBytes": 1963,
+      "jsTransferBytes": 1379
+    },
+    "findings": [
+      {
+        "id": "transport.no-http-redirect",
+        "category": "transport",
+        "severity": "medium",
+        "title": "http:// does not redirect to https://",
+        "detail": "http://example.com/ answered 200 instead of redirecting to HTTPS.",
+        "fix": "Add a permanent (301/308) redirect from http:// to https:// at the host or CDN."
+      },
+      {
+        "id": "transport.hsts-missing",
+        "category": "transport",
+        "severity": "medium",
+        "title": "No Strict-Transport-Security header",
+        "detail": "Without HSTS a first visit over http:// can be intercepted before the redirect.",
+        "fix": "Send `Strict-Transport-Security: max-age=31536000; includeSubDomains` on HTTPS responses."
+      },
+      {
+        "id": "headers.csp-missing",
+        "category": "headers",
+        "severity": "medium",
+        "title": "No Content-Security-Policy",
+        "detail": "A CSP limits what an injected script can load or send, and is the main defence-in-depth against XSS.",
+        "fix": "Start with `Content-Security-Policy: default-src 'self'; frame-ancestors 'self'` plus the API/CDN origins the app needs, test with Content-Security-Policy-Report-Only first."
+      },
+      {
+        "id": "headers.clickjacking",
+        "category": "headers",
+        "severity": "medium",
+        "title": "Page can be framed by any site (clickjacking)",
+        "detail": "Neither X-Frame-Options nor CSP frame-ancestors is set.",
+        "fix": "Send `X-Frame-Options: DENY` (or SAMEORIGIN) or add `frame-ancestors 'self'` to the CSP."
+      },
+      {
+        "id": "headers.nosniff-missing",
+        "category": "headers",
+        "severity": "low",
+        "title": "X-Content-Type-Options: nosniff is missing",
+        "detail": "Browsers may MIME-sniff uploads or API responses into executable content.",
+        "fix": "Send `X-Content-Type-Options: nosniff` on every response."
+      },
+      {
+        "id": "headers.referrer-policy-missing",
+        "category": "headers",
+        "severity": "low",
+        "title": "No Referrer-Policy",
+        "detail": "Full URLs (including tokens in query strings) can leak to third-party sites via the Referer header.",
+        "fix": "Send `Referrer-Policy: strict-origin-when-cross-origin`."
+      },
+      {
+        "id": "headers.permissions-policy-missing",
+        "category": "headers",
+        "severity": "low",
+        "title": "No Permissions-Policy",
+        "detail": "Embedded third-party code can request camera, microphone or geolocation.",
+        "fix": "Send e.g. `Permissions-Policy: camera=(), microphone=(), geolocation=()` and allow only what the app uses."
+      },
+      {
+        "id": "seo.robots-missing",
+        "category": "seo",
+        "severity": "low",
+        "title": "No robots.txt",
+        "detail": "https://example.com/robots.txt returned an HTML page (app fallback).",
+        "fix": "Add a robots.txt that allows crawling and points to the sitemap (`Sitemap: https://…/sitemap.xml`)."
+      },
+      {
+        "id": "seo.sitemap-missing",
+        "category": "seo",
+        "severity": "low",
+        "title": "No sitemap found",
+        "detail": "Checked https://example.com/sitemap.xml.",
+        "fix": "Generate a sitemap.xml (next-sitemap, @nuxtjs/sitemap, vite-plugin-sitemap) and list it in robots.txt."
+      },
+      {
+        "id": "seo.description-missing",
+        "category": "seo",
+        "severity": "low",
+        "title": "Missing meta description",
+        "detail": "Search engines will pick a random text snippet.",
+        "fix": "Add `<meta name=\"description\" content=\"…\">` (120-160 characters)."
+      }
+    ]
+  }
+]

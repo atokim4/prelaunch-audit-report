@@ -1,0 +1,4 @@
+project_id = "broken-notes-app"
+
+[api]
+schemas = ["public"]

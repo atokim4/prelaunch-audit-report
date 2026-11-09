@@ -1,0 +1,12 @@
+diff --git a/app/admin/users-table.tsx b/app/admin/users-table.tsx
+--- a/app/admin/users-table.tsx
++++ b/app/admin/users-table.tsx
+@@ -3,7 +3,7 @@
+ import { useEffect, useState } from "react";
+ import { createClient } from "@supabase/supabase-js";
+ 
+-const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
++const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!);
+ 
+ type Profile = { id: string; display_name: string | null; plan: string };
+ 

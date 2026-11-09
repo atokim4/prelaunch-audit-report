@@ -1,0 +1,8 @@
+node_modules
+vendor
+test/fixtures
+examples
+out
+package-lock.json
+media/*.png
+examples/**/report.html

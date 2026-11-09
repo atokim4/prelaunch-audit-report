@@ -1,0 +1,145 @@
+{
+  "$comment": "Ground truth for target/. Holes are seeded on purpose; controls are done correctly and are there to catch false positives. Paths are relative to target/.",
+  "holes": [
+    {
+      "id": "H01",
+      "kind": "rls-disabled",
+      "surface": "database",
+      "target": { "object": "public.audit_log", "file": "supabase/migrations/20261101000700_audit_log.sql" },
+      "summary": "public.audit_log has RLS off, so anyone with the anon key can read and write it."
+    },
+    {
+      "id": "H02",
+      "kind": "rls-no-policy",
+      "surface": "database",
+      "target": { "object": "public.feature_flags", "file": "supabase/migrations/20261101000800_feature_flags.sql" },
+      "summary": "public.feature_flags has RLS on and no policies: deny-all for the API, so the client's flag read silently returns nothing."
+    },
+    {
+      "id": "H03",
+      "kind": "permissive-policy",
+      "surface": "database",
+      "target": { "object": "public.messages", "file": "supabase/migrations/20261101000600_messages.sql" },
+      "summary": "public.messages has a select policy using (true): every direct message is readable by anyone, signed in or not."
+    },
+    {
+      "id": "H04",
+      "kind": "update-policy-too-broad",
+      "surface": "database",
+      "target": { "object": "public.profiles", "file": "supabase/migrations/20261101000100_profiles.sql" },
+      "summary": "public.profiles update policy has no WITH CHECK and no column limit, so a user can set their own plan to 'pro' without paying."
+    },
+    {
+      "id": "H05",
+      "kind": "definer-search-path",
+      "surface": "database",
+      "target": {
+        "object": "public.get_message_stats",
+        "file": "supabase/migrations/20261101000900_message_stats.sql"
+      },
+      "summary": "public.get_message_stats() is SECURITY DEFINER with no fixed search_path."
+    },
+    {
+      "id": "H06",
+      "kind": "view-bypasses-rls",
+      "surface": "database",
+      "target": { "object": "public.recent_notes", "file": "supabase/migrations/20261101000500_recent_notes.sql" },
+      "summary": "public.recent_notes is a view over the private notes table without security_invoker, so it returns every user's note titles."
+    },
+    {
+      "id": "H07",
+      "kind": "public-bucket",
+      "surface": "database",
+      "target": {
+        "object": "storage.buckets/invoices",
+        "file": "supabase/migrations/20261101001200_invoices_bucket.sql"
+      },
+      "summary": "The invoices storage bucket is public and has a select policy that lets anyone list every invoice."
+    },
+    {
+      "id": "H08",
+      "kind": "server-secret-in-client",
+      "surface": "code",
+      "target": { "file": "app/admin/users-table.tsx" },
+      "summary": "A \"use client\" component builds a Supabase client with SUPABASE_SERVICE_ROLE_KEY."
+    },
+    {
+      "id": "H09",
+      "kind": "public-env-secret",
+      "surface": "code",
+      "target": { "file": "lib/stripe.ts" },
+      "summary": "The Stripe secret key is read from NEXT_PUBLIC_STRIPE_SECRET_KEY, which Next.js inlines into the browser bundle."
+    },
+    {
+      "id": "H10",
+      "kind": "webhook-unverified",
+      "surface": "code",
+      "target": { "file": "app/api/stripe/webhook/route.ts" },
+      "summary": "The Stripe webhook route parses the body as an event without checking the stripe-signature header, then upgrades the plan."
+    },
+    {
+      "id": "H11",
+      "kind": "auth-users-exposed",
+      "surface": "database",
+      "target": { "object": "public.user_directory", "file": "supabase/migrations/20261101001100_user_directory.sql" },
+      "summary": "public.user_directory selects id and email from auth.users and is granted to anon: every user's email is public."
+    },
+    {
+      "id": "H12",
+      "kind": "anon-definer-rpc",
+      "surface": "database",
+      "target": { "object": "public.admin_set_plan", "file": "supabase/migrations/20261101001000_admin_set_plan.sql" },
+      "summary": "public.admin_set_plan() is SECURITY DEFINER, has no caller check and is granted to anon: anyone can change anyone's plan over RPC."
+    }
+  ],
+  "controls": [
+    {
+      "id": "C01",
+      "surface": "database",
+      "target": { "object": "public.notes", "file": "supabase/migrations/20261101000300_notes.sql" },
+      "summary": "public.notes: RLS on, owner-scoped policies for all four commands, WITH CHECK on writes."
+    },
+    {
+      "id": "C02",
+      "surface": "database",
+      "target": { "object": "public.note_counts", "file": "supabase/migrations/20261101000400_note_counts.sql" },
+      "summary": "public.note_counts: a view with security_invoker = true."
+    },
+    {
+      "id": "C03",
+      "surface": "database",
+      "target": {
+        "object": "public.handle_new_user",
+        "file": "supabase/migrations/20261101000200_handle_new_user.sql"
+      },
+      "summary": "public.handle_new_user(): SECURITY DEFINER trigger function with search_path = '' and EXECUTE revoked from the API roles."
+    },
+    {
+      "id": "C04",
+      "surface": "database",
+      "target": {
+        "object": "storage.buckets/avatars",
+        "file": "supabase/migrations/20261101001300_avatars_bucket.sql"
+      },
+      "summary": "The avatars bucket: private, read and upload limited to the user's own folder."
+    },
+    {
+      "id": "C05",
+      "surface": "code",
+      "target": { "file": "app/notes/notes-list.tsx" },
+      "summary": "A \"use client\" component that uses only the public anon key."
+    },
+    {
+      "id": "C06",
+      "surface": "code",
+      "target": { "file": "lib/supabase/admin.ts" },
+      "summary": "The service role client, in a server-only module."
+    },
+    {
+      "id": "C07",
+      "surface": "code",
+      "target": { "file": "app/api/checkout/route.ts" },
+      "summary": "A route handler that checks the signed-in user before creating a Checkout session."
+    }
+  ]
+}

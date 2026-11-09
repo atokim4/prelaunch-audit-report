@@ -1,0 +1,42 @@
+{
+  "name": "prelaunch-audit-report",
+  "version": "0.1.0",
+  "description": "Turns repo and live-URL security scanners into a severity-rated pre-launch audit report (JSON, HTML, PDF) with verified patch diffs, for Next.js/React + Supabase + Stripe apps. Personal project.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "author": "Sunnatulla E.",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "bin": {
+    "prelaunch-audit": "src/cli.ts"
+  },
+  "scripts": {
+    "audit": "node src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm test",
+    "sample": "node src/cli.ts test/fixtures/broken-notes-app --out examples/sample-report --date 2026-11-09T09:00:00Z --note \"Sample report. broken-notes-app is a small Next.js + Supabase + Stripe demo built with security holes on purpose (github.com/atokim4/supabase-scanner-bench). Every finding below is real scanner output on that code. It is not a client project.\""
+  },
+  "dependencies": {
+    "@fontsource/ibm-plex-mono": "5.3.0",
+    "@fontsource/ibm-plex-sans": "5.3.0",
+    "@fontsource/source-serif-4": "5.3.1",
+    "playwright-core": "1.65.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.15",
+    "@eslint/js": "10.0.1",
+    "@types/node": "22.20.5",
+    "eslint": "10.14.0",
+    "globals": "17.14.0",
+    "prettier": "3.9.10",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.72.1",
+    "vitest": "5.1.0"
+  }
+}

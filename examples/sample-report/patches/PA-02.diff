@@ -1,0 +1,29 @@
+diff --git a/app/api/stripe/webhook/route.ts b/app/api/stripe/webhook/route.ts
+--- a/app/api/stripe/webhook/route.ts
++++ b/app/api/stripe/webhook/route.ts
+@@ -1,9 +1,24 @@
+ import { NextResponse } from "next/server";
+ import type Stripe from "stripe";
+ import { supabaseAdmin } from "@/lib/supabase/admin";
++import { stripe } from "@/lib/stripe";
+ 
+ export async function POST(request: Request) {
+-  const event = (await request.json()) as Stripe.Event;
++  const signature = request.headers.get("stripe-signature");
++  if (!signature) {
++    return NextResponse.json({ error: "Missing stripe-signature header" }, { status: 400 });
++  }
++
++  let event: Stripe.Event;
++  try {
++    event = await stripe.webhooks.constructEventAsync(
++      await request.text(),
++      signature,
++      process.env.STRIPE_WEBHOOK_SECRET!,
++    );
++  } catch {
++    return NextResponse.json({ error: "Invalid signature" }, { status: 400 });
++  }
+ 
+   if (event.type === "checkout.session.completed") {
+     const session = event.data.object;

@@ -1,0 +1,390 @@
+{
+  "schema": "prelaunch-audit/v1",
+  "app": {
+    "name": "broken-notes-app",
+    "repo": "broken-notes-app"
+  },
+  "generatedAt": "2026-11-09T09:00:00.000Z",
+  "counts": {
+    "critical": 7,
+    "high": 3,
+    "medium": 1,
+    "low": 1
+  },
+  "findings": [
+    {
+      "id": "PA-01",
+      "source": "vibe-preflight",
+      "rule": "server-secret-in-client",
+      "severity": "critical",
+      "title": "Server-only key used in browser code",
+      "cwe": {
+        "id": 668,
+        "name": "Exposure of Resource to Wrong Sphere"
+      },
+      "location": {
+        "kind": "file",
+        "file": "app/admin/users-table.tsx",
+        "line": 6
+      },
+      "evidence": "users-table.tsx runs in the browser and uses `SUPABASE_SERVICE_ROLE_KEY`.",
+      "snippet": "   6 | const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);",
+      "whyItMatters": "Code in this file runs in the visitor's browser. A Supabase service role key or Stripe secret key there gives full control of the database or the Stripe account to anyone who opens developer tools. If it was ever deployed, treat the key as leaked.",
+      "fix": "Use the public anon key in the browser and keep the secret key in server code only. Rotate the key if this was ever deployed.",
+      "effort": "1-4 hours",
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/app/admin/users-table.tsx b/app/admin/users-table.tsx\n--- a/app/admin/users-table.tsx\n+++ b/app/admin/users-table.tsx\n@@ -3,7 +3,7 @@\n import { useEffect, useState } from \"react\";\n import { createClient } from \"@supabase/supabase-js\";\n \n-const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);\n+const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!);\n \n type Profile = { id: string; display_name: string | null; plan: string };\n \n",
+        "summary": "The browser component now uses the public anon key (NEXT_PUBLIC_SUPABASE_ANON_KEY), so its queries run under Row Level Security as the signed-in user.",
+        "caveats": [
+          "The component now sees only the rows its user may see. If it is an admin screen that needs every row, move the query to a route handler that checks the caller is an admin and uses the service role there.",
+          "Rotate the service role key if this ever shipped."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-02",
+      "source": "vibe-preflight",
+      "rule": "stripe-webhook-unverified",
+      "severity": "critical",
+      "title": "Stripe webhook accepts unsigned requests",
+      "cwe": {
+        "id": 345,
+        "name": "Insufficient Verification of Data Authenticity"
+      },
+      "location": {
+        "kind": "file",
+        "file": "app/api/stripe/webhook/route.ts",
+        "line": 8
+      },
+      "evidence": "Handles Stripe events without `constructEvent`, so any POST is trusted.",
+      "snippet": "   8 |   if (event.type === \"checkout.session.completed\") {\n   9 |     const session = event.data.object;\n  10 |     await supabaseAdmin\n  11 |       .from(\"profiles\")",
+      "whyItMatters": "The webhook acts on whatever JSON it receives. Anyone who finds the URL can post a fake 'payment completed' event and get the paid plan for free.",
+      "fix": "Verify the `stripe-signature` header with `stripe.webhooks.constructEvent` on the raw request body before acting on the event.",
+      "effort": "under 1 hour",
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/app/api/stripe/webhook/route.ts b/app/api/stripe/webhook/route.ts\n--- a/app/api/stripe/webhook/route.ts\n+++ b/app/api/stripe/webhook/route.ts\n@@ -1,9 +1,24 @@\n import { NextResponse } from \"next/server\";\n import type Stripe from \"stripe\";\n import { supabaseAdmin } from \"@/lib/supabase/admin\";\n+import { stripe } from \"@/lib/stripe\";\n \n export async function POST(request: Request) {\n-  const event = (await request.json()) as Stripe.Event;\n+  const signature = request.headers.get(\"stripe-signature\");\n+  if (!signature) {\n+    return NextResponse.json({ error: \"Missing stripe-signature header\" }, { status: 400 });\n+  }\n+\n+  let event: Stripe.Event;\n+  try {\n+    event = await stripe.webhooks.constructEventAsync(\n+      await request.text(),\n+      signature,\n+      process.env.STRIPE_WEBHOOK_SECRET!,\n+    );\n+  } catch {\n+    return NextResponse.json({ error: \"Invalid signature\" }, { status: 400 });\n+  }\n \n   if (event.type === \"checkout.session.completed\") {\n     const session = event.data.object;\n",
+        "summary": "Reads the raw body and checks the stripe-signature header with constructEventAsync before the handler touches the event. Unsigned or tampered requests get a 400.",
+        "caveats": [
+          "Set STRIPE_WEBHOOK_SECRET to the endpoint's signing secret (whsec_…) in every environment.",
+          "Test with `stripe listen --forward-to localhost:3000/api/stripe/webhook` and `stripe trigger checkout.session.completed`."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-03",
+      "source": "vibe-preflight",
+      "rule": "public-env-secret",
+      "severity": "critical",
+      "title": "Secret in a browser-exposed environment variable",
+      "cwe": {
+        "id": 668,
+        "name": "Exposure of Resource to Wrong Sphere"
+      },
+      "location": {
+        "kind": "file",
+        "file": "lib/stripe.ts",
+        "line": 3
+      },
+      "evidence": "`NEXT_PUBLIC_STRIPE_SECRET_KEY` looks like a secret and is exposed to the browser.",
+      "snippet": "   3 | export const stripe = new Stripe(process.env.NEXT_PUBLIC_STRIPE_SECRET_KEY!);",
+      "whyItMatters": "Next.js copies every `NEXT_PUBLIC_` variable into the JavaScript it sends to visitors (Vite does the same with `VITE_`). A secret under that prefix is public as soon as the site is built.",
+      "fix": "Rename the variable without the public prefix, read it only in server code, and rotate the key if it was ever deployed.",
+      "effort": "under 1 hour",
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/.env.example b/.env.example\n--- a/.env.example\n+++ b/.env.example\n@@ -1,6 +1,6 @@\n NEXT_PUBLIC_SUPABASE_URL=\n NEXT_PUBLIC_SUPABASE_ANON_KEY=\n SUPABASE_SERVICE_ROLE_KEY=\n-NEXT_PUBLIC_STRIPE_SECRET_KEY=\n+STRIPE_SECRET_KEY=\n STRIPE_WEBHOOK_SECRET=\n STRIPE_PRICE_ID=\ndiff --git a/lib/stripe.ts b/lib/stripe.ts\n--- a/lib/stripe.ts\n+++ b/lib/stripe.ts\n@@ -1,3 +1,4 @@\n+import \"server-only\";\n import Stripe from \"stripe\";\n \n-export const stripe = new Stripe(process.env.NEXT_PUBLIC_STRIPE_SECRET_KEY!);\n+export const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);\n",
+        "summary": "Renames NEXT_PUBLIC_STRIPE_SECRET_KEY to STRIPE_SECRET_KEY in .env.example, lib/stripe.ts, and marks lib/stripe.ts server-only so a browser import fails the build.",
+        "caveats": [
+          "Rename the variable in your hosting dashboard too, and rotate the key if a build with NEXT_PUBLIC_ ever went live."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-04",
+      "source": "vibe-preflight",
+      "rule": "rls-disabled",
+      "severity": "critical",
+      "title": "Table open to the public API (Row Level Security off)",
+      "cwe": {
+        "id": 862,
+        "name": "Missing Authorization"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261101000700_audit_log.sql",
+        "line": 2
+      },
+      "evidence": "`public.audit_log` is created without `enable row level security` in any migration.",
+      "snippet": "   2 | create table public.audit_log (\n   3 |   id bigint generated always as identity primary key,\n   4 |   user_id uuid references auth.users (id) on delete set null,\n   5 |   action text not null,",
+      "whyItMatters": "Supabase serves every table in the public schema over its REST API, and the key it needs ships in your website. With Row Level Security off, anyone can read, change or delete every row of this table from a browser console.",
+      "fix": "Enable Row Level Security on the table. With no policies the API gets nothing, and your server code (service role) keeps working. Add policies only for what the browser really needs.",
+      "effort": "under 1 hour",
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261109090000_enable_rls_audit_log.sql b/supabase/migrations/20261109090000_enable_rls_audit_log.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261109090000_enable_rls_audit_log.sql\n@@ -0,0 +1,3 @@\n+-- PA-04: turn on Row Level Security for public.audit_log.\n+-- Generated by prelaunch-audit. Review before applying.\n+alter table public.audit_log enable row level security;\n",
+        "summary": "Turns on Row Level Security for public.audit_log. With no policies the public API gets nothing; server code using the service role key keeps working.",
+        "caveats": [
+          "If the browser needs to read or write this table, add policies for exactly those rows."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-05",
+      "source": "vibe-preflight",
+      "rule": "definer-function-anon",
+      "severity": "critical",
+      "title": "Privileged database function callable by anyone",
+      "cwe": {
+        "id": 269,
+        "name": "Improper Privilege Management"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261101001000_admin_set_plan.sql",
+        "line": 13
+      },
+      "evidence": "`public.admin_set_plan()` is SECURITY DEFINER and anon can call it at /rest/v1/rpc/admin_set_plan (granted explicitly).",
+      "snippet": "  13 | grant execute on function public.admin_set_plan(uuid, text) to anon, authenticated;",
+      "whyItMatters": "The function runs with its owner's rights, so it skips Row Level Security. Supabase exposes it at /rest/v1/rpc/, and visitors who are not signed in may call it.",
+      "fix": "Revoke execute from `public`, `anon` and `authenticated`, grant it only to the roles that need it, and check the caller inside the function.",
+      "effort": "under 1 hour",
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261109090001_revoke_admin_set_plan.sql b/supabase/migrations/20261109090001_revoke_admin_set_plan.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261109090001_revoke_admin_set_plan.sql\n@@ -0,0 +1,3 @@\n+-- PA-05: stop the API roles from calling public.admin_set_plan().\n+-- Generated by prelaunch-audit. Review before applying.\n+revoke execute on function public.admin_set_plan(target_user uuid, new_plan text) from public, anon, authenticated;\n",
+        "summary": "Revokes execute on public.admin_set_plan() from public, anon and authenticated. The service role keeps its own grant, so server code can still call it.",
+        "caveats": [
+          "Call it only from server code that has checked the user is allowed to (for an admin action: that they are an admin)."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-06",
+      "source": "vibe-preflight",
+      "rule": "auth-users-exposed",
+      "severity": "critical",
+      "title": "User accounts table exposed through a view",
+      "cwe": {
+        "id": 359,
+        "name": "Exposure of Private Personal Information to an Unauthorized Actor"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261101001100_user_directory.sql",
+        "line": 2
+      },
+      "evidence": "View `public.user_directory` selects from `auth.users` and the API serves it.",
+      "snippet": "   2 | create view public.user_directory as\n   3 |   select id, email, created_at\n   4 |   from auth.users;",
+      "whyItMatters": "`auth.users` holds every account's email and sign-in data. A view over it in the public schema puts that list on the API, so anyone can download your user list.",
+      "fix": "Revoke API access to the view, and give users the lookup they need through a function that checks the caller and returns only safe columns.",
+      "effort": "1-4 hours",
+      "alsoFlaggedBy": [
+        "view-bypasses-rls"
+      ],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261109090002_revoke_user_directory.sql b/supabase/migrations/20261109090002_revoke_user_directory.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261109090002_revoke_user_directory.sql\n@@ -0,0 +1,3 @@\n+-- PA-06: take public.user_directory off the public API.\n+-- Generated by prelaunch-audit. Review before applying.\n+revoke all on public.user_directory from anon, authenticated;\n",
+        "summary": "Revokes API access to public.user_directory, so the account list is no longer readable through /rest/v1/.",
+        "caveats": [
+          "The feature that used this view stops working. Replace it with a function that checks the caller and returns only what it needs (for example the id for one exact email)."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-07",
+      "source": "vibe-preflight",
+      "rule": "storage-public-bucket",
+      "severity": "critical",
+      "title": "Public storage bucket",
+      "cwe": {
+        "id": 552,
+        "name": "Files or Directories Accessible to External Parties"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261101001200_invoices_bucket.sql",
+        "line": 2
+      },
+      "evidence": "Storage bucket `invoices` is public, and policy \"Anyone can list invoices\" lets anyone list every file in it.",
+      "snippet": "   2 | insert into storage.buckets (id, name, public)\n   3 | values ('invoices', 'invoices', true);",
+      "whyItMatters": "Files in a public bucket open for anyone with the link. When a select policy on storage.objects also lets anyone list the bucket, the links are no secret either: anyone can download every file.",
+      "fix": "Make the bucket private, drop the open select policy, and hand out short-lived signed URLs from the server after checking who is asking.",
+      "effort": "1-4 hours",
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261109090003_private_bucket_invoices.sql b/supabase/migrations/20261109090003_private_bucket_invoices.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261109090003_private_bucket_invoices.sql\n@@ -0,0 +1,4 @@\n+-- PA-07: make the invoices bucket private.\n+-- Generated by prelaunch-audit. Review before applying.\n+update storage.buckets set public = false where id = 'invoices';\n+drop policy if exists \"Anyone can list invoices\" on storage.objects;\n",
+        "summary": "Makes the invoices bucket private and drops \"Anyone can list invoices\". Files stay where they are.",
+        "caveats": [
+          "Links to these files stop working. Serve them with createSignedUrl() from server code after checking the file belongs to the user."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-08",
+      "source": "vibe-preflight",
+      "rule": "rls-update-privileged-column",
+      "severity": "high",
+      "title": "Users can edit their own plan or role column",
+      "cwe": {
+        "id": 915,
+        "name": "Improperly Controlled Modification of Dynamically-Determined Object Attributes"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261101000100_profiles.sql",
+        "line": 17
+      },
+      "evidence": "Policy \"Users can update own profile\" lets users update their row in `public.profiles`, including `plan` and `stripe_customer_id`. No column privilege or trigger stops them.",
+      "snippet": "  17 | create policy \"Users can update own profile\"\n  18 |   on public.profiles for update\n  19 |   to authenticated\n  20 |   using ((select auth.uid()) = id);",
+      "whyItMatters": "The update policy lets a signed-in user change any column of their own row, including the one that says what they paid for. One request from the browser console turns a free account into a paid one.",
+      "fix": "Limit what users may update with column privileges (grant update only on the safe columns) and add `with check` to the policy. Change the plan only from the server, after Stripe confirms payment.",
+      "effort": "1-4 hours",
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261109090004_lock_columns_profiles.sql b/supabase/migrations/20261109090004_lock_columns_profiles.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261109090004_lock_columns_profiles.sql\n@@ -0,0 +1,12 @@\n+-- PA-08: users may only edit safe columns of public.profiles.\n+-- Generated by prelaunch-audit. Review before applying.\n+revoke update on public.profiles from anon, authenticated;\n+grant update (display_name) on public.profiles to authenticated;\n+\n+drop policy \"Users can update own profile\" on public.profiles;\n+\n+create policy \"Users can update own profile\"\n+  on public.profiles for update\n+  to authenticated\n+  using ((select auth.uid()) = id)\n+  with check ((select auth.uid()) = id);\n",
+        "summary": "Users can update only display_name; plan, stripe_customer_id can be changed only by the server. Adds a WITH CHECK to the policy.",
+        "caveats": [
+          "If the app updates other columns from the browser, add them to the grant. Change paid columns only in server code (for example the Stripe webhook)."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-09",
+      "source": "vibe-preflight",
+      "rule": "view-bypasses-rls",
+      "severity": "high",
+      "title": "View skips Row Level Security",
+      "cwe": {
+        "id": 863,
+        "name": "Incorrect Authorization"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261101000500_recent_notes.sql",
+        "line": 2
+      },
+      "evidence": "View `public.recent_notes` has no `security_invoker`, so it reads the tables below it without RLS.",
+      "snippet": "   2 | create view public.recent_notes as\n   3 |   select id, user_id, title, created_at\n   4 |   from public.notes\n   5 |   order by created_at desc",
+      "whyItMatters": "Postgres views run with the rights of whoever created them, so they ignore the policies of the tables below. Supabase serves the view over the API, which gives every caller the rows your policies were meant to hide.",
+      "fix": "Set `security_invoker = true` on the view (Postgres 15+), so it runs with the caller's rights and the table policies apply.",
+      "effort": "under 1 hour",
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261109090005_security_invoker_recent_notes.sql b/supabase/migrations/20261109090005_security_invoker_recent_notes.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261109090005_security_invoker_recent_notes.sql\n@@ -0,0 +1,3 @@\n+-- PA-09: make public.recent_notes respect the caller's RLS.\n+-- Generated by prelaunch-audit. Review before applying.\n+alter view public.recent_notes set (security_invoker = true);\n",
+        "summary": "Sets security_invoker on public.recent_notes, so the policies of the tables below it apply to whoever queries it.",
+        "caveats": [
+          "Needs Postgres 15 or newer (every current Supabase project is)."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-10",
+      "source": "vibe-preflight",
+      "rule": "rls-permissive-policy",
+      "severity": "high",
+      "title": "Policy lets everyone through (using true)",
+      "cwe": {
+        "id": 863,
+        "name": "Incorrect Authorization"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261101000600_messages.sql",
+        "line": 15
+      },
+      "evidence": "Policy \"Enable read access for all users\" on `public.messages` (select) lets anyone (signed in or not) read every row.",
+      "snippet": "  15 | create policy \"Enable read access for all users\"\n  16 |   on public.messages for select\n  17 |   using (true);",
+      "whyItMatters": "A policy with `using (true)` or `with check (true)` allows the action for every caller, including visitors who are not signed in. If the table holds anything private, it is public.",
+      "fix": "Replace the policy with one that compares `auth.uid()` to the owner column, and limit it to the `authenticated` role.",
+      "effort": "under 1 hour",
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261109090006_scope_policy_messages.sql b/supabase/migrations/20261109090006_scope_policy_messages.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261109090006_scope_policy_messages.sql\n@@ -0,0 +1,8 @@\n+-- PA-10: limit \"Enable read access for all users\" to the users in the row.\n+-- Generated by prelaunch-audit. Review before applying.\n+drop policy \"Enable read access for all users\" on public.messages;\n+\n+create policy \"Users can select rows they are in\"\n+  on public.messages for select\n+  to authenticated\n+  using ((select auth.uid()) = sender_id or (select auth.uid()) = recipient_id);\n",
+        "summary": "Replaces \"Enable read access for all users\" with \"Users can select rows they are in\": signed-in users whose id is in sender_id or recipient_id.",
+        "caveats": [
+          "Check that sender_id / recipient_id really is who should have access. If the rows are meant to be public, keep the old policy and say so in a comment."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-11",
+      "source": "vibe-preflight",
+      "rule": "definer-search-path",
+      "severity": "medium",
+      "title": "SECURITY DEFINER function without a fixed search_path",
+      "cwe": {
+        "id": 426,
+        "name": "Untrusted Search Path"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261101000900_message_stats.sql",
+        "line": 2
+      },
+      "evidence": "`public.get_message_stats()` is SECURITY DEFINER and doesn't set search_path.",
+      "snippet": "   2 | create function public.get_message_stats()\n   3 | returns table (sent bigint, received bigint)\n   4 | language sql\n   5 | stable",
+      "whyItMatters": "The function runs with its owner's rights. Without a fixed `search_path`, a caller who can create objects in a schema on the path can make it run their code with those rights. Supabase's own linter flags this.",
+      "fix": "Add `set search_path = ''` to the function and schema-qualify every table it uses.",
+      "effort": "under 1 hour",
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261109090007_search_path_get_message_stats.sql b/supabase/migrations/20261109090007_search_path_get_message_stats.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261109090007_search_path_get_message_stats.sql\n@@ -0,0 +1,3 @@\n+-- PA-11: pin the search_path of public.get_message_stats().\n+-- Generated by prelaunch-audit. Review before applying.\n+alter function public.get_message_stats() set search_path = '';\n",
+        "summary": "Pins search_path to '' for public.get_message_stats(), so the function only sees the objects it names in full.",
+        "caveats": [
+          "Every table and function in the body must be schema-qualified (public.messages, auth.uid())."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-12",
+      "source": "vibe-preflight",
+      "rule": "rls-no-policy",
+      "severity": "low",
+      "title": "Table has Row Level Security on and no policies",
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261101000800_feature_flags.sql",
+        "line": 2
+      },
+      "evidence": "`public.feature_flags` has RLS on and no policies: every API read and write is denied.",
+      "snippet": "   2 | create table public.feature_flags (\n   3 |   key text primary key,\n   4 |   enabled boolean not null default false\n   5 | );",
+      "whyItMatters": "This is safe: the API returns nothing. But if the app reads this table from the browser, that read silently comes back empty, which looks like a bug at launch.",
+      "fix": "If the browser needs the table, add a read policy for the rows it should see. If only the server uses it, leave it and note that on purpose.",
+      "effort": "under 1 hour",
+      "alsoFlaggedBy": []
+    }
+  ],
+  "tools": [
+    {
+      "name": "vibe-preflight",
+      "version": "1.3.0",
+      "command": "node vendor/vibe-preflight/preflight.mjs broken-notes-app --format json --fail-on never",
+      "status": "ok"
+    },
+    {
+      "name": "secret-scan (built in)",
+      "version": "10 patterns",
+      "command": "working tree (git ls-files) + git log -p --all",
+      "status": "ok"
+    }
+  ],
+  "notChecked": [
+    "The deployed site: no URL was given, so HTTPS, security headers, cookies and the built JavaScript bundles were not checked.",
+    "Business logic and authorization inside your own API routes and server actions (beyond the Stripe webhook).",
+    "The live database: policies or grants changed in the Supabase dashboard and not saved as migrations are invisible to a repo scan.",
+    "Dependencies with known CVEs (run `npm audit` or Dependabot for that).",
+    "Rate limiting, abuse and brute-force protection, email/auth settings in the Supabase dashboard.",
+    "Manual penetration testing: every finding here comes from automated scanners and was not exploited against a running app."
+  ]
+}
