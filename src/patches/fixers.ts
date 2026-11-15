@@ -1,5 +1,5 @@
 import { functionTable } from "../shape.ts";
-import type { Finding, ProbePolicy, Proof } from "../types.ts";
+import type { Finding, LiveBucket, LiveTable, ProbePolicy, Proof } from "../types.ts";
 import type { FileEdit } from "./diff.ts";
 import {
   functionArgs,
@@ -170,7 +170,7 @@ const permissivePolicy: Fixer = async (finding, ctx) => {
   return {
     edits: [
       migration(ctx, `scope_policy_${slugOf(table)}`, `${finding.id}: limit "${policy}" to the users in the row.`, [
-        `drop policy ${ident(policy)} on ${ident(table)};`,
+        `drop policy if exists ${ident(policy)} on ${ident(table)};`,
         "",
         `create policy ${ident(scoped)}`,
         `  on ${ident(table)} for ${command}`,
@@ -209,7 +209,7 @@ const updatePrivilegedColumn: Fixer = async (finding, ctx) => {
         `revoke update on ${ident(table)} from anon, authenticated;`,
         `grant update (${editable.map(ident).join(", ")}) on ${ident(table)} to authenticated;`,
         "",
-        `drop policy ${ident(policy)} on ${ident(table)};`,
+        `drop policy if exists ${ident(policy)} on ${ident(table)};`,
         "",
         `create policy ${ident(policy)}`,
         `  on ${ident(table)} for update`,
@@ -529,7 +529,7 @@ function scopedPolicy(policy: ProbePolicy, table: string, condition: string): st
         ? `using (${condition})`
         : `using (${condition})\n  with check (${condition})`;
   return [
-    `drop policy ${identPart(policy.name)} on ${publicRel(table)};`,
+    `drop policy if exists ${identPart(policy.name)} on ${publicRel(table)};`,
     "",
     `create policy ${identPart(policy.name)}`,
     `  on ${publicRel(table)} for ${command}`,
@@ -597,7 +597,90 @@ const stripeWebhookJwtGate: Fixer = async (finding, ctx) => {
   };
 };
 
+const RESTRICTIVE_WHY = [
+  "The policy that lets this through is not in the migrations, so its name is unknown. A restrictive policy is",
+  "ANDed with every permissive one, so it closes the leak whatever the dashboard policy is called.",
+];
+
+/** A leak only the live project shows: a restrictive owner-only select policy on top of whatever is there. */
+const liveRlsLeak: Fixer = async (finding, ctx) => {
+  const live = finding.live;
+  if (live?.kind !== "live-table" || live.relation !== "table") return undefined;
+  const name = live.table.replace(/^public\./, "");
+  const direct = live.ownerColumns[0];
+  const via = live.ownedVia;
+  const owner = direct
+    ? `(select auth.uid()) = ${identPart(direct)}`
+    : via
+      ? `exists (select 1 from ${publicRel(via.parent)} p where p.${identPart(via.parentColumn)} = ${identPart(via.column)} and p.${identPart(via.parentOwner)} = (select auth.uid()))`
+      : undefined;
+  if (!owner) return undefined;
+  const policy = `Only owners read ${name} (restrictive)`;
+  return {
+    edits: [
+      migration(
+        ctx,
+        `restrict_select_${slugOf(name)}`,
+        `${finding.id}: only the owner can read rows of ${live.table}.`,
+        [
+          ...RESTRICTIVE_WHY.map((line) => `-- ${line}`),
+          `alter table ${publicRel(name)} enable row level security;`,
+          `drop policy if exists ${identPart(policy)} on ${publicRel(name)};`,
+          `create policy ${identPart(policy)}`,
+          `  on ${publicRel(name)}`,
+          "  as restrictive",
+          "  for select",
+          "  to anon, authenticated",
+          `  using (${owner});`,
+        ],
+      ),
+    ],
+    summary: `Adds a restrictive select policy on ${live.table}: a row is readable only by its owner (\`${direct ?? `${via?.parent}.${via?.parentOwner}`}\`), whatever the policies made in the dashboard allow.`,
+    caveats: [
+      "Owners still need a normal (permissive) select policy for their own rows. Run `supabase db pull` first to see what the live project has, and keep that in a migration too.",
+      "If some rows are meant to be shared (a team, a public profile), this blocks that as well: write the sharing rule into the policy instead.",
+    ],
+  };
+};
+
+/** Another user can list a user's folder: restrictive owner-folder policy scoped to this one bucket. */
+const liveStorageLeak: Fixer = async (finding, ctx) => {
+  const live: LiveBucket | LiveTable | undefined = finding.live;
+  if (live?.kind !== "live-bucket") return undefined;
+  const policy = `Only owners read ${live.bucket} files (restrictive)`;
+  return {
+    edits: [
+      migration(
+        ctx,
+        `restrict_bucket_${slugOf(live.bucket)}`,
+        `${finding.id}: files in ${live.bucket} are readable only from the owner's folder.`,
+        [
+          ...RESTRICTIVE_WHY.map((line) => `-- ${line}`),
+          `drop policy if exists ${identPart(policy)} on storage.objects;`,
+          `create policy ${identPart(policy)}`,
+          "  on storage.objects",
+          "  as restrictive",
+          "  for select",
+          "  to anon, authenticated",
+          `  using (bucket_id <> ${literal(live.bucket)} or (storage.foldername(name))[1] = (select auth.uid())::text);`,
+        ],
+      ),
+    ],
+    summary: `Adds a restrictive select policy on storage.objects for the ${live.bucket} bucket: a file is listable and downloadable over the API only from \`<your user id>/\`.`,
+    caveats: [
+      "Assumes files live under `<user id>/…`, the layout the live check found user A's file in. Files stored another way become unreadable.",
+      ...(live.public
+        ? [
+            "The bucket is public, so its files still download by public URL without any policy. Make it private if the files are personal.",
+          ]
+        : []),
+    ],
+  };
+};
+
 export const FIXERS: Record<string, Fixer> = {
+  "live-rls-leak": liveRlsLeak,
+  "live-storage-leak": liveStorageLeak,
   "rls-probe-leak": probeLeak,
   "stripe-webhook-jwt-gate": stripeWebhookJwtGate,
   "rls-disabled": rlsDisabled,

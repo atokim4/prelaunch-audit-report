@@ -1,7 +1,7 @@
 {
   "name": "prelaunch-audit-report",
-  "version": "0.2.0",
-  "description": "Turns repo scanners, a Row Level Security probe in PGlite and live-URL checks into a severity-rated pre-launch audit report (JSON, HTML, PDF) with verified patch diffs, for Next.js or Vite/React + Supabase + Stripe apps. Personal project.",
+  "version": "0.3.0",
+  "description": "Turns repo scanners, a Row Level Security probe in PGlite, an optional read-only probe of the live Supabase project and live-URL checks into a severity-rated pre-launch audit report (JSON, HTML, PDF) with verified patch diffs, for Next.js or Vite/React + Supabase + Stripe apps. Personal project.",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -21,7 +21,8 @@
     "test": "vitest run",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm test",
     "sample": "node src/cli.ts test/fixtures/broken-notes-app --out examples/sample-report --date 2026-11-09T09:00:00Z --note \"Sample report. broken-notes-app is a small Next.js + Supabase + Stripe demo written with security holes on purpose for this repo's tests (test/fixtures/broken-notes-app). Every finding below is real tool output on that code. It is not a client project.\"",
-    "sample:vite": "node src/cli.ts test/fixtures/pipeline-crm-app --out examples/sample-report-vite-supabase --date 2026-11-15T09:00:00Z --note \"Sample report. pipeline-crm is a small Vite + React + Supabase Edge Functions demo, shaped like the apps AI builders generate, written with security holes on purpose for this repo's tests (test/fixtures/pipeline-crm-app). Every finding below is real tool output on that code. It is not a client project.\""
+    "sample:vite": "node scripts/sample-live.ts",
+    "postgrest": "sh scripts/fetch-postgrest.sh"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "5.3.0",
@@ -30,7 +31,8 @@
     "playwright-core": "1.65.0"
   },
   "devDependencies": {
-    "@electric-sql/pglite": "0.5.15",
+    "@electric-sql/pglite": "0.5.16",
+    "@electric-sql/pglite-socket": "0.2.19",
     "@eslint/js": "10.0.1",
     "@types/node": "22.20.5",
     "eslint": "10.14.0",

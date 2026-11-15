@@ -1,4 +1,13 @@
-import { SEVERITY_RANK, type Cwe, type Effort, type Proof, type RawFinding, type Severity } from "./types.ts";
+import {
+  SEVERITY_RANK,
+  type Cwe,
+  type Effort,
+  type LiveBucket,
+  type LiveTable,
+  type Proof,
+  type RawFinding,
+  type Severity,
+} from "./types.ts";
 
 /**
  * The severity rubric. Every rule below is placed with these four questions, in order;
@@ -227,6 +236,28 @@ const PROJECT_CONFIG: Record<string, RuleInfo> = {
   },
 };
 
+/** The read-only probe of the live project, for leaks the repo does not explain. */
+const LIVE: Record<string, RuleInfo> = {
+  "live-rls-leak": {
+    title: "Live database lets other people read users' rows",
+    severity: (raw) => (raw.toolSeverity === "anon" ? "critical" : "high"),
+    cwe: CWE.incorrectAuthz,
+    whyItMatters:
+      "This was measured on the running project, not guessed from code: the probe signed in as a second test user (or as nobody) and counted rows that belong to someone else. The migrations in the repo do not explain it, so the policy or grant that lets it through was changed in the dashboard or the table was made there.",
+    fix: "Run `supabase db pull` (or `supabase db diff --linked`) to get the live policies into a migration, fix the select policy so it compares the owner column with `auth.uid()`, push it, and run the live probe again.",
+    effort: "1-4 hours",
+  },
+  "live-storage-leak": {
+    title: "Other users can list files in a user's storage folder",
+    severity: (raw) => (raw.toolSeverity === "anon" ? "critical" : "high"),
+    cwe: CWE.filesExposed,
+    whyItMatters:
+      "The probe listed user A's folder in this bucket as user B (or as nobody) and got entries back. A file that can be listed can usually be downloaded with the same rights, so uploads such as contracts or ID scans are open to other accounts.",
+    fix: "Limit the select policy on `storage.objects` for this bucket to the owner's folder: `bucket_id = '<bucket>' and (storage.foldername(name))[1] = auth.uid()::text`. Do the same for insert, update and delete.",
+    effort: "under 1 hour",
+  },
+};
+
 /** What the RLS probe class means in plain words, for findings no static rule explains. */
 const PROBE_CLASS: Record<string, { title: string; why: string; fix: string }> = {
   anon: {
@@ -274,13 +305,19 @@ export function proofClass(proof: Proof): keyof typeof PROBE_CLASS | undefined {
 
 const max = (a: Severity, b: Severity | undefined): Severity => (b && SEVERITY_RANK[b] > SEVERITY_RANK[a] ? b : a);
 
+/** Severity of what the live probe measured: a visitor reading user rows is Critical, another user High. */
+export function liveSeverity(live: LiveTable | LiveBucket | undefined): Severity | undefined {
+  if (!live || live.verdict !== "leak") return undefined;
+  return live.leaks.includes("anon") ? "critical" : "high";
+}
+
 /**
  * Final severity of a raw finding. The probe can raise it (a "warning" policy that really lets visitors
  * read user rows is Critical) and lower one case: an open read policy on a table with no owner column and
  * no write leak is a public reference table, which is Low (confirm it is meant to be public).
  */
 export function severityOf(raw: RawFinding, info: RuleInfo): Severity {
-  const base = info.severity(raw);
+  const base = max(info.severity(raw), liveSeverity(raw.live));
   const proof = raw.proof;
   if (!proof) return base;
   const sharedRead =
@@ -288,7 +325,8 @@ export function severityOf(raw: RawFinding, info: RuleInfo): Severity {
     /\(select\)/.test(raw.message) &&
     !owned(proof) &&
     !proof.leaks.length &&
-    !proof.checks.some((c) => c.inconclusive);
+    !proof.checks.some((c) => c.inconclusive) &&
+    !liveSeverity(raw.live);
   if (sharedRead) return "low";
   return max(base, proofSeverity(proof));
 }
@@ -384,6 +422,8 @@ export function ruleInfo(raw: RawFinding): RuleInfo | undefined {
       return SECRETS[raw.rule];
     case "launch-audit":
       return launchAuditInfo(raw);
+    case "live-probe":
+      return LIVE[raw.rule];
   }
 }
 
@@ -393,6 +433,7 @@ export function repoRuleTable(): { source: string; rule: string; title: string; 
     ...Object.entries(PREFLIGHT).map(([rule, info]) => ({ source: "vibe-preflight", rule, ...info })),
     ...Object.entries(SECRETS).map(([rule, info]) => ({ source: "secret-scan", rule, ...info })),
     ...Object.entries(PROJECT_CONFIG).map(([rule, info]) => ({ source: "project-config", rule, ...info })),
+    ...Object.entries(LIVE).map(([rule, info]) => ({ source: "live-probe", rule, ...info })),
     ...Object.entries(PROBE_CLASS).map(([kind, text]) => ({
       source: "rls-probe",
       rule: `rls-probe-leak (${kind})`,
@@ -423,6 +464,7 @@ const PLAIN_RISK: Record<string, string> = {
   "secret-in-history": "An API key removed from the code can still be recovered from its history.",
   "dependency-advisory": "A library your app ships has a published security advisory for the version you use.",
   "stripe-webhook-jwt-gate": "Supabase turns away Stripe's payment messages, so paying customers may not get access.",
+  "live-storage-leak": "One customer can list the files another customer uploaded.",
 };
 
 const PROBE_RISK: Record<string, string> = {
@@ -434,6 +476,7 @@ const PROBE_RISK: Record<string, string> = {
 
 export function plainRisk(finding: {
   source: string;
+  severity?: Severity;
   rule: string;
   title: string;
   subject?: string;
@@ -445,6 +488,11 @@ export function plainRisk(finding: {
   }
   if (stripeKey && finding.rule === "public-env-secret") {
     return "Your Stripe secret key sits in a public variable, so any browser code that reads it ships the key to visitors.";
+  }
+  if (finding.rule === "live-rls-leak") {
+    return finding.severity === "critical"
+      ? "On the running app, visitors without an account can read your users' records."
+      : "On the running app, one customer can read another customer's records.";
   }
   if (finding.source === "rls-probe") {
     const kind = finding.proof && proofClass(finding.proof);

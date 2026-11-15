@@ -3,7 +3,8 @@ export type Severity = (typeof SEVERITIES)[number];
 
 export const SEVERITY_RANK: Record<Severity, number> = { critical: 4, high: 3, medium: 2, low: 1 };
 
-export type Source = "vibe-preflight" | "launch-audit" | "secret-scan" | "rls-probe" | "project-config" | "npm-audit";
+export type Source =
+  "vibe-preflight" | "launch-audit" | "secret-scan" | "rls-probe" | "project-config" | "npm-audit" | "live-probe";
 
 export type Effort = "under 1 hour" | "1-4 hours" | "half a day to a day";
 
@@ -32,6 +33,8 @@ export interface RawFinding {
   proof?: Proof;
   /** CWE the scanner itself gives ("CWE-405"), for sources with their own advisories. */
   cwe?: string;
+  /** What the read-only probe of the live Supabase project saw for this table or bucket. */
+  live?: LiveTable | LiveBucket;
 }
 
 export type Actor = "anon" | "other-user" | "owner";
@@ -118,6 +121,8 @@ export interface Finding {
   subject?: string;
   /** What the RLS probe could actually do with this table. */
   proof?: Proof;
+  /** What the read-only probe of the live project saw for the same table or bucket. */
+  live?: LiveTable | LiveBucket;
   /** Other rules that flagged the same thing and were folded into this finding. */
   alsoFlaggedBy: string[];
 }
@@ -154,5 +159,81 @@ export interface AuditResult {
   tools: ToolRun[];
   /** Every table and view the RLS probe tried, leaking or not (the access matrix). */
   probe?: Proof[];
+  /** The consented, read-only probe of the client's own Supabase project. */
+  live?: LiveResult;
   notChecked: string[];
+}
+
+/** Who made a live request: the public key alone, or one of the two test users the client created. */
+export type LiveActor = "anon" | "user-a" | "user-b";
+
+/**
+ * One live count. Only Postgres' own refusals (SQLSTATE 42501, an RLS violation) are "blocked"; a
+ * 401, a timeout or any other error proves nothing either way and is "inconclusive".
+ */
+export type LiveCount =
+  | { status: "count"; n: number }
+  | { status: "blocked"; code: string }
+  | { status: "missing"; code: string }
+  | { status: "inconclusive"; reason: string };
+
+export type LiveVerdict = "leak" | "protected" | "inconclusive" | "shared" | "missing";
+
+/** What the live probe saw for one table or view. Counts only: no row content is read or kept. */
+export interface LiveTable {
+  kind: "live-table";
+  table: string;
+  relation: "table" | "view";
+  /** Where the name came from: the migrations, the generated types file, or both. */
+  foundIn: ("migrations" | "types")[];
+  ownerColumns: string[];
+  ownedVia?: { column: string; parent: string; parentColumn: string; parentOwner: string };
+  /** Rows each actor can see in the whole table. */
+  visible: Record<LiveActor, LiveCount>;
+  /** User A's own rows, as user A sees them. */
+  ownRowsA?: LiveCount;
+  /** User A's rows (owner column = A) as user B and as a visitor; direct owner columns only. */
+  rowsOfA?: { "user-b": LiveCount; anon: LiveCount };
+  /** User B's own rows, as user B sees them (the visible minus own gap = other people's rows). */
+  ownRowsB?: LiveCount;
+  verdict: LiveVerdict;
+  /** One plain sentence: what got through, or why the result proves nothing. */
+  summary: string;
+  leaks: ("anon" | "user-b")[];
+}
+
+export interface LiveBucket {
+  kind: "live-bucket";
+  bucket: string;
+  /** From the bucket listing; undefined when no actor could list buckets. */
+  public?: boolean;
+  /** Entries under user A's folder (`<user A id>/`), per actor. */
+  folderOfA: Record<LiveActor, LiveCount>;
+  verdict: LiveVerdict;
+  summary: string;
+  leaks: ("anon" | "user-b")[];
+}
+
+/** A difference between what the migrations say and what the live project does. */
+export interface LiveDrift {
+  table: string;
+  kind: "fixed-outside-migrations" | "opened-outside-migrations" | "not-in-migrations" | "not-deployed";
+  detail: string;
+}
+
+export interface LiveResult {
+  /** Origin of the project, e.g. https://abcd.supabase.co. Never the key. */
+  project: string;
+  /** "publishable" (sb_publishable_…) or "anon" (legacy JWT). */
+  keyKind: "publishable" | "anon";
+  tables: LiveTable[];
+  buckets: LiveBucket[];
+  /** Bucket listing per actor (bucket configuration, not files). */
+  bucketsVisible: Record<LiveActor, LiveCount>;
+  /** Public RPC functions found in the repo: listed, never called. */
+  rpcs: { name: string; securityDefiner: boolean; foundIn: ("migrations" | "types")[] }[];
+  drift: LiveDrift[];
+  requests: number;
+  /** What the probe did and did not do, for the report. */
+  notes: string[];
 }

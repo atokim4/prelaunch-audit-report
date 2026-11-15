@@ -4,7 +4,7 @@ import type { SqlFile } from "../patches/sql.ts";
 import type { Location, Proof, RawFinding, ToolRun } from "../types.ts";
 
 /** Static rules about one table or view; the probe's proof is attached to these instead of a new finding. */
-const TABLE_RULES = new Set([
+export const TABLE_RULES = new Set([
   "rls-disabled",
   "rls-permissive-policy",
   "rls-no-policy",

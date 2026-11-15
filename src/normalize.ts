@@ -105,6 +105,7 @@ export async function normalize(repo: string, raws: RawFinding[]): Promise<{ fin
       effort: info.effort,
       subject: lead.raw.source === "launch-audit" ? undefined : lead.raw.subject,
       proof: group.find((g) => g.raw.proof)?.raw.proof,
+      live: group.find((g) => g.raw.live)?.raw.live,
       alsoFlaggedBy: others,
     });
   }

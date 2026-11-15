@@ -2,3 +2,6 @@ node_modules
 out
 /audit-out
 test/.tmp
+.cache
+.env.live
+.env*.local

@@ -10,6 +10,11 @@ read and change that row as a visitor with no account and as a second user. A fi
 ("user B could select 1 of 1 of user A's rows"). After the patches are written, the same tries run once more with
 all of them applied, and the report shows how many leaks are left (0 on both demo apps).
 
+With the project owner's consent it can also probe the live Supabase project, read-only: it counts rows as a
+visitor and as two test users the owner creates, never downloads a row, and puts the result next to the local
+probe with a list of where the live database and the migrations disagree (a policy fixed or opened in the
+dashboard, a table made there).
+
 I built it as a personal project. The two sample reports below are runs on demo apps I wrote with security
 holes on purpose. They are not client audits.
 
@@ -50,6 +55,11 @@ node src/cli.ts path/to/your-app --url https://your-app.example --launch-audit-c
 | `--name <name>`              | App name on the report (default: `name` in package.json)     |
 | `--date <ISO date>`          | Fixed report date, for reproducible output                   |
 | `--skip-npm-audit`           | Don't run `npm audit` (it needs network)                     |
+| `--live <project url>`       | Read-only probe of the live Supabase project (see below)     |
+| `--i-own-this-project`       | Required with `--live`                                       |
+| `--live-env <file>`          | Read the key and test logins from a file (`.env.example`)    |
+| `--live-rate <n>`            | Requests per second, at most (default 5)                     |
+| `--live-max-requests <n>`    | Stop after this many requests (default 600)                  |
 
 Set `CHROME_PATH` if Chrome is somewhere unusual, and `CHROME_NO_SANDBOX=1` when Chrome runs inside a
 container that has no sandbox.
@@ -129,6 +139,43 @@ package that carries an advisory (packages listed only because they depend on it
 below npm's rating, because the advisory says the version is affected, not that your code reaches the affected
 function. Without a lockfile or network the report says dependencies were not checked.
 
+### The live Supabase project (optional, read-only)
+
+A repo scan cannot see what was changed in the Supabase dashboard. `--live` checks the running project, and
+only when you own it or have the owner's written permission: it refuses to start without
+`--i-own-this-project`.
+
+```bash
+cp .env.example .env.live   # the anon or publishable key, and two test logins
+node src/cli.ts path/to/your-app --live https://<ref>.supabase.co --i-own-this-project --live-env .env.live
+```
+
+The owner creates two throwaway accounts, A and B, and gives A at least one row in each table (and a file under
+`<user A id>/` in each bucket). Then, as a visitor with only the public key, as A and as B:
+
+- for every table and view the migrations create, plus the ones only `src/integrations/supabase/types.ts` (the
+  file Lovable and `supabase gen types` write) knows about: how many rows each can see, how many of A's rows B
+  and the visitor get, and how many rows B sees that are not B's (for tables owned through a parent row);
+- storage: the bucket list, and how many entries each can list in A's folder;
+- RPC functions are listed from the migrations and the types file, never called.
+
+It is read-only by construction. Counts come from `HEAD` requests with `Prefer: count=exact`, so the answer is a
+`Content-Range` header and no row crosses the wire; an error is asked again with `limit=0` to read its code.
+The HTTP layer refuses any `POST` other than sign-in, sign-out and storage listing, keeps to 5 requests a second by
+default and stops at a request cap. The secret and `service_role` keys are refused before anything is sent,
+because they skip RLS. The two sessions are signed out at the end. Only Postgres' own refusal (SQLSTATE 42501, or
+a row-level security error) is "blocked"; a 401, a timeout or any other error is shown as "no answer".
+
+Live leaks fold into the repo finding for the same table. A leak no repo finding explains becomes its own finding
+(High when user B gets through, Critical for a visitor) with a patch: a restrictive select policy, owner only,
+which Postgres ANDs with every other policy, so it closes the leak without knowing what the dashboard policy is
+called. The report adds a "live project" page with the counts and a drift table: fixed in the dashboard only (the
+repo still has the hole), opened in the dashboard, not in the migrations, not deployed.
+
+What it does not do: try inserts, updates or deletes on the live project, call RPC functions, or probe tables the
+repo does not name. The OpenAPI listing at `/rest/v1/` is closed to the public key on newer Supabase projects,
+so the table list has to come from the repo.
+
 ### Live site (optional)
 
 apify-launch-audit checks HTTPS and HSTS, security headers, cookie flags, keys in
@@ -141,11 +188,11 @@ The cover of every report lists this too:
 
 - Business logic and authorization inside your own API routes, server actions and edge functions (beyond the
   Stripe webhook).
-- The live database. Policies or grants changed in the Supabase dashboard and never saved as migrations are
-  invisible to a repo scan, and the probe runs your migrations locally, never against your project.
+- The live database, unless `--live` ran. Policies or grants changed in the Supabase dashboard and never saved as
+  migrations are invisible to a repo scan. With `--live`, only reads were tried there.
 - Rate limiting, abuse protection, and the auth and email settings in the Supabase dashboard.
-- Manual penetration testing. Every finding comes from an automated scanner or the local probe; nothing was
-  tried against your running app.
+- Manual penetration testing. Every finding comes from an automated scanner, the local probe or read-only
+  counts on the live project; nobody tried to break in by hand.
 
 The probe also has limits worth knowing: it seeds one row per table with guessed values, so a table whose check
 constraints or triggers reject those values is listed as "not tried"; it tests the two API roles, not
@@ -227,13 +274,35 @@ tools know, and 9 of 9 or 12 of 12 is not an independent detection rate. On some
 Neither app has committed secrets, so they say nothing about the credential scanner; its tests use keys built at
 runtime in temporary git repos.
 
-Regenerate the samples with `npm run sample` and `npm run sample:vite`.
+**The live probe** is tested end to end against the real [PostgREST](https://postgrest.org) 16.5 binary (the server
+behind `supabase.co/rest/v1`) running on PGlite through
+[pglite-socket](https://github.com/electric-sql/pglite/tree/main/packages/pglite-socket), with the pipeline-crm
+migrations, a file of changes "made in the dashboard" (`test/fixtures/pipeline-crm-live`) and made-up rows. Auth
+and the API gateway are a small Node stand-in (`test/live/stand-in.ts`): it checks the key, answers the GoTrue
+password grant with JWTs PostgREST verifies, and serves storage listing through PostgREST on the `storage` schema,
+which has the same RLS but simpler answers than Supabase Storage. So counts, `Content-Range`, error codes and RLS
+are real PostgREST and Postgres behaviour; auth and storage are emulated. On that stand-in the probe:
+
+- finds all 4 seeded drifts: the leads policy fixed in the dashboard only, tasks opened to every signed-in user
+  (and the `open_tasks` view over it), a `notes` table that only the types file knows;
+- finds user B listing user A's folder in a private bucket whose policy checks the bucket and not the folder;
+- leaves every row unchanged (a fingerprint of all tables before and after), sends only the allowed requests,
+  and puts no row value in its output;
+- has its two restrictive patches applied to a fresh stand-in in the suite, after which tasks, `open_tasks` and the
+  bucket come back protected.
+
+With the live part the Vite sample has 13 findings: 5 Critical, 7 High, 1 Low. 11 of the 12 Critical and High
+ones have a verified patch; the `open_tasks` view has none of its own, because the tasks patch is its fix.
+
+Regenerate the samples with `npm run sample` and `npm run sample:vite` (the second one needs `npm run postgrest`
+once, which downloads PostgREST and checks its SHA-256).
 
 ## Development
 
 ```bash
 npm ci
-npm run check   # tsc, eslint, prettier, vitest (77 tests, about a minute: each probe boots Postgres in WASM)
+npm run postgrest   # once: PostgREST 16.5 for the live-probe tests (Linux x86-64; else set POSTGREST_BIN)
+npm run check       # tsc, eslint, prettier, vitest (about two minutes: each probe boots Postgres in WASM)
 ```
 
 The code runs as TypeScript directly on Node's type stripping, with no build step.
@@ -243,6 +312,7 @@ src/cli.ts              options, writes the output folder
 src/audit.ts            project shape, scanners, probe, normalise, patches, re-probe
 src/shape.ts            framework, migrations, edge functions and verify_jwt
 src/probe/              the RLS probe (PGlite) and the Supabase stand-in it loads first
+src/live/               the read-only live probe: table list, rate-limited HTTP, counts, drift
 src/scanners/           vibe-preflight (subprocess), secrets, npm audit, launch-audit, probe → findings
 src/rubric.ts           severity, CWE, effort and plain-language text per rule
 src/normalize.ts        rubric + dedupe + ordering + ids
@@ -254,4 +324,5 @@ src/report/             HTML template and the PDF print (playwright-core + Chrom
 
 MIT, see [LICENSE](LICENSE). The vendored vibe-preflight bundle is MIT. Fonts embedded in the report are Source
 Serif 4 and IBM Plex (SIL Open Font License, via Fontsource). PGlite is Apache-2.0 / PostgreSQL licensed. The
-Stripe npm package (MIT) is a dev dependency, used only to sign test events.
+Stripe npm package (MIT) is a dev dependency, used only to sign test events. pglite-socket (Apache-2.0) is a dev
+dependency; PostgREST (MIT) is downloaded for the tests, not shipped.

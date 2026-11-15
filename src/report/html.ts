@@ -8,6 +8,12 @@ import {
   type AuditResult,
   type Effort,
   type Finding,
+  type LiveBucket,
+  type LiveCount,
+  type LiveDrift,
+  type LiveResult,
+  type LiveTable,
+  type LiveVerdict,
   type ProbeCheck,
   type Proof,
   type Severity,
@@ -164,7 +170,115 @@ function matrixHtml(matrix: Proof[]): string {
     <table class="matrix"><thead><tr><th>Table</th><th>Visitor read</th><th>Visitor write</th><th>User B read</th><th>User B write</th><th>Self-upgrade</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
-function findingHtml(f: Finding): string {
+function liveCell(c: LiveCount | undefined, leaked = false): string {
+  if (!c) return `<td class="pc pc-na">–</td>`;
+  switch (c.status) {
+    case "count":
+      return `<td class="pc ${leaked && c.n > 0 ? "pc-leak" : "pc-ok"}">${c.n}</td>`;
+    case "blocked":
+      return `<td class="pc pc-ok" title="${esc(c.code)}">refused</td>`;
+    case "missing":
+      return `<td class="pc pc-na" title="${esc(c.code)}">missing</td>`;
+    case "inconclusive":
+      return `<td class="pc pc-unknown" title="${esc(c.reason)}">?</td>`;
+  }
+}
+
+const VERDICT_LABEL: Record<LiveVerdict, string> = {
+  leak: "leaks",
+  protected: "protected",
+  inconclusive: "no answer",
+  shared: "shared data",
+  missing: "not on live",
+};
+const verdictCell = (v: LiveVerdict): string =>
+  `<td class="pc ${v === "leak" ? "pc-leak" : v === "protected" || v === "shared" ? "pc-ok" : "pc-unknown"}">${VERDICT_LABEL[v]}</td>`;
+
+const DRIFT_LABEL: Record<LiveDrift["kind"], string> = {
+  "fixed-outside-migrations": "Fixed in the dashboard only",
+  "opened-outside-migrations": "Opened in the dashboard",
+  "not-in-migrations": "Not in the migrations",
+  "not-deployed": "Not deployed",
+};
+
+/** Owner-filtered columns: A's own rows, then what user B and a visitor get of them. */
+function liveRow(t: LiveTable): string {
+  const name = `<code>${esc(t.table.replace(/^public\./, ""))}</code>${t.relation === "view" ? ' <span class="kind">view</span>' : ""}`;
+  const repo = t.foundIn.includes("migrations") ? (t.foundIn.includes("types") ? "both" : "migrations") : "types only";
+  const bLeak = t.leaks.includes("user-b");
+  const bCell = t.rowsOfA ? liveCell(t.rowsOfA["user-b"], bLeak) : liveCell(t.visible["user-b"], bLeak && !t.rowsOfA);
+  return `<tr><td>${name}</td><td>${repo}</td>${liveCell(t.visible.anon, t.leaks.includes("anon"))}${liveCell(t.ownRowsA)}${t.ownerColumns.length || t.ownedVia ? bCell : `<td class="pc pc-na">–</td>`}${verdictCell(t.verdict)}</tr>`;
+}
+
+function bucketRow(b: LiveBucket): string {
+  const access = b.public === undefined ? "?" : b.public ? "public" : "private";
+  return `<tr><td><code>${esc(b.bucket)}</code></td><td>${access}</td>${liveCell(b.folderOfA.anon, true)}${liveCell(b.folderOfA["user-a"])}${liveCell(b.folderOfA["user-b"], true)}${verdictCell(b.verdict)}</tr>`;
+}
+
+/** The consented probe of the live project: counts per table, storage folders, drift, RPCs listed. */
+function liveHtml(live: LiveResult): string {
+  const leaking =
+    live.tables.filter((t) => t.verdict === "leak").length + live.buckets.filter((b) => b.verdict === "leak").length;
+  const unclear = live.tables.filter((t) => t.verdict === "inconclusive");
+  return `<section class="part live">
+    <h2>The live project</h2>
+    <p>With the owner's written consent, the probe sent ${live.requests} read-only requests to <code>${esc(live.project)}</code> with the ${live.keyKind === "publishable" ? "publishable" : "anon"} key every visitor's browser has, once with no account and once as each of two test users the owner created (A and B). ${leaking ? `<strong>${leaking} of the checks below leak on the running project.</strong>` : "Nothing leaked on the running project."}</p>
+    <h4>Rows each person can see</h4>
+    <p class="probe-what">"Visitor" is everything a visitor without an account can count in the table. "A's rows" is what user A sees of their own rows. "B sees of A's" is how many of those user B gets (for tables owned through a parent row: rows of other users in total). Counts only: no row was downloaded.</p>
+    <table class="matrix live-matrix"><thead><tr><th>Table</th><th>In the repo</th><th>Visitor</th><th>A's rows</th><th>B sees of A's</th><th>Result</th></tr></thead><tbody>${live.tables.map(liveRow).join("")}</tbody></table>
+    ${unclear.length ? `<p class="probe-what">No answer: ${unclear.map((t) => `<code>${esc(t.table.replace(/^public\./, ""))}</code> (${prose(t.summary)})`).join("; ")}</p>` : ""}
+    ${
+      live.buckets.length
+        ? `<h4>Storage: user A's folder</h4>
+    <p class="probe-what">Entries listed under <code>&lt;user A id&gt;/</code>, the folder layout Supabase's storage docs use for per-user files.</p>
+    <table class="matrix live-matrix"><thead><tr><th>Bucket</th><th>Access</th><th>Visitor</th><th>User A</th><th>User B</th><th>Result</th></tr></thead><tbody>${live.buckets.map(bucketRow).join("")}</tbody></table>`
+        : ""
+    }
+    ${
+      live.drift.length
+        ? `<h4>Where the live project and the migrations disagree</h4>
+    <table><thead><tr><th>Table</th><th>Drift</th><th>What it means</th></tr></thead><tbody>${live.drift
+      .map(
+        (d) =>
+          `<tr><td><code>${esc(d.table.replace(/^public\./, ""))}</code></td><td>${DRIFT_LABEL[d.kind]}</td><td>${prose(d.detail)}</td></tr>`,
+      )
+      .join("")}</tbody></table>`
+        : ""
+    }
+    ${
+      live.rpcs.length
+        ? `<h4>RPC functions (listed, not called)</h4>
+    <p class="probe-what">${live.rpcs.map((r) => `<code>${esc(r.name)}</code>${r.securityDefiner ? " (security definer)" : ""}`).join(", ")}. The probe never calls a function on a live project: a function can write. Their grants are covered by the repo checks.</p>`
+        : ""
+    }
+    <h4>How it was run</h4>
+    <ul class="caveats">${live.notes.map((n) => `<li>${prose(n)}</li>`).join("")}</ul>
+  </section>`;
+}
+
+/** Live reads say nothing about a finding that is only about writes (an insert or self-upgrade hole). */
+const writeOnly = (f: Finding): boolean =>
+  Boolean(f.proof?.leaks.length) && !f.proof?.leaks.some((c) => c.action === "select" && c.actor !== "owner");
+
+/** The live result for the table or bucket a finding is about. */
+function liveNote(f: Finding, live: LiveTable | LiveBucket, drift: LiveDrift[]): string {
+  const label =
+    live.verdict === "leak"
+      ? '<b class="pc-leak-text">leaks</b>'
+      : live.verdict === "protected"
+        ? "<b>protected</b>"
+        : `<b>${VERDICT_LABEL[live.verdict]}</b>`;
+  const where = live.kind === "live-table" ? live.table : `storage:${live.bucket}`;
+  const fixedLive = drift.some((d) => d.table === where && d.kind === "fixed-outside-migrations");
+  const extra = writeOnly(f)
+    ? " This finding is about writes, which the live probe never tries, so it stands as tested locally."
+    : fixedLive
+      ? ` The repo still has the hole: the fix lives only in the database, so commit it as a migration${f.patch?.verified ? " (the patch here does that)" : ""}.`
+      : "";
+  return `<p class="probe-after">Reads on the live project: ${label}. ${prose(live.summary)}${extra}</p>`;
+}
+
+function findingHtml(f: Finding, drift: LiveDrift[]): string {
   const patch = f.patch
     ? `<section class="patch">
         <h4>Patch</h4>
@@ -196,6 +310,7 @@ function findingHtml(f: Finding): string {
       <h4>Fix</h4>
       <p>${prose(f.fix)}</p>
       ${f.proof ? proofHtml(f.proof) : ""}
+      ${f.live ? liveNote(f, f.live, drift) : ""}
       ${f.cwe ? `<p class="cwe">${esc(`CWE-${f.cwe.id}${f.cwe.name ? `: ${f.cwe.name}` : ""}`)}</p>` : ""}
       ${patch}
     </div>
@@ -329,6 +444,7 @@ h2{break-after:avoid}
 .pc-leak-text{color:var(--critical)}
 .partial{font-size:9.5pt;border-left:2px solid var(--high);padding-left:3mm}
 .partial b{color:var(--high)}
+.live-matrix th:first-child{width:24%}
 .kind{font-size:7.5pt;color:var(--ink-2);text-transform:uppercase;letter-spacing:.05em}
 `;
 
@@ -351,10 +467,6 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
   const [lo, hi] = effortRange(serious);
   const patched = findings.filter((f) => f.patch?.verified).length;
   const partial = findings.filter((f) => f.patch?.verified && f.patch.partial).length;
-  const repoChecked = result.tools
-    .filter((t) => t.status === "ok")
-    .map((t) => `${t.name} ${t.version}`)
-    .join(", ");
 
   const cover = `<section class="cover">
     <div class="mast"><span>Automated scan with patches</span><span>${esc(date(result.generatedAt))}</span></div>
@@ -373,8 +485,8 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
         <li>App code: server keys in browser code, public env prefixes, the Stripe webhook${result.app.shape.edgeFunctions.length ? " (including Deno edge functions and their JWT setting)" : ""}.</li>
         <li>Credentials in the files and in git history.</li>
         ${result.tools.some((t) => t.name === "npm audit" && t.status === "ok") ? "<li>Runtime dependencies against npm's advisory database.</li>" : ""}
+        ${result.live ? `<li>The live Supabase project, read-only and with consent: ${result.live.tables.length} tables and views${result.live.buckets.length ? ` and ${result.live.buckets.length} storage bucket${result.live.buckets.length === 1 ? "" : "s"}` : ""} counted as a visitor and two test users.</li>` : ""}
         ${result.app.url ? "<li>The live site: HTTPS, security headers, cookies, exposed files, keys in JS bundles.</li>" : ""}
-        <li>Tools: ${esc(repoChecked)}.</li>
       </ul></div>
       <div><h4>What was not checked</h4><ul>${result.notChecked.map((n) => `<li>${prose(n)}</li>`).join("")}</ul></div>
     </div>
@@ -407,7 +519,8 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
     ${result.probe?.length ? matrixHtml(result.probe) : ""}
   </section>`;
 
-  const details = `<section class="part"><h2>Findings</h2>${findings.map(findingHtml).join("")}</section>`;
+  const liveSection = result.live ? liveHtml(result.live) : "";
+  const details = `<section class="part"><h2>Findings</h2>${findings.map((f) => findingHtml(f, result.live?.drift ?? [])).join("")}</section>`;
 
   const appendix = `<section class="part appendix">
     <h2>Appendix</h2>
@@ -442,7 +555,7 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
 <title>${esc(`Pre-launch security audit: ${result.app.name}`)}</title>
 <style>${await fontFaces()}${CSS}</style>
 </head>
-<body><main class="sheet">${cover}${summary}${details}${appendix}</main></body>
+<body><main class="sheet">${cover}${summary}${liveSection}${details}${appendix}</main></body>
 </html>
 `;
 }

@@ -5,12 +5,13 @@ import { countBySeverity, normalize } from "./normalize.ts";
 import { leaks, probeRls, type ProbeResult } from "./probe/rls-probe.ts";
 import { attachPatches, fixContext, patchedMigrations } from "./patches/index.ts";
 import { runLaunchAudit } from "./scanners/launch-audit.ts";
+import { mergeLive, runLiveProbe, type LiveOptions } from "./scanners/live-probe.ts";
 import { runNpmAudit } from "./scanners/npm-audit.ts";
 import { runPreflight } from "./scanners/preflight.ts";
 import { mergeProbe, runRlsProbe, toProof } from "./scanners/rls-probe.ts";
 import { runSecretScan } from "./scanners/secrets.ts";
 import { detectShape, edgeConfigFindings } from "./shape.ts";
-import type { AuditResult, Proof, RawFinding, ToolRun } from "./types.ts";
+import type { AuditResult, LiveResult, Proof, RawFinding, ToolRun } from "./types.ts";
 
 export interface AuditOptions {
   repo: string;
@@ -23,15 +24,24 @@ export interface AuditOptions {
   now?: Date;
   /** Run `npm audit` (needs network). Default true. */
   npmAudit?: boolean;
+  /** Read-only probe of the client's own Supabase project. The CLI asks for explicit consent first. */
+  live?: LiveOptions;
 }
+
+const LIVE_NOT_CHECKED =
+  "The live database: policies or grants changed in the Supabase dashboard and not saved as migrations are invisible to a repo scan. The RLS probe runs your migrations in a local Postgres, not against your project.";
+const LIVE_LIMITS =
+  "On the live project, only reads were tried: inserts, updates, deletes and RPC calls were not, so a write hole that exists only in the dashboard is not in this report. Tables the repo does not name were not probed.";
 
 /** What no scanner here looks at. Printed on the cover so nobody reads the report as a full pentest. */
 const ALWAYS_NOT_CHECKED = [
   "Business logic and authorization inside your own API routes, server actions and edge functions (beyond the Stripe webhook).",
-  "The live database: policies or grants changed in the Supabase dashboard and not saved as migrations are invisible to a repo scan. The RLS probe runs your migrations in a local Postgres, not against your project.",
   "Rate limiting, abuse and brute-force protection, email/auth settings in the Supabase dashboard.",
-  "Manual penetration testing: every finding here comes from automated scanners and a local probe, and nothing was tried against your running app.",
 ];
+const NO_PENTEST =
+  "Manual penetration testing: every finding here comes from automated scanners and a local probe, and nothing was tried against your running app.";
+const NO_PENTEST_LIVE =
+  "Manual penetration testing: every finding here comes from automated scanners, a local probe and read-only counts on your project. Nobody tried to break in by hand.";
 
 async function appName(repo: string): Promise<string> {
   try {
@@ -73,6 +83,17 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
   raws.push(...(await edgeConfigFindings(shape, ctx.read)));
   if (probe.result) raws.push(...mergeProbe(raws, probe.result, ctx.migrations));
   if (probe.note) notChecked.unshift(probe.note);
+
+  let live: LiveResult | undefined;
+  if (options.live) {
+    const run = await runLiveProbe(options.live, ctx, probe.result);
+    tools.push(run.tool);
+    live = run.result;
+    if (live) raws.push(...mergeLive(raws, live));
+    notChecked.push(run.note ?? LIVE_LIMITS, live ? NO_PENTEST_LIVE : NO_PENTEST);
+  } else {
+    notChecked.push(LIVE_NOT_CHECKED, NO_PENTEST);
+  }
   if (secrets.tool.note) notChecked.unshift(secrets.tool.note);
 
   if (options.url) {
@@ -121,6 +142,7 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
     findings,
     tools,
     probe: matrix,
+    ...(live ? { live } : {}),
     notChecked,
   };
 }
