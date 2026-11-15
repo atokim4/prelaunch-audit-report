@@ -2,11 +2,15 @@ import { readFile, stat } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { isGitRepo, listFiles } from "./files.ts";
 import { countBySeverity, normalize } from "./normalize.ts";
-import { attachPatches, fixContext } from "./patches/index.ts";
+import { leaks, probeRls, type ProbeResult } from "./probe/rls-probe.ts";
+import { attachPatches, fixContext, patchedMigrations } from "./patches/index.ts";
 import { runLaunchAudit } from "./scanners/launch-audit.ts";
+import { runNpmAudit } from "./scanners/npm-audit.ts";
 import { runPreflight } from "./scanners/preflight.ts";
+import { mergeProbe, runRlsProbe, toProof } from "./scanners/rls-probe.ts";
 import { runSecretScan } from "./scanners/secrets.ts";
-import type { AuditResult, RawFinding, ToolRun } from "./types.ts";
+import { detectShape, edgeConfigFindings } from "./shape.ts";
+import type { AuditResult, Proof, RawFinding, ToolRun } from "./types.ts";
 
 export interface AuditOptions {
   repo: string;
@@ -17,15 +21,16 @@ export interface AuditOptions {
   name?: string;
   /** Fixed clock, for reproducible reports and tests. */
   now?: Date;
+  /** Run `npm audit` (needs network). Default true. */
+  npmAudit?: boolean;
 }
 
 /** What no scanner here looks at. Printed on the cover so nobody reads the report as a full pentest. */
 const ALWAYS_NOT_CHECKED = [
-  "Business logic and authorization inside your own API routes and server actions (beyond the Stripe webhook).",
-  "The live database: policies or grants changed in the Supabase dashboard and not saved as migrations are invisible to a repo scan.",
-  "Dependencies with known CVEs (run `npm audit` or Dependabot for that).",
+  "Business logic and authorization inside your own API routes, server actions and edge functions (beyond the Stripe webhook).",
+  "The live database: policies or grants changed in the Supabase dashboard and not saved as migrations are invisible to a repo scan. The RLS probe runs your migrations in a local Postgres, not against your project.",
   "Rate limiting, abuse and brute-force protection, email/auth settings in the Supabase dashboard.",
-  "Manual penetration testing: every finding here comes from automated scanners and was not exploited against a running app.",
+  "Manual penetration testing: every finding here comes from automated scanners and a local probe, and nothing was tried against your running app.",
 ];
 
 async function appName(repo: string): Promise<string> {
@@ -48,11 +53,26 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
   const raws: RawFinding[] = [];
   const notChecked = [...ALWAYS_NOT_CHECKED];
 
-  const [preflight, secrets] = await Promise.all([runPreflight(repo), runSecretScan(repo)]);
-  for (const result of [preflight, secrets]) {
+  const git = await isGitRepo(repo);
+  const ctx = await fixContext(repo, await listFiles(repo, git), now);
+  const shape = await detectShape(ctx.files, ctx.read);
+
+  const [preflight, secrets, probe, deps] = await Promise.all([
+    runPreflight(repo),
+    runSecretScan(repo),
+    runRlsProbe(ctx.migrations),
+    options.npmAudit === false ? undefined : runNpmAudit(repo),
+  ]);
+  for (const result of [preflight, secrets, ...(deps ? [deps] : [])]) {
     raws.push(...result.findings);
     tools.push(result.tool);
   }
+  if (deps?.note) notChecked.push(deps.note);
+  if (!deps) notChecked.push("Dependencies with known CVEs: npm audit was turned off for this run.");
+  tools.push(probe.tool);
+  raws.push(...(await edgeConfigFindings(shape, ctx.read)));
+  if (probe.result) raws.push(...mergeProbe(raws, probe.result, ctx.migrations));
+  if (probe.note) notChecked.unshift(probe.note);
   if (secrets.tool.note) notChecked.unshift(secrets.tool.note);
 
   if (options.url) {
@@ -70,16 +90,37 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
   }
 
   const { findings } = await normalize(repo, raws);
-  const git = await isGitRepo(repo);
-  await attachPatches(findings, await fixContext(repo, await listFiles(repo, git), now), repo);
+  const edits = await attachPatches(findings, ctx, repo);
+
+  // Re-run the probe with every verified patch applied: a patch for a leak has to bring it to zero.
+  let matrix: Proof[] | undefined;
+  if (probe.result) {
+    const after = await probeRls(patchedMigrations(ctx.migrations, edits)).catch((error: unknown): ProbeResult => ({
+      tables: [],
+      migrations: 0,
+      skippedExtensions: [],
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    const afterByTable = new Map(after.tables.map((t) => [t.table, t]));
+    matrix = probe.result.tables.filter((t) => !t.skipped).map(toProof);
+    if (after.error) {
+      probe.tool.note = `${probe.tool.note ?? ""} The re-run with the patches applied failed: ${after.error}`.trim();
+    } else {
+      for (const proof of [...matrix, ...findings.flatMap((f) => (f.proof ? [f.proof] : []))]) {
+        const table = afterByTable.get(proof.table);
+        proof.afterPatches = table && !table.skipped ? leaks(table) : [];
+      }
+    }
+  }
 
   return {
     schema: "prelaunch-audit/v1",
-    app: { name: options.name ?? (await appName(repo)), repo: basename(repo), url: options.url },
+    app: { name: options.name ?? (await appName(repo)), repo: basename(repo), url: options.url, shape },
     generatedAt: now.toISOString(),
     counts: countBySeverity(findings),
     findings,
     tools,
+    probe: matrix,
     notChecked,
   };
 }

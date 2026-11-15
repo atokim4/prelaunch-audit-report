@@ -169,11 +169,19 @@ export function functionArgs(files: SqlFile[], fn: string): string | undefined {
 }
 
 /** Quotes an identifier part only when it needs it. */
+/** One identifier, quoted only when it has to be. */
+export function identPart(part: string): string {
+  return /^[a-z_][a-z0-9_]*$/.test(part) ? part : `"${part.replace(/"/g, '""')}"`;
+}
+
+/** A dotted name (schema.table) as SQL. For names that may contain dots themselves, use identPart. */
 export function ident(name: string): string {
-  return name
-    .split(".")
-    .map((part) => (/^[a-z_][a-z0-9_]*$/.test(part) ? part : `"${part.replace(/"/g, '""')}"`))
-    .join(".");
+  return name.split(".").map(identPart).join(".");
+}
+
+/** `public.<name>` from a probe table name, where <name> may itself contain dots. */
+export function publicRel(table: string): string {
+  return `public.${identPart(table.replace(/^public\./, ""))}`;
 }
 
 export function literal(value: string): string {

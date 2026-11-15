@@ -1,0 +1,10 @@
+project_id = "pipeline-crm-demo"
+
+[api]
+schemas = ["public"]
+
+[functions.stripe-webhook]
+verify_jwt = false
+
+[functions.create-checkout]
+verify_jwt = true

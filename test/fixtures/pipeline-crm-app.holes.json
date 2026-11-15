@@ -1,0 +1,68 @@
+{
+  "$comment": "Ground truth for pipeline-crm-app, a Lovable-shaped demo (Vite + React SPA, Supabase migrations, Deno edge functions) written for these tests. Holes are seeded on purpose; controls are done right and must not be flagged at Medium or above. H02 and H04 have policies that look fine in a dashboard; only the behavioural probe catches them.",
+  "holes": [
+    {
+      "id": "H01",
+      "kind": "permissive-select-policy",
+      "target": { "object": "public.leads", "file": "supabase/migrations/20261110090100_leads.sql" },
+      "summary": "Policy \"Enable read access for all users\" using (true): visitors without an account read every lead (names, emails, phones)."
+    },
+    {
+      "id": "H02",
+      "kind": "policy-checks-role-not-owner",
+      "target": { "object": "public.deals", "file": "supabase/migrations/20261110090200_deals.sql" },
+      "summary": "Select policy using (auth.role() = 'authenticated'): any signed-in user reads every other user's deals. RLS is on and a policy exists."
+    },
+    {
+      "id": "H03",
+      "kind": "update-privileged-column",
+      "target": { "object": "public.profiles", "file": "supabase/migrations/20261110090000_profiles.sql" },
+      "summary": "Own-row update policy with no column limit: a user sets their own plan to 'pro'."
+    },
+    {
+      "id": "H04",
+      "kind": "insert-check-not-owner",
+      "target": { "object": "public.activities", "file": "supabase/migrations/20261110090300_activities.sql" },
+      "summary": "Insert policy with check (auth.uid() is not null): user B writes activity rows in user A's name."
+    },
+    {
+      "id": "H05",
+      "kind": "rls-disabled",
+      "target": { "object": "public.invoices", "file": "supabase/migrations/20261110090400_invoices.sql" },
+      "summary": "public.invoices never enables RLS: anyone reads, edits and deletes every invoice."
+    },
+    {
+      "id": "H06",
+      "kind": "view-bypasses-rls",
+      "target": { "object": "public.pipeline_summary", "file": "supabase/migrations/20261110090200_deals.sql" },
+      "summary": "View without security_invoker: every user's pipeline totals are readable by anyone."
+    },
+    {
+      "id": "H07",
+      "kind": "stripe-webhook-unverified",
+      "target": { "object": "stripe-webhook", "file": "supabase/functions/stripe-webhook/index.ts" },
+      "summary": "Deno edge function trusts await req.json() and upgrades the plan; verify_jwt = false makes it reachable by anyone."
+    },
+    {
+      "id": "H08",
+      "kind": "secret-in-vite-env",
+      "target": { "object": "VITE_STRIPE_SECRET_KEY", "file": "src/lib/billing.ts" },
+      "summary": "Stripe secret key read from a VITE_ variable in browser code, so it ships in the bundle."
+    },
+    {
+      "id": "H09",
+      "kind": "definer-function-anon",
+      "target": { "object": "public.delete_lead", "file": "supabase/migrations/20261110090100_leads.sql" },
+      "summary": "SECURITY DEFINER delete_lead(uuid) with no owner check and the default execute grant: anyone deletes any lead."
+    }
+  ],
+  "controls": [
+    { "id": "C01", "target": { "object": "public.tasks", "file": "supabase/migrations/20261110090500_tasks.sql" }, "summary": "Owner-scoped policies for every command, (select auth.uid()) form." },
+    { "id": "C02", "target": { "object": "public.open_tasks", "file": "supabase/migrations/20261110090500_tasks.sql" }, "summary": "View with security_invoker = true." },
+    { "id": "C03", "target": { "object": "public.plans", "file": "supabase/migrations/20261110090600_plans.sql" }, "summary": "Public price list: open read on purpose, no write policy. Static rules flag the open read; the probe sees no owner column and no write, so it may appear only as Low." },
+    { "id": "C04", "target": { "object": "create-checkout", "file": "supabase/functions/create-checkout/index.ts" }, "summary": "Edge function that checks the caller with auth.getUser() and keeps the Stripe key in Deno.env." },
+    { "id": "C05", "target": { "object": "supabase client", "file": "src/integrations/supabase/client.ts" }, "summary": "Browser client with the publishable key only." },
+    { "id": "C06", "target": { "object": "public.handle_new_user", "file": "supabase/migrations/20261110090000_profiles.sql" }, "summary": "SECURITY DEFINER trigger function with search_path = '' (the profiles file also holds H03)." },
+    { "id": "C07", "target": { "object": "stripe-webhook", "file": "supabase/config.toml" }, "summary": "verify_jwt = false for the Stripe webhook, which is right once the signature is checked." }
+  ]
+}

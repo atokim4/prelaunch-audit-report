@@ -1,4 +1,4 @@
-import type { Cwe, Effort, RawFinding, Severity } from "./types.ts";
+import { SEVERITY_RANK, type Cwe, type Effort, type Proof, type RawFinding, type Severity } from "./types.ts";
 
 /**
  * The severity rubric. Every rule below is placed with these four questions, in order;
@@ -152,7 +152,7 @@ const PREFLIGHT: Record<string, RuleInfo> = {
     cwe: CWE.wrongSphere,
     whyItMatters:
       "Code in this file runs in the visitor's browser. A Supabase service role key or Stripe secret key there gives full control of the database or the Stripe account to anyone who opens developer tools. If it was ever deployed, treat the key as leaked.",
-    fix: "Use the public anon key in the browser and keep the secret key in server code only. Rotate the key if this was ever deployed.",
+    fix: "Use only public keys in the browser (the Supabase anon or publishable key, the Stripe publishable key) and keep secret keys in server code. Rotate the key if this was ever deployed.",
     effort: "1-4 hours",
   },
   "public-env-secret": {
@@ -215,6 +215,84 @@ const SECRETS: Record<string, RuleInfo> = {
   },
 };
 
+/** Our own config check of supabase/config.toml against the edge function code. */
+const PROJECT_CONFIG: Record<string, RuleInfo> = {
+  "stripe-webhook-jwt-gate": {
+    title: "Stripe webhook function behind Supabase's JWT check",
+    severity: fixed("medium"),
+    whyItMatters:
+      "Supabase checks for a signed-in user's token before an edge function runs, and Stripe never sends one. Every real payment event gets a 401, so customers who paid may not get access. It fails closed, which is why this is not rated higher.",
+    fix: "Set `verify_jwt = false` for this function in supabase/config.toml (or deploy it with `--no-verify-jwt`). The Stripe signature check in the code is then the gate, so keep it.",
+    effort: "under 1 hour",
+  },
+};
+
+/** What the RLS probe class means in plain words, for findings no static rule explains. */
+const PROBE_CLASS: Record<string, { title: string; why: string; fix: string }> = {
+  anon: {
+    title: "Visitors without an account can reach users' rows",
+    why: "The probe signed in as nobody, with only the public key every visitor has, and read or changed rows that belong to a user. On the real API that is one request from a browser console.",
+    fix: "Limit the policies on this table to the `authenticated` role and to rows where the owner column equals `auth.uid()`.",
+  },
+  "other-user": {
+    title: "Policy exists but lets one user reach another user's rows",
+    why: "The table has Row Level Security and policies, so a dashboard check passes. The probe signed in as a second user and still read or changed the first user's rows: the policy checks that someone is signed in, not who owns the row.",
+    fix: "Compare the owner column with `auth.uid()` in every policy on this table (`using` for reads, updates and deletes, `with check` for inserts and updates).",
+  },
+  owner: {
+    title: "Users can change what they paid for on their own row",
+    why: "The probe signed in as the row's owner and changed a plan, role or billing column. A free account can make itself paid with one request.",
+    fix: "Revoke update on the table, grant update only on the safe columns, and change paid columns only from the server after Stripe confirms payment.",
+  },
+  "anon-write": {
+    title: "Anyone can change shared data",
+    why: "The probe added, changed or deleted rows of a table that belongs to no user (a price list, settings), which every visitor sees.",
+    fix: "Keep the public read policy if it is wanted, and allow writes only to the service role (no insert, update or delete policy for anon or authenticated).",
+  },
+};
+
+/** Rows belong to someone: an owner column, or a parent row that has one. */
+const owned = (proof: Proof): boolean => proof.ownerColumns.length > 0 || proof.ownedVia !== undefined;
+
+/** Severity of what the probe could do: the rubric applied to measured access instead of policy text. */
+export function proofSeverity(proof: Proof): Severity | undefined {
+  if (!proof.leaks.length) return undefined;
+  const anon = proof.leaks.some((c) => c.actor === "anon");
+  const writes = proof.leaks.some((c) => c.action !== "select");
+  if (anon || (!owned(proof) && writes)) return "critical";
+  return "high";
+}
+
+/** The class of the worst leak, which picks the title for a probe-only finding. */
+export function proofClass(proof: Proof): keyof typeof PROBE_CLASS | undefined {
+  if (!proof.leaks.length) return undefined;
+  if (!owned(proof)) return "anon-write";
+  if (proof.leaks.some((c) => c.actor === "anon")) return "anon";
+  if (proof.leaks.some((c) => c.actor === "other-user")) return "other-user";
+  return "owner";
+}
+
+const max = (a: Severity, b: Severity | undefined): Severity => (b && SEVERITY_RANK[b] > SEVERITY_RANK[a] ? b : a);
+
+/**
+ * Final severity of a raw finding. The probe can raise it (a "warning" policy that really lets visitors
+ * read user rows is Critical) and lower one case: an open read policy on a table with no owner column and
+ * no write leak is a public reference table, which is Low (confirm it is meant to be public).
+ */
+export function severityOf(raw: RawFinding, info: RuleInfo): Severity {
+  const base = info.severity(raw);
+  const proof = raw.proof;
+  if (!proof) return base;
+  const sharedRead =
+    raw.rule === "rls-permissive-policy" &&
+    /\(select\)/.test(raw.message) &&
+    !owned(proof) &&
+    !proof.leaks.length &&
+    !proof.checks.some((c) => c.inconclusive);
+  if (sharedRead) return "low";
+  return max(base, proofSeverity(proof));
+}
+
 /** CWE for launch-audit ids, by exact id or by prefix. */
 const LAUNCH_CWE: [string, Cwe][] = [
   ["transport.no-https", CWE.cleartextTransmission],
@@ -258,9 +336,48 @@ function launchAuditInfo(raw: RawFinding): RuleInfo | undefined {
   };
 }
 
+/** npm's rating, one level down: an advisory says a version is affected, not that your code reaches it. */
+const NPM_SEVERITY: Record<string, Severity> = { critical: "high", high: "medium", moderate: "low", low: "low" };
+
+function npmAuditInfo(raw: RawFinding): RuleInfo | undefined {
+  const severity = NPM_SEVERITY[raw.toolSeverity];
+  if (!severity) return undefined; // "info"
+  const id = Number(raw.cwe?.match(/^CWE-(\d+)$/)?.[1]);
+  return {
+    title: raw.title ?? raw.rule,
+    severity: () => severity,
+    cwe: id ? cwe(id, "") : undefined,
+    whyItMatters:
+      "A package your app ships has a published security advisory for this version range. Whether it can be exploited depends on whether your code uses the affected part; the scan does not check that, which is why it is rated one level below npm's rating.",
+    fix: raw.fix ?? "",
+    effort: raw.fix?.includes("major version") ? "1-4 hours" : "under 1 hour",
+  };
+}
+
+function probeInfo(raw: RawFinding): RuleInfo | undefined {
+  const kind = raw.proof && proofClass(raw.proof);
+  const text = kind && PROBE_CLASS[kind];
+  if (!raw.proof || !text) return undefined;
+  const proof = raw.proof;
+  return {
+    title: text.title,
+    severity: () => proofSeverity(proof) ?? "low",
+    cwe: kind === "owner" ? CWE.massAssignment : kind === "other-user" ? CWE.incorrectAuthz : CWE.missingAuthz,
+    whyItMatters: text.why,
+    fix: text.fix,
+    effort: "under 1 hour",
+  };
+}
+
 /** Rubric entry for a raw finding, or undefined when it is not a finding for the report. */
 export function ruleInfo(raw: RawFinding): RuleInfo | undefined {
   switch (raw.source) {
+    case "rls-probe":
+      return probeInfo(raw);
+    case "project-config":
+      return PROJECT_CONFIG[raw.rule];
+    case "npm-audit":
+      return npmAuditInfo(raw);
     case "vibe-preflight":
       return PREFLIGHT[raw.rule];
     case "secret-scan":
@@ -275,6 +392,13 @@ export function repoRuleTable(): { source: string; rule: string; title: string; 
   return [
     ...Object.entries(PREFLIGHT).map(([rule, info]) => ({ source: "vibe-preflight", rule, ...info })),
     ...Object.entries(SECRETS).map(([rule, info]) => ({ source: "secret-scan", rule, ...info })),
+    ...Object.entries(PROJECT_CONFIG).map(([rule, info]) => ({ source: "project-config", rule, ...info })),
+    ...Object.entries(PROBE_CLASS).map(([kind, text]) => ({
+      source: "rls-probe",
+      rule: `rls-probe-leak (${kind})`,
+      title: text.title,
+      cwe: kind === "owner" ? CWE.massAssignment : kind === "other-user" ? CWE.incorrectAuthz : CWE.missingAuthz,
+    })),
   ].map(({ source, rule, title, cwe }) => ({ source, rule, title, cwe }));
 }
 
@@ -297,8 +421,34 @@ const PLAIN_RISK: Record<string, string> = {
   "env-file-committed": "Keys stored in the code repository can be read by anyone with access to it.",
   "secret-in-tree": "A working API key is written in the code.",
   "secret-in-history": "An API key removed from the code can still be recovered from its history.",
+  "dependency-advisory": "A library your app ships has a published security advisory for the version you use.",
+  "stripe-webhook-jwt-gate": "Supabase turns away Stripe's payment messages, so paying customers may not get access.",
 };
 
-export function plainRisk(finding: { source: string; rule: string; title: string }): string {
+const PROBE_RISK: Record<string, string> = {
+  anon: "Visitors without an account can read or change your users' records.",
+  "other-user": "Any signed-in user can see or change other customers' records.",
+  owner: "A signed-in user can switch their own account to the paid plan without paying.",
+  "anon-write": "Anyone can change data every customer sees, such as your prices.",
+};
+
+export function plainRisk(finding: {
+  source: string;
+  rule: string;
+  title: string;
+  subject?: string;
+  proof?: Proof;
+}): string {
+  const stripeKey = /STRIPE/i.test(finding.subject ?? "");
+  if (stripeKey && finding.rule === "server-secret-in-client") {
+    return "Your Stripe secret key is sent to every visitor's browser, so anyone can issue refunds or read your customers.";
+  }
+  if (stripeKey && finding.rule === "public-env-secret") {
+    return "Your Stripe secret key sits in a public variable, so any browser code that reads it ships the key to visitors.";
+  }
+  if (finding.source === "rls-probe") {
+    const kind = finding.proof && proofClass(finding.proof);
+    return (kind && PROBE_RISK[kind]) ?? finding.title;
+  }
   return (finding.source === "launch-audit" ? undefined : PLAIN_RISK[finding.rule]) ?? finding.title;
 }

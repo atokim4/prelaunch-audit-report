@@ -1,0 +1,38 @@
+diff --git a/supabase/functions/stripe-webhook/index.ts b/supabase/functions/stripe-webhook/index.ts
+--- a/supabase/functions/stripe-webhook/index.ts
++++ b/supabase/functions/stripe-webhook/index.ts
+@@ -2,6 +2,9 @@ import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
+ import Stripe from "https://esm.sh/stripe@14.21.0?target=deno";
+ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+ 
++const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY") ?? "", { httpClient: Stripe.createFetchHttpClient() });
++const cryptoProvider = Stripe.createSubtleCryptoProvider();
++
+ const corsHeaders = {
+   "Access-Control-Allow-Origin": "*",
+   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+@@ -13,7 +16,23 @@ serve(async (req) => {
+   }
+ 
+   try {
+-    const event = (await req.json()) as Stripe.Event;
++    const signature = req.headers.get("stripe-signature");
++    if (!signature) {
++      return new Response("Missing stripe-signature header", { status: 400 });
++    }
++
++    let event: Stripe.Event;
++    try {
++      event = await stripe.webhooks.constructEventAsync(
++        await req.text(),
++        signature,
++        Deno.env.get("STRIPE_WEBHOOK_SECRET") ?? "",
++        undefined,
++        cryptoProvider,
++      );
++    } catch {
++      return new Response("Invalid signature", { status: 400 });
++    }
+ 
+     const supabase = createClient(
+       Deno.env.get("SUPABASE_URL") ?? "",

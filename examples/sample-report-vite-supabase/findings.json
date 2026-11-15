@@ -1,0 +1,1691 @@
+{
+  "schema": "prelaunch-audit/v1",
+  "app": {
+    "name": "pipeline-crm",
+    "repo": "pipeline-crm-app",
+    "shape": {
+      "framework": "vite-react",
+      "label": "Vite + React single-page app",
+      "migrations": 7,
+      "edgeFunctions": [
+        {
+          "name": "create-checkout",
+          "path": "supabase/functions/create-checkout/index.ts",
+          "verifyJwt": true
+        },
+        {
+          "name": "stripe-webhook",
+          "path": "supabase/functions/stripe-webhook/index.ts",
+          "verifyJwt": false
+        }
+      ]
+    }
+  },
+  "generatedAt": "2026-11-15T09:00:00.000Z",
+  "counts": {
+    "critical": 5,
+    "high": 4,
+    "medium": 0,
+    "low": 1
+  },
+  "findings": [
+    {
+      "id": "PA-01",
+      "source": "vibe-preflight",
+      "rule": "server-secret-in-client",
+      "severity": "critical",
+      "title": "Server-only key used in browser code",
+      "cwe": {
+        "id": 668,
+        "name": "Exposure of Resource to Wrong Sphere"
+      },
+      "location": {
+        "kind": "file",
+        "file": "src/lib/billing.ts",
+        "line": 4
+      },
+      "evidence": "billing.ts runs in the browser and uses `VITE_STRIPE_SECRET_KEY`.",
+      "snippet": "   4 | const stripe = new Stripe(import.meta.env.VITE_STRIPE_SECRET_KEY);",
+      "whyItMatters": "Code in this file runs in the visitor's browser. A Supabase service role key or Stripe secret key there gives full control of the database or the Stripe account to anyone who opens developer tools. If it was ever deployed, treat the key as leaked.",
+      "fix": "Use only public keys in the browser (the Supabase anon or publishable key, the Stripe publishable key) and keep secret keys in server code. Rotate the key if this was ever deployed.",
+      "effort": "1-4 hours",
+      "subject": "VITE_STRIPE_SECRET_KEY",
+      "alsoFlaggedBy": [
+        "public-env-secret"
+      ],
+      "patch": {
+        "diff": "diff --git a/.env.example b/.env.example\n--- a/.env.example\n+++ b/.env.example\n@@ -1,4 +1,4 @@\n VITE_SUPABASE_URL=https://your-project.supabase.co\n VITE_SUPABASE_PUBLISHABLE_KEY=\n-VITE_STRIPE_SECRET_KEY=\n+STRIPE_SECRET_KEY=\n VITE_STRIPE_PRICE_PRO=\ndiff --git a/src/lib/billing.ts b/src/lib/billing.ts\n--- a/src/lib/billing.ts\n+++ b/src/lib/billing.ts\n@@ -1,7 +1,7 @@\n import Stripe from \"stripe\";\n \n // Used by the Billing page to show the customer's past payments.\n-const stripe = new Stripe(import.meta.env.VITE_STRIPE_SECRET_KEY);\n+const stripe = new Stripe(import.meta.env.STRIPE_SECRET_KEY);\n \n export async function listPayments(customerId: string) {\n   const charges = await stripe.charges.list({ customer: customerId, limit: 20 });\n",
+        "summary": "Renames VITE_STRIPE_SECRET_KEY to STRIPE_SECRET_KEY in .env.example, src/lib/billing.ts.",
+        "caveats": [
+          "Rename the variable in your hosting dashboard too, and rotate the key if a build with VITE_ ever went live."
+        ],
+        "verified": true,
+        "partial": "The key is out of the browser bundle after the next build, but the code that used it still runs in the browser and now gets an empty value. Move that code to a Supabase Edge Function that reads it with `Deno.env.get()` and checks the caller's JWT, and look up whose data it may touch from the session there, never from an argument the browser sends. Until then the feature is off, which is safer than a key anyone can copy."
+      }
+    },
+    {
+      "id": "PA-02",
+      "source": "vibe-preflight",
+      "rule": "stripe-webhook-unverified",
+      "severity": "critical",
+      "title": "Stripe webhook accepts unsigned requests",
+      "cwe": {
+        "id": 345,
+        "name": "Insufficient Verification of Data Authenticity"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/functions/stripe-webhook/index.ts",
+        "line": 23
+      },
+      "evidence": "Handles Stripe events without `constructEvent`, so any POST is trusted.",
+      "snippet": "  23 |     if (event.type === \"checkout.session.completed\") {\n  24 |       const session = event.data.object as Stripe.Checkout.Session;\n  25 |       await supabase\n  26 |         .from(\"profiles\")",
+      "whyItMatters": "The webhook acts on whatever JSON it receives. Anyone who finds the URL can post a fake 'payment completed' event and get the paid plan for free.",
+      "fix": "Verify the `stripe-signature` header with `stripe.webhooks.constructEvent` on the raw request body before acting on the event.",
+      "effort": "under 1 hour",
+      "subject": "constructEvent",
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/functions/stripe-webhook/index.ts b/supabase/functions/stripe-webhook/index.ts\n--- a/supabase/functions/stripe-webhook/index.ts\n+++ b/supabase/functions/stripe-webhook/index.ts\n@@ -2,6 +2,9 @@ import { serve } from \"https://deno.land/std@0.190.0/http/server.ts\";\n import Stripe from \"https://esm.sh/stripe@14.21.0?target=deno\";\n import { createClient } from \"https://esm.sh/@supabase/supabase-js@2.45.0\";\n \n+const stripe = new Stripe(Deno.env.get(\"STRIPE_SECRET_KEY\") ?? \"\", { httpClient: Stripe.createFetchHttpClient() });\n+const cryptoProvider = Stripe.createSubtleCryptoProvider();\n+\n const corsHeaders = {\n   \"Access-Control-Allow-Origin\": \"*\",\n   \"Access-Control-Allow-Headers\": \"authorization, x-client-info, apikey, content-type\",\n@@ -13,7 +16,23 @@ serve(async (req) => {\n   }\n \n   try {\n-    const event = (await req.json()) as Stripe.Event;\n+    const signature = req.headers.get(\"stripe-signature\");\n+    if (!signature) {\n+      return new Response(\"Missing stripe-signature header\", { status: 400 });\n+    }\n+\n+    let event: Stripe.Event;\n+    try {\n+      event = await stripe.webhooks.constructEventAsync(\n+        await req.text(),\n+        signature,\n+        Deno.env.get(\"STRIPE_WEBHOOK_SECRET\") ?? \"\",\n+        undefined,\n+        cryptoProvider,\n+      );\n+    } catch {\n+      return new Response(\"Invalid signature\", { status: 400 });\n+    }\n \n     const supabase = createClient(\n       Deno.env.get(\"SUPABASE_URL\") ?? \"\",\n",
+        "summary": "Reads the raw body and checks the stripe-signature header with constructEventAsync and Stripe's SubtleCrypto provider (Deno has no Node crypto) before the function touches the event. Unsigned or tampered requests get a 400.",
+        "caveats": [
+          "Set the secret: `supabase secrets set STRIPE_WEBHOOK_SECRET=whsec_...` (the endpoint's signing secret from the Stripe dashboard).",
+          "Keep `verify_jwt = false` for this function in supabase/config.toml: Stripe sends no Supabase token, and the signature is now the gate.",
+          "Test: `stripe listen --forward-to <project>.supabase.co/functions/v1/stripe-webhook`, then `stripe trigger checkout.session.completed`."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-03",
+      "source": "vibe-preflight",
+      "rule": "rls-permissive-policy",
+      "severity": "critical",
+      "title": "Policy lets everyone through (using true)",
+      "cwe": {
+        "id": 863,
+        "name": "Incorrect Authorization"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261110090100_leads.sql",
+        "line": 12
+      },
+      "evidence": "Policy \"Enable read access for all users\" on `public.leads` (select) lets anyone (signed in or not) read every row.",
+      "snippet": "  12 | create policy \"Enable read access for all users\"\n  13 |   on public.leads for select\n  14 |   using (true);",
+      "whyItMatters": "A policy with `using (true)` or `with check (true)` allows the action for every caller, including visitors who are not signed in. If the table holds anything private, it is public.",
+      "fix": "Replace the policy with one that compares `auth.uid()` to the owner column, and limit it to the `authenticated` role.",
+      "effort": "under 1 hour",
+      "subject": "public.leads",
+      "proof": {
+        "table": "public.leads",
+        "kind": "table",
+        "ownerColumns": [
+          "owner_id"
+        ],
+        "checks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"leads\""
+          },
+          {
+            "actor": "anon",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "delete",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"leads\""
+          },
+          {
+            "actor": "other-user",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "delete",
+            "rows": 0,
+            "of": 1
+          }
+        ],
+        "leaks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "policies": [
+          {
+            "name": "Enable read access for all users",
+            "command": "select",
+            "roles": [
+              "public"
+            ],
+            "using": "true"
+          },
+          {
+            "name": "Users can add leads",
+            "command": "insert",
+            "roles": [
+              "authenticated"
+            ],
+            "withCheck": "(auth.uid() = owner_id)"
+          },
+          {
+            "name": "Users can edit their leads",
+            "command": "update",
+            "roles": [
+              "authenticated"
+            ],
+            "using": "(auth.uid() = owner_id)",
+            "withCheck": "(auth.uid() = owner_id)"
+          }
+        ],
+        "afterPatches": []
+      },
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261115090000_scope_policy_leads.sql b/supabase/migrations/20261115090000_scope_policy_leads.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261115090000_scope_policy_leads.sql\n@@ -0,0 +1,8 @@\n+-- PA-03: limit \"Enable read access for all users\" to the users in the row.\n+-- Generated by prelaunch-audit. Review before applying.\n+drop policy \"Enable read access for all users\" on public.leads;\n+\n+create policy \"Users can select rows they are in\"\n+  on public.leads for select\n+  to authenticated\n+  using ((select auth.uid()) = owner_id);\n",
+        "summary": "Replaces \"Enable read access for all users\" with \"Users can select rows they are in\": signed-in users whose id is in owner_id.",
+        "caveats": [
+          "Check that owner_id really is who should have access. If the rows are meant to be public, keep the old policy and say so in a comment."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-04",
+      "source": "vibe-preflight",
+      "rule": "view-bypasses-rls",
+      "severity": "critical",
+      "title": "View skips Row Level Security",
+      "cwe": {
+        "id": 863,
+        "name": "Incorrect Authorization"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261110090200_deals.sql",
+        "line": 23
+      },
+      "evidence": "View `public.pipeline_summary` has no `security_invoker`, so it reads the tables below it without RLS.",
+      "snippet": "  23 | create view public.pipeline_summary as\n  24 |   select owner_id, stage, count(*) as deals, sum(amount_cents) as total_cents\n  25 |   from public.deals\n  26 |   group by owner_id, stage;",
+      "whyItMatters": "Postgres views run with the rights of whoever created them, so they ignore the policies of the tables below. Supabase serves the view over the API, which gives every caller the rows your policies were meant to hide.",
+      "fix": "Set `security_invoker = true` on the view (Postgres 15+), so it runs with the caller's rights and the table policies apply.",
+      "effort": "under 1 hour",
+      "subject": "public.pipeline_summary",
+      "proof": {
+        "table": "public.pipeline_summary",
+        "kind": "view",
+        "ownerColumns": [
+          "owner_id"
+        ],
+        "checks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "leaks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "policies": [],
+        "afterPatches": []
+      },
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261115090001_security_invoker_pipeline_summary.sql b/supabase/migrations/20261115090001_security_invoker_pipeline_summary.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261115090001_security_invoker_pipeline_summary.sql\n@@ -0,0 +1,3 @@\n+-- PA-04: make public.pipeline_summary respect the caller's RLS.\n+-- Generated by prelaunch-audit. Review before applying.\n+alter view public.pipeline_summary set (security_invoker = true);\n",
+        "summary": "Sets security_invoker on public.pipeline_summary, so the policies of the tables below it apply to whoever queries it.",
+        "caveats": [
+          "Needs Postgres 15 or newer (every current Supabase project is)."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-05",
+      "source": "vibe-preflight",
+      "rule": "rls-disabled",
+      "severity": "critical",
+      "title": "Table open to the public API (Row Level Security off)",
+      "cwe": {
+        "id": 862,
+        "name": "Missing Authorization"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261110090400_invoices.sql",
+        "line": 1
+      },
+      "evidence": "`public.invoices` is created without `enable row level security` in any migration.",
+      "snippet": "   1 | create table public.invoices (\n   2 |   id uuid primary key default gen_random_uuid(),\n   3 |   customer_id uuid not null references auth.users (id) on delete cascade,\n   4 |   number text not null,",
+      "whyItMatters": "Supabase serves every table in the public schema over its REST API, and the key it needs ships in your website. With Row Level Security off, anyone can read, change or delete every row of this table from a browser console.",
+      "fix": "Enable Row Level Security on the table. With no policies the API gets nothing, and your server code (service role) keeps working. Add policies only for what the browser really needs.",
+      "effort": "under 1 hour",
+      "subject": "public.invoices",
+      "proof": {
+        "table": "public.invoices",
+        "kind": "table",
+        "ownerColumns": [
+          "customer_id"
+        ],
+        "checks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "insert",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "update",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "delete",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "insert",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "update",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "delete",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "leaks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "insert",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "update",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "delete",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "insert",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "update",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "delete",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "policies": [],
+        "afterPatches": []
+      },
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261115090002_enable_rls_invoices.sql b/supabase/migrations/20261115090002_enable_rls_invoices.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261115090002_enable_rls_invoices.sql\n@@ -0,0 +1,3 @@\n+-- PA-05: turn on Row Level Security for public.invoices.\n+-- Generated by prelaunch-audit. Review before applying.\n+alter table public.invoices enable row level security;\n",
+        "summary": "Turns on Row Level Security for public.invoices. With no policies the public API gets nothing; server code using the service role key keeps working.",
+        "caveats": [
+          "If the browser needs to read or write this table, add policies for exactly those rows."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-06",
+      "source": "vibe-preflight",
+      "rule": "rls-update-privileged-column",
+      "severity": "high",
+      "title": "Users can edit their own plan or role column",
+      "cwe": {
+        "id": 915,
+        "name": "Improperly Controlled Modification of Dynamically-Determined Object Attributes"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261110090000_profiles.sql",
+        "line": 17
+      },
+      "evidence": "Policy \"Users can update their own profile\" lets users update their row in `public.profiles`, including `plan` and `stripe_customer_id`. No column privilege or trigger stops them.",
+      "snippet": "  17 | create policy \"Users can update their own profile\"\n  18 |   on public.profiles for update\n  19 |   to authenticated\n  20 |   using (auth.uid() = id);",
+      "whyItMatters": "The update policy lets a signed-in user change any column of their own row, including the one that says what they paid for. One request from the browser console turns a free account into a paid one.",
+      "fix": "Limit what users may update with column privileges (grant update only on the safe columns) and add `with check` to the policy. Change the plan only from the server, after Stripe confirms payment.",
+      "effort": "1-4 hours",
+      "subject": "public.profiles",
+      "proof": {
+        "table": "public.profiles",
+        "kind": "table",
+        "ownerColumns": [
+          "id"
+        ],
+        "checks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"profiles\""
+          },
+          {
+            "actor": "anon",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "delete",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"profiles\""
+          },
+          {
+            "actor": "other-user",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "delete",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "owner",
+            "action": "update",
+            "column": "plan",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "owner",
+            "action": "update",
+            "column": "stripe_customer_id",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "leaks": [
+          {
+            "actor": "owner",
+            "action": "update",
+            "column": "plan",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "owner",
+            "action": "update",
+            "column": "stripe_customer_id",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "policies": [
+          {
+            "name": "Users can update their own profile",
+            "command": "update",
+            "roles": [
+              "authenticated"
+            ],
+            "using": "(auth.uid() = id)"
+          },
+          {
+            "name": "Users can view their own profile",
+            "command": "select",
+            "roles": [
+              "authenticated"
+            ],
+            "using": "(auth.uid() = id)"
+          }
+        ],
+        "afterPatches": []
+      },
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261115090003_lock_columns_profiles.sql b/supabase/migrations/20261115090003_lock_columns_profiles.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261115090003_lock_columns_profiles.sql\n@@ -0,0 +1,12 @@\n+-- PA-06: users may only edit safe columns of public.profiles.\n+-- Generated by prelaunch-audit. Review before applying.\n+revoke update on public.profiles from anon, authenticated;\n+grant update (full_name, company) on public.profiles to authenticated;\n+\n+drop policy \"Users can update their own profile\" on public.profiles;\n+\n+create policy \"Users can update their own profile\"\n+  on public.profiles for update\n+  to authenticated\n+  using (auth.uid() = id)\n+  with check (auth.uid() = id);\n",
+        "summary": "Users can update only full_name, company; plan, stripe_customer_id can be changed only by the server. Adds a WITH CHECK to the policy.",
+        "caveats": [
+          "If the app updates other columns from the browser, add them to the grant. Change paid columns only in server code (for example the Stripe webhook)."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-07",
+      "source": "vibe-preflight",
+      "rule": "definer-function-anon",
+      "severity": "high",
+      "title": "Privileged database function callable by anyone",
+      "cwe": {
+        "id": 269,
+        "name": "Improper Privilege Management"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261110090100_leads.sql",
+        "line": 27
+      },
+      "evidence": "`public.delete_lead()` is SECURITY DEFINER and anon can call it at /rest/v1/rpc/delete_lead (Supabase's default grant was never revoked).",
+      "snippet": "  27 | create function public.delete_lead(lead_id uuid)\n  28 | returns void\n  29 | language sql\n  30 | security definer",
+      "whyItMatters": "The function runs with its owner's rights, so it skips Row Level Security. Supabase exposes it at /rest/v1/rpc/, and visitors who are not signed in may call it.",
+      "fix": "Revoke execute from `public`, `anon` and `authenticated`, grant it only to the roles that need it, and check the caller inside the function.",
+      "effort": "under 1 hour",
+      "subject": "public.delete_lead",
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261115090004_revoke_delete_lead.sql b/supabase/migrations/20261115090004_revoke_delete_lead.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261115090004_revoke_delete_lead.sql\n@@ -0,0 +1,3 @@\n+-- PA-07: stop the API roles from calling public.delete_lead().\n+-- Generated by prelaunch-audit. Review before applying.\n+revoke execute on function public.delete_lead(lead_id uuid) from public, anon, authenticated;\n",
+        "summary": "Revokes execute on public.delete_lead() from public, anon and authenticated. The service role keeps its own grant, so server code can still call it.",
+        "caveats": [
+          "Call it only from server code that has checked the user is allowed to (for an admin action: that they are an admin)."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-08",
+      "source": "rls-probe",
+      "rule": "rls-probe-leak",
+      "severity": "high",
+      "title": "Policy exists but lets one user reach another user's rows",
+      "cwe": {
+        "id": 863,
+        "name": "Incorrect Authorization"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261110090200_deals.sql",
+        "line": 13
+      },
+      "evidence": "RLS probe on `public.deals`: user B could select 1 of 1 of user A's rows. Let through by policy \"Authenticated users can view deals\" (select, `using (auth.role() = 'authenticated'::text)`).",
+      "snippet": "  13 | create policy \"Authenticated users can view deals\"\n  14 |   on public.deals for select\n  15 |   using (auth.role() = 'authenticated');",
+      "whyItMatters": "The table has Row Level Security and policies, so a dashboard check passes. The probe signed in as a second user and still read or changed the first user's rows: the policy checks that someone is signed in, not who owns the row.",
+      "fix": "Compare the owner column with `auth.uid()` in every policy on this table (`using` for reads, updates and deletes, `with check` for inserts and updates).",
+      "effort": "under 1 hour",
+      "subject": "public.deals",
+      "proof": {
+        "table": "public.deals",
+        "kind": "table",
+        "ownerColumns": [
+          "owner_id"
+        ],
+        "checks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"deals\""
+          },
+          {
+            "actor": "anon",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "delete",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"deals\""
+          },
+          {
+            "actor": "other-user",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "delete",
+            "rows": 0,
+            "of": 1
+          }
+        ],
+        "leaks": [
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "policies": [
+          {
+            "name": "Authenticated users can view deals",
+            "command": "select",
+            "roles": [
+              "public"
+            ],
+            "using": "(auth.role() = 'authenticated'::text)"
+          },
+          {
+            "name": "Users can manage their deals",
+            "command": "all",
+            "roles": [
+              "authenticated"
+            ],
+            "using": "(auth.uid() = owner_id)",
+            "withCheck": "(auth.uid() = owner_id)"
+          }
+        ],
+        "afterPatches": []
+      },
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261115090005_scope_policies_deals.sql b/supabase/migrations/20261115090005_scope_policies_deals.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261115090005_scope_policies_deals.sql\n@@ -0,0 +1,8 @@\n+-- PA-08: tie public.deals policies to the row owner.\n+-- Generated by prelaunch-audit. Review before applying.\n+drop policy \"Authenticated users can view deals\" on public.deals;\n+\n+create policy \"Authenticated users can view deals\"\n+  on public.deals for select\n+  to authenticated\n+  using ((select auth.uid()) = owner_id);\n",
+        "summary": "Rewrites \"Authenticated users can view deals\" so owner_id must equal the signed-in user's id. The names stay, so nothing else that refers to them breaks.",
+        "caveats": [
+          "Check that this is who should have access. If a team or shared workspace should see the rows too, scope the policy to that membership instead."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-09",
+      "source": "rls-probe",
+      "rule": "rls-probe-leak",
+      "severity": "high",
+      "title": "Policy exists but lets one user reach another user's rows",
+      "cwe": {
+        "id": 863,
+        "name": "Incorrect Authorization"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261110090300_activities.sql",
+        "line": 17
+      },
+      "evidence": "RLS probe on `public.activities`: user B inserted a row in user A's name. Let through by policy \"Signed-in users can log activity\" (insert, `with check (auth.uid() IS NOT NULL)`).",
+      "snippet": "  17 | create policy \"Signed-in users can log activity\"\n  18 |   on public.activities for insert\n  19 |   to authenticated\n  20 |   with check (auth.uid() is not null);",
+      "whyItMatters": "The table has Row Level Security and policies, so a dashboard check passes. The probe signed in as a second user and still read or changed the first user's rows: the policy checks that someone is signed in, not who owns the row.",
+      "fix": "Compare the owner column with `auth.uid()` in every policy on this table (`using` for reads, updates and deletes, `with check` for inserts and updates).",
+      "effort": "under 1 hour",
+      "subject": "public.activities",
+      "proof": {
+        "table": "public.activities",
+        "kind": "table",
+        "ownerColumns": [
+          "user_id"
+        ],
+        "checks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"activities\""
+          },
+          {
+            "actor": "anon",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "delete",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "insert",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "delete",
+            "rows": 0,
+            "of": 1
+          }
+        ],
+        "leaks": [
+          {
+            "actor": "other-user",
+            "action": "insert",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "policies": [
+          {
+            "name": "Signed-in users can log activity",
+            "command": "insert",
+            "roles": [
+              "authenticated"
+            ],
+            "withCheck": "(auth.uid() IS NOT NULL)"
+          },
+          {
+            "name": "Users can view their activity",
+            "command": "select",
+            "roles": [
+              "authenticated"
+            ],
+            "using": "(auth.uid() = user_id)"
+          }
+        ],
+        "afterPatches": []
+      },
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261115090006_scope_policies_activities.sql b/supabase/migrations/20261115090006_scope_policies_activities.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261115090006_scope_policies_activities.sql\n@@ -0,0 +1,8 @@\n+-- PA-09: tie public.activities policies to the row owner.\n+-- Generated by prelaunch-audit. Review before applying.\n+drop policy \"Signed-in users can log activity\" on public.activities;\n+\n+create policy \"Signed-in users can log activity\"\n+  on public.activities for insert\n+  to authenticated\n+  with check ((select auth.uid()) = user_id);\n",
+        "summary": "Rewrites \"Signed-in users can log activity\" so user_id must equal the signed-in user's id. The names stay, so nothing else that refers to them breaks.",
+        "caveats": [
+          "Check that this is who should have access. If a team or shared workspace should see the rows too, scope the policy to that membership instead."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-10",
+      "source": "vibe-preflight",
+      "rule": "rls-permissive-policy",
+      "severity": "low",
+      "title": "Policy lets everyone through (using true)",
+      "cwe": {
+        "id": 863,
+        "name": "Incorrect Authorization"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261110090600_plans.sql",
+        "line": 10
+      },
+      "evidence": "Policy \"Plans are public\" on `public.plans` (select) lets anyone (signed in or not) read every row.",
+      "snippet": "  10 | create policy \"Plans are public\"\n  11 |   on public.plans for select\n  12 |   to anon, authenticated\n  13 |   using (true);",
+      "whyItMatters": "A policy with `using (true)` or `with check (true)` allows the action for every caller, including visitors who are not signed in. If the table holds anything private, it is public.",
+      "fix": "Replace the policy with one that compares `auth.uid()` to the owner column, and limit it to the `authenticated` role.",
+      "effort": "under 1 hour",
+      "subject": "public.plans",
+      "proof": {
+        "table": "public.plans",
+        "kind": "table",
+        "ownerColumns": [],
+        "checks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 2,
+            "of": 2
+          },
+          {
+            "actor": "anon",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"plans\""
+          },
+          {
+            "actor": "anon",
+            "action": "update",
+            "rows": 0,
+            "of": 2
+          },
+          {
+            "actor": "anon",
+            "action": "delete",
+            "rows": 0,
+            "of": 2
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 2,
+            "of": 2
+          },
+          {
+            "actor": "other-user",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"plans\""
+          },
+          {
+            "actor": "other-user",
+            "action": "update",
+            "rows": 0,
+            "of": 2
+          },
+          {
+            "actor": "other-user",
+            "action": "delete",
+            "rows": 0,
+            "of": 2
+          }
+        ],
+        "leaks": [],
+        "policies": [
+          {
+            "name": "Plans are public",
+            "command": "select",
+            "roles": [
+              "anon",
+              "authenticated"
+            ],
+            "using": "true"
+          }
+        ],
+        "afterPatches": []
+      },
+      "alsoFlaggedBy": []
+    }
+  ],
+  "tools": [
+    {
+      "name": "vibe-preflight",
+      "version": "1.3.0",
+      "command": "node vendor/vibe-preflight/preflight.mjs pipeline-crm-app --format json --fail-on never",
+      "status": "ok"
+    },
+    {
+      "name": "secret-scan (built in)",
+      "version": "10 patterns",
+      "command": "working tree (git ls-files) + git log -p --all",
+      "status": "ok"
+    },
+    {
+      "name": "npm audit",
+      "version": "10.9.9",
+      "command": "npm audit --json --package-lock-only --omit=dev",
+      "status": "ok",
+      "note": "0 packages with advisories (runtime dependencies only)."
+    },
+    {
+      "name": "rls-probe",
+      "version": "1.1.0",
+      "command": "prelaunch-audit rls-probe (PGlite + Supabase shim, rolled-back tries as anon and a second user)",
+      "status": "ok",
+      "note": "9 tables and views tried as anon and as a second user."
+    }
+  ],
+  "probe": [
+    {
+      "table": "public.activities",
+      "kind": "table",
+      "ownerColumns": [
+        "user_id"
+      ],
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"activities\""
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        }
+      ],
+      "leaks": [
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "policies": [
+        {
+          "name": "Signed-in users can log activity",
+          "command": "insert",
+          "roles": [
+            "authenticated"
+          ],
+          "withCheck": "(auth.uid() IS NOT NULL)"
+        },
+        {
+          "name": "Users can view their activity",
+          "command": "select",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "(auth.uid() = user_id)"
+        }
+      ],
+      "afterPatches": []
+    },
+    {
+      "table": "public.deals",
+      "kind": "table",
+      "ownerColumns": [
+        "owner_id"
+      ],
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"deals\""
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"deals\""
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        }
+      ],
+      "leaks": [
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "policies": [
+        {
+          "name": "Authenticated users can view deals",
+          "command": "select",
+          "roles": [
+            "public"
+          ],
+          "using": "(auth.role() = 'authenticated'::text)"
+        },
+        {
+          "name": "Users can manage their deals",
+          "command": "all",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "(auth.uid() = owner_id)",
+          "withCheck": "(auth.uid() = owner_id)"
+        }
+      ],
+      "afterPatches": []
+    },
+    {
+      "table": "public.invoices",
+      "kind": "table",
+      "ownerColumns": [
+        "customer_id"
+      ],
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "leaks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "policies": [],
+      "afterPatches": []
+    },
+    {
+      "table": "public.leads",
+      "kind": "table",
+      "ownerColumns": [
+        "owner_id"
+      ],
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"leads\""
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"leads\""
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        }
+      ],
+      "leaks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "policies": [
+        {
+          "name": "Enable read access for all users",
+          "command": "select",
+          "roles": [
+            "public"
+          ],
+          "using": "true"
+        },
+        {
+          "name": "Users can add leads",
+          "command": "insert",
+          "roles": [
+            "authenticated"
+          ],
+          "withCheck": "(auth.uid() = owner_id)"
+        },
+        {
+          "name": "Users can edit their leads",
+          "command": "update",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "(auth.uid() = owner_id)",
+          "withCheck": "(auth.uid() = owner_id)"
+        }
+      ],
+      "afterPatches": []
+    },
+    {
+      "table": "public.open_tasks",
+      "kind": "view",
+      "ownerColumns": [
+        "owner_id"
+      ],
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        }
+      ],
+      "leaks": [],
+      "policies": [],
+      "afterPatches": []
+    },
+    {
+      "table": "public.pipeline_summary",
+      "kind": "view",
+      "ownerColumns": [
+        "owner_id"
+      ],
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "leaks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "policies": [],
+      "afterPatches": []
+    },
+    {
+      "table": "public.plans",
+      "kind": "table",
+      "ownerColumns": [],
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 2,
+          "of": 2
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"plans\""
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 0,
+          "of": 2
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 0,
+          "of": 2
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 2,
+          "of": 2
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"plans\""
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 0,
+          "of": 2
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 0,
+          "of": 2
+        }
+      ],
+      "leaks": [],
+      "policies": [
+        {
+          "name": "Plans are public",
+          "command": "select",
+          "roles": [
+            "anon",
+            "authenticated"
+          ],
+          "using": "true"
+        }
+      ],
+      "afterPatches": []
+    },
+    {
+      "table": "public.profiles",
+      "kind": "table",
+      "ownerColumns": [
+        "id"
+      ],
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"profiles\""
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"profiles\""
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "owner",
+          "action": "update",
+          "column": "plan",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "owner",
+          "action": "update",
+          "column": "stripe_customer_id",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "leaks": [
+        {
+          "actor": "owner",
+          "action": "update",
+          "column": "plan",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "owner",
+          "action": "update",
+          "column": "stripe_customer_id",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "policies": [
+        {
+          "name": "Users can update their own profile",
+          "command": "update",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "(auth.uid() = id)"
+        },
+        {
+          "name": "Users can view their own profile",
+          "command": "select",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "(auth.uid() = id)"
+        }
+      ],
+      "afterPatches": []
+    },
+    {
+      "table": "public.tasks",
+      "kind": "table",
+      "ownerColumns": [
+        "owner_id"
+      ],
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"tasks\""
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"tasks\""
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        }
+      ],
+      "leaks": [],
+      "policies": [
+        {
+          "name": "Users can add their tasks",
+          "command": "insert",
+          "roles": [
+            "authenticated"
+          ],
+          "withCheck": "(( SELECT auth.uid() AS uid) = owner_id)"
+        },
+        {
+          "name": "Users can delete their tasks",
+          "command": "delete",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "(( SELECT auth.uid() AS uid) = owner_id)"
+        },
+        {
+          "name": "Users can read their tasks",
+          "command": "select",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "(( SELECT auth.uid() AS uid) = owner_id)"
+        },
+        {
+          "name": "Users can update their tasks",
+          "command": "update",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "(( SELECT auth.uid() AS uid) = owner_id)",
+          "withCheck": "(( SELECT auth.uid() AS uid) = owner_id)"
+        }
+      ],
+      "afterPatches": []
+    }
+  ],
+  "notChecked": [
+    "The deployed site: no URL was given, so HTTPS, security headers, cookies and the built JavaScript bundles were not checked.",
+    "Business logic and authorization inside your own API routes, server actions and edge functions (beyond the Stripe webhook).",
+    "The live database: policies or grants changed in the Supabase dashboard and not saved as migrations are invisible to a repo scan. The RLS probe runs your migrations in a local Postgres, not against your project.",
+    "Rate limiting, abuse and brute-force protection, email/auth settings in the Supabase dashboard.",
+    "Manual penetration testing: every finding here comes from automated scanners and a local probe, and nothing was tried against your running app."
+  ]
+}

@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { ruleInfo } from "./rubric.ts";
+import { ruleInfo, severityOf } from "./rubric.ts";
 import { SEVERITIES, SEVERITY_RANK, type Finding, type RawFinding, type Severity } from "./types.ts";
 
 /** When two rules flag the same object with the same severity, the more specific one names the finding. */
@@ -75,7 +75,7 @@ export async function normalize(repo: string, raws: RawFinding[]): Promise<{ fin
       continue;
     }
     const key = dedupeKey(raw);
-    groups.set(key, [...(groups.get(key) ?? []), { raw, severity: info.severity(raw) }]);
+    groups.set(key, [...(groups.get(key) ?? []), { raw, severity: severityOf(raw, info) }]);
   }
 
   const cache = new Map<string, string[] | null>();
@@ -103,6 +103,8 @@ export async function normalize(repo: string, raws: RawFinding[]): Promise<{ fin
       whyItMatters: info.whyItMatters,
       fix: info.fix,
       effort: info.effort,
+      subject: lead.raw.source === "launch-audit" ? undefined : lead.raw.subject,
+      proof: group.find((g) => g.raw.proof)?.raw.proof,
       alsoFlaggedBy: others,
     });
   }

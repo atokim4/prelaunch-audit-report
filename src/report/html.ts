@@ -1,7 +1,17 @@
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { plainRisk, repoRuleTable, RUBRIC } from "../rubric.ts";
-import { SEVERITIES, type AuditResult, type Effort, type Finding, type Severity } from "../types.ts";
+import {
+  SEVERITIES,
+  type Action,
+  type Actor,
+  type AuditResult,
+  type Effort,
+  type Finding,
+  type ProbeCheck,
+  type Proof,
+  type Severity,
+} from "../types.ts";
 
 export interface RenderOptions {
   /** Printed on the cover under the title, e.g. that this is a sample run on a demo app. */
@@ -63,11 +73,103 @@ function diffHtml(diff: string): string {
   return `<pre class="diff"><code>${rows.join("")}</code></pre>`;
 }
 
+const ACTOR_LABEL: Record<Actor, string> = {
+  anon: "Visitor, no account",
+  "other-user": "Another user",
+  owner: "Owner",
+};
+const ACTIONS: Action[] = ["select", "insert", "update", "delete"];
+const ACTION_LABEL: Record<Action, string> = {
+  select: "read",
+  insert: "insert as A",
+  update: "update",
+  delete: "delete",
+};
+
+function cell(check: ProbeCheck | undefined, leaked: boolean): string {
+  if (!check) return `<td class="pc pc-na">–</td>`;
+  if (check.inconclusive) return `<td class="pc pc-unknown" title="${esc(check.inconclusive)}">?</td>`;
+  const text =
+    check.action === "insert" ? (check.rows ? "got in" : "blocked") : check.rows ? `${check.rows}/${check.of}` : "0";
+  return `<td class="pc ${leaked ? "pc-leak" : "pc-ok"}">${esc(text)}</td>`;
+}
+
+function ownerText(proof: Proof): string {
+  if (proof.ownerColumns.length)
+    return ` (owner column: <code>${proof.ownerColumns.map(esc).join("</code>, <code>")}</code>)`;
+  if (proof.ownedVia) {
+    return ` (owned through <code>${esc(proof.ownedVia.column)}</code> → <code>${esc(proof.ownedVia.parent)}</code>)`;
+  }
+  return ", no owner column (shared data)";
+}
+
+/** The probe's tries on one table, as a small grid: actors down, actions across. */
+function proofHtml(proof: Proof): string {
+  const leaked = new Set(proof.leaks);
+  const rows = (["anon", "other-user"] as const)
+    .map((actor) => {
+      const cells = ACTIONS.map((action) => {
+        const check = proof.checks.find((c) => c.actor === actor && c.action === action && !c.column);
+        return cell(check, check ? leaked.has(check) : false);
+      });
+      return `<tr><th scope="row">${ACTOR_LABEL[actor]}</th>${cells.join("")}</tr>`;
+    })
+    .join("");
+  const escalations = proof.checks
+    .filter((c) => c.actor === "owner" && c.column)
+    .map((c) => `<code>${esc(c.column ?? "")}</code> ${c.rows ? '<b class="pc-leak-text">changed</b>' : "refused"}`);
+  const after = proof.afterPatches;
+  const verdict =
+    after === undefined
+      ? ""
+      : proof.leaks.length === 0
+        ? ""
+        : after.length === 0
+          ? `<p class="probe-after">Same harness with the report's patches applied: <b>0 leaks</b>.</p>`
+          : `<p class="probe-after">Same harness with the report's patches applied: <b>${after.length} still open</b> (${after.map((c) => `${ACTOR_LABEL[c.actor].toLowerCase()} ${c.column ? `changes ${c.column}` : ACTION_LABEL[c.action]}`).join(", ")}).</p>`;
+  return `<section class="probe">
+    <h4>Tested in Postgres</h4>
+    <p class="probe-what">User A owns ${proof.kind === "view" ? "the rows behind this view" : "one row"}; each cell is what the actor got in a rolled-back transaction${ownerText(proof)}.${proof.checks.some((c) => c.inconclusive) ? ` "?" means the try failed for another reason (a constraint the test values broke), so it proves nothing either way.` : ""}</p>
+    <table class="probe-grid"><thead><tr><th></th>${ACTIONS.map((a) => `<th>${ACTION_LABEL[a]}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table>
+    ${escalations.length ? `<p class="probe-what">Owner editing paid columns on their own row: ${escalations.join(", ")}.</p>` : ""}
+    ${verdict}
+  </section>`;
+}
+
+/** Every table the probe tried, one line each: the access matrix for the summary. */
+function matrixHtml(matrix: Proof[]): string {
+  const rows = matrix
+    .map((p) => {
+      const read = (actor: Actor) => p.checks.find((c) => c.actor === actor && c.action === "select");
+      const write = (actor: Actor) =>
+        p.leaks
+          .filter((c) => c.actor === actor && c.action !== "select" && !c.column)
+          .map((c) => ACTION_LABEL[c.action]);
+      const readCell = (actor: Actor) => {
+        const check = read(actor);
+        return cell(check, check ? p.leaks.includes(check) : false);
+      };
+      const writeCell = (actor: Actor) => {
+        const w = write(actor);
+        const text = w.length === 3 ? "all" : w.map((a) => a.replace(" as A", "")).join(", ");
+        return `<td class="pc ${w.length ? "pc-leak" : "pc-ok"}">${w.length ? esc(text) : "none"}</td>`;
+      };
+      const own = p.leaks.filter((c) => c.actor === "owner").map((c) => c.column ?? "");
+      const ownText = own.length > 1 ? `${own[0]} +${own.length - 1}` : (own[0] ?? "");
+      return `<tr><td><code>${esc(p.table.replace(/^public\./, ""))}</code>${p.kind === "view" ? ' <span class="kind">view</span>' : ""}</td>${readCell("anon")}${writeCell("anon")}${readCell("other-user")}${writeCell("other-user")}<td class="pc ${own.length ? "pc-leak" : "pc-ok"}">${own.length ? esc(ownText) : "none"}</td></tr>`;
+    })
+    .join("");
+  return `<h4>Who can reach user A's rows</h4>
+    <p class="probe-what">The RLS probe ran your migrations in a local Postgres, gave user A one row per table and tried every action as a visitor without an account and as a second user. Red cells got through: "1/1" means one of user A's one rows. "Self-upgrade" is user A changing a plan or billing column on their own row. A table with no owner column of its own belongs to the owner of the row its foreign key points at; shared tables with no owner at all (price lists) count only writes. "?" is a try that failed for another reason and proves nothing.</p>
+    <table class="matrix"><thead><tr><th>Table</th><th>Visitor read</th><th>Visitor write</th><th>User B read</th><th>User B write</th><th>Self-upgrade</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
 function findingHtml(f: Finding): string {
   const patch = f.patch
     ? `<section class="patch">
         <h4>Patch</h4>
         <p>${prose(f.patch.summary)}</p>
+        ${f.patch.partial ? `<p class="partial"><b>Partial fix.</b> ${prose(f.patch.partial)}</p>` : ""}
         ${diffHtml(f.patch.diff)}
         <p class="check">${f.patch.verified ? "Applies cleanly to the audited code (<code>git apply --check</code>)." : "Did not pass <code>git apply --check</code>: apply by hand."}</p>
         ${f.patch.caveats.length ? `<ul class="caveats">${f.patch.caveats.map((c) => `<li>${prose(c)}</li>`).join("")}</ul>` : ""}
@@ -93,7 +195,8 @@ function findingHtml(f: Finding): string {
       <p>${prose(f.whyItMatters)}</p>
       <h4>Fix</h4>
       <p>${prose(f.fix)}</p>
-      ${f.cwe ? `<p class="cwe">${esc(`CWE-${f.cwe.id}: ${f.cwe.name}`)}</p>` : ""}
+      ${f.proof ? proofHtml(f.proof) : ""}
+      ${f.cwe ? `<p class="cwe">${esc(`CWE-${f.cwe.id}${f.cwe.name ? `: ${f.cwe.name}` : ""}`)}</p>` : ""}
       ${patch}
     </div>
   </article>`;
@@ -186,8 +289,11 @@ tr{break-inside:avoid}
 td:first-child{white-space:nowrap}
 
 /* Findings */
-.finding{display:grid;grid-template-columns:30mm 1fr;gap:6mm;padding:5mm 0 3mm;border-top:1px solid var(--ink);break-inside:avoid-page}
+.finding{display:grid;grid-template-columns:30mm 1fr;gap:6mm;padding:5mm 0 3mm;border-top:1px solid var(--ink)}
 .finding+.finding{break-before:auto}
+h2{break-after:avoid}
+.body h4,.where{break-after:avoid}
+.snippet,.probe,.partial,.caveats li,.evidence{break-inside:avoid}
 .apparatus{font:400 8pt/1.4 var(--sans);color:var(--ink-2)}
 .apparatus .fid{font:600 15pt/1 var(--serif);color:var(--ink);margin-bottom:2mm}
 .apparatus dl{margin:3mm 0 0}.apparatus dt{font-weight:600;letter-spacing:.05em;text-transform:uppercase;font-size:7pt;margin-top:2mm}
@@ -203,7 +309,40 @@ td:first-child{white-space:nowrap}
 .d-file{display:block;color:var(--ink-2);font-weight:600}
 .caveats{margin:0;padding-left:4mm;font-size:9.5pt}.caveats li{margin-bottom:1mm}
 .appendix p,.appendix li{font-size:9.5pt}
+
+/* RLS probe */
+.probe{margin:3mm 0 1mm}
+.probe-what,.probe-after{font:400 8.5pt/1.45 var(--sans);color:var(--ink-2)}
+.probe-after b{color:var(--ink)}
+.probe-grid{width:auto;margin:1.5mm 0 2mm}
+.probe-grid th,.probe-grid td{padding:1.2mm 3mm 1.2mm 0}
+.probe-grid thead th{font-weight:600}
+.probe-grid tbody th{font-weight:400;color:var(--ink);border-bottom:1px solid var(--rule);text-align:left;padding-right:5mm}
+.pc{text-align:center;font-variant-numeric:tabular-nums;white-space:nowrap}
+.matrix{table-layout:fixed}.matrix th:first-child{width:30%}
+.matrix .pc{text-align:left;white-space:normal}
+.pc-leak{color:var(--critical);font-weight:600}
+.pc-leak::before{content:"";display:inline-block;width:1.8mm;height:1.8mm;border-radius:.4mm;background:var(--critical);margin-right:1.2mm;vertical-align:.2mm}
+.pc-ok{color:var(--ink-2)}
+.pc-na{color:var(--rule)}
+.pc-unknown{color:var(--medium);font-weight:600}
+.pc-leak-text{color:var(--critical)}
+.partial{font-size:9.5pt;border-left:2px solid var(--high);padding-left:3mm}
+.partial b{color:var(--high)}
+.kind{font-size:7.5pt;color:var(--ink-2);text-transform:uppercase;letter-spacing:.05em}
 `;
+
+function shapeLine(result: AuditResult): string {
+  const { shape } = result.app;
+  const parts = [shape.label];
+  if (shape.migrations) parts.push(`${shape.migrations} Supabase migrations`);
+  if (shape.edgeFunctions.length) {
+    parts.push(
+      `${shape.edgeFunctions.length} edge function${shape.edgeFunctions.length === 1 ? "" : "s"} (${shape.edgeFunctions.map((f) => f.name).join(", ")})`,
+    );
+  }
+  return parts.join(", ");
+}
 
 export async function renderHtml(result: AuditResult, options: RenderOptions = {}): Promise<string> {
   const { findings, counts } = result;
@@ -211,7 +350,11 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
   const top = findings.slice(0, 3);
   const [lo, hi] = effortRange(serious);
   const patched = findings.filter((f) => f.patch?.verified).length;
-  const repoChecked = result.tools.map((t) => `${t.name} ${t.version}`).join(", ");
+  const partial = findings.filter((f) => f.patch?.verified && f.patch.partial).length;
+  const repoChecked = result.tools
+    .filter((t) => t.status === "ok")
+    .map((t) => `${t.name} ${t.version}`)
+    .join(", ");
 
   const cover = `<section class="cover">
     <div class="mast"><span>Automated scan with patches</span><span>${esc(date(result.generatedAt))}</span></div>
@@ -224,9 +367,12 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
     </div>
     <div class="scope">
       <div><h4>What was checked</h4><ul>
+        <li>Project: ${esc(shapeLine(result))}.</li>
         <li>Supabase migrations: RLS, policies, views, SECURITY DEFINER functions, storage buckets.</li>
-        <li>App code: server keys in browser code, public env prefixes, the Stripe webhook.</li>
+        ${result.probe ? `<li>Row Level Security by behaviour: ${result.probe.length} tables and views tried as a visitor and as a second user in a local Postgres, before and after the patches.</li>` : ""}
+        <li>App code: server keys in browser code, public env prefixes, the Stripe webhook${result.app.shape.edgeFunctions.length ? " (including Deno edge functions and their JWT setting)" : ""}.</li>
         <li>Credentials in the files and in git history.</li>
+        ${result.tools.some((t) => t.name === "npm audit" && t.status === "ok") ? "<li>Runtime dependencies against npm's advisory database.</li>" : ""}
         ${result.app.url ? "<li>The live site: HTTPS, security headers, cookies, exposed files, keys in JS bundles.</li>" : ""}
         <li>Tools: ${esc(repoChecked)}.</li>
       </ul></div>
@@ -237,7 +383,7 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
   const summary = `<section class="part">
     <h2>Summary</h2>
     <p>The scan found <strong>${findings.length} issues</strong>: ${SEVERITIES.map((s) => `${counts[s]} ${LABEL[s].toLowerCase()}`).join(", ")}.
-    ${serious.length ? `Fixing the ${serious.length} critical and high ones is about ${hours(lo)} to ${hours(hi)} hours of developer time, and ${patched} of the ${findings.length} come with a patch that applies to the code as it is.` : "Nothing critical or high was found."}</p>
+    ${serious.length ? `Fixing the ${serious.length} critical and high ones is about ${hours(lo)} to ${hours(hi)} hours of developer time, and ${patched} of the ${findings.length} come with a patch that applies to the code as it is${partial ? ` (${partial} of them partial: they close the exposure and say what a developer still has to move)` : ""}.` : "Nothing critical or high was found."}</p>
     ${
       top.length
         ? `<h4>The three biggest risks</h4><ol class="risks">${top
@@ -254,10 +400,11 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
       <tbody>${findings
         .map(
           (f) =>
-            `<tr><td><a href="#${f.id}">${f.id}</a></td><td>${tag(f.severity)}</td><td>${esc(f.title)}</td><td><code>${esc(where(f))}</code></td><td>${esc(f.effort)}</td><td>${f.patch?.verified ? "yes" : "no"}</td></tr>`,
+            `<tr><td><a href="#${f.id}">${f.id}</a></td><td>${tag(f.severity)}</td><td>${esc(f.title)}</td><td><code>${esc(where(f))}</code></td><td>${esc(f.effort)}</td><td>${f.patch?.verified ? (f.patch.partial ? "partial" : "yes") : "no"}</td></tr>`,
         )
         .join("")}</tbody>
     </table>
+    ${result.probe?.length ? matrixHtml(result.probe) : ""}
   </section>`;
 
   const details = `<section class="part"><h2>Findings</h2>${findings.map(findingHtml).join("")}</section>`;
@@ -265,7 +412,7 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
   const appendix = `<section class="part appendix">
     <h2>Appendix</h2>
     <h4>How severity is rated</h4>
-    <p>Each rule is placed by the first line that fits. Live-site findings keep the severity apify-launch-audit gives them.</p>
+    <p>Each rule is placed by the first line that fits. Live-site findings keep the severity apify-launch-audit gives them. When the RLS probe ran, the severity follows what it could really do: a visitor reading user rows is Critical even if the policy only looked suspicious, and an open read on a table with no owner column and no write leak is Low. Dependency advisories are one level below npm's rating, because the scan does not prove your code reaches the affected function.</p>
     <table><tbody>${RUBRIC.map((r) => `<tr><td>${tag(r.severity)}</td><td>${esc(r.rule)}</td></tr>`).join("")}</tbody></table>
     <h4>Tools</h4>
     <table><thead><tr><th>Tool</th><th>Version</th><th>What ran</th></tr></thead><tbody>${result.tools

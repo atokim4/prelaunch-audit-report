@@ -57,7 +57,18 @@ describe("audit of the broken bench app", () => {
   });
 
   it("rates the findings with the rubric", () => {
-    expect(result.counts).toEqual({ critical: 7, high: 3, medium: 1, low: 1 });
+    // The RLS probe raises recent_notes (view) and messages (using true) from High to Critical: a visitor
+    // without an account really read user A's rows there.
+    expect(result.counts).toEqual({ critical: 9, high: 1, medium: 1, low: 1 });
+    const raised = result.findings.filter(
+      (f) => f.proof?.leaks.some((c) => c.actor === "anon") && f.severity === "critical",
+    );
+    expect(raised.map((f) => f.subject).sort()).toEqual([
+      "public.audit_log",
+      "public.messages",
+      "public.recent_notes",
+      "public.user_directory",
+    ]);
   });
 
   it("has a patch that passes git apply --check for every Critical and High finding", () => {
@@ -92,7 +103,7 @@ describe("the bench app after applying every patch", () => {
 
     beforeAll(async () => {
       db = await PGlite.create();
-      await db.exec(await readFile("test/fixtures/supabase-shim.sql", "utf8"));
+      await db.exec(await readFile("src/probe/supabase-shim.sql", "utf8"));
       const dir = join(patched, "supabase/migrations");
       for (const name of (await readdir(dir)).filter((n) => n.endsWith(".sql")).sort()) {
         await db.exec(await readFile(join(dir, name), "utf8"));

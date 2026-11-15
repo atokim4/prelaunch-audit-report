@@ -10,8 +10,9 @@ import { SEVERITIES } from "./types.ts";
 const HELP = `Usage: prelaunch-audit <repo> [options]
 
 Runs vibe-preflight (repo checks for Supabase + Stripe), a credential scan of the files and git
-history and, with --url, a passive scan of the live site. Writes a severity-rated report with
-a patch for each finding it can fix.
+history, a Row Level Security probe of the migrations in PGlite, npm audit and, with --url, a
+passive scan of the live site. Writes a severity-rated report with a patch for each finding it
+can fix.
 
 Options:
   --out <dir>                 where to write the report (default: ./audit-out)
@@ -22,6 +23,7 @@ Options:
   --note <text>               a line for the cover (scope, sample notice)
   --name <name>               app name on the report (default: package.json name)
   --date <ISO date>           report date (default: now), for reproducible output
+  --skip-npm-audit            do not run npm audit (it needs network and a package-lock.json)
   -h, --help                  show this help
 
 Output: <out>/findings.json, report.html, report.pdf and patches/PA-xx.diff.
@@ -40,6 +42,7 @@ async function main(): Promise<void> {
       format: { type: "string", default: "json,html,pdf" },
       note: { type: "string" },
       date: { type: "string" },
+      "skip-npm-audit": { type: "boolean", default: false },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -62,6 +65,7 @@ async function main(): Promise<void> {
     launchAuditJson: values["launch-audit-json"],
     name: values.name,
     now,
+    npmAudit: !values["skip-npm-audit"],
   });
 
   const out = resolve(values.out);

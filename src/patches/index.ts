@@ -1,8 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { SEVERITY_RANK, type Finding } from "../types.ts";
-import { applies, unifiedDiff } from "./diff.ts";
-import { FIXERS, type FixContext } from "./fixers.ts";
+import { applies, unifiedDiff, type FileEdit } from "./diff.ts";
+import { FIXERS, probeLeak, type FixContext } from "./fixers.ts";
+import type { SqlFile } from "./sql.ts";
 
 const MIGRATIONS_DIR = "supabase/migrations";
 
@@ -45,20 +46,31 @@ export async function fixContext(repo: string, files: string[], now: Date): Prom
 /**
  * Adds a patch to every finding a fixer knows how to fix (always tried for Critical and High, also for
  * Medium when a fixer exists). Each diff is checked with `git apply --check` against the files as they are.
+ * Returns the edits of the verified patches, for the RLS re-probe.
  */
-export async function attachPatches(findings: Finding[], ctx: FixContext, repo: string): Promise<void> {
+export async function attachPatches(findings: Finding[], ctx: FixContext, repo: string): Promise<FileEdit[]> {
+  const verified: FileEdit[] = [];
   for (const finding of findings) {
     if (SEVERITY_RANK[finding.severity] < SEVERITY_RANK.medium) continue;
     const fixer = FIXERS[finding.rule];
-    if (!fixer) continue;
-    const draft = await fixer(finding, ctx);
+    let draft = fixer ? await fixer(finding, ctx) : undefined;
+    // A static rule's fixer may not know the table's shape (a child table has no owner column); the
+    // probe's proof can still say which policies leaked and who owns the rows.
+    if (!draft && finding.proof?.leaks.length) draft = await probeLeak(finding, ctx);
     if (!draft) continue;
     const diff = await unifiedDiff(draft.edits);
-    finding.patch = {
-      diff,
-      summary: draft.summary,
-      caveats: draft.caveats,
-      verified: await applies(repo, draft.edits, diff),
-    };
+    const ok = await applies(repo, draft.edits, diff);
+    finding.patch = { diff, summary: draft.summary, caveats: draft.caveats, verified: ok, partial: draft.partial };
+    if (ok) verified.push(...draft.edits);
   }
+  return verified;
+}
+
+/** The migration set after the patches: edited files replaced, new files added. */
+export function patchedMigrations(migrations: SqlFile[], edits: FileEdit[]): SqlFile[] {
+  const byPath = new Map(migrations.map((m) => [m.path, m.text]));
+  for (const edit of edits) {
+    if (edit.path.startsWith(`${MIGRATIONS_DIR}/`) && edit.path.endsWith(".sql")) byPath.set(edit.path, edit.after);
+  }
+  return [...byPath].map(([path, text]) => ({ path, text }));
 }

@@ -81,3 +81,20 @@ $$;
 alter default privileges in schema public grant all on tables to anon, authenticated, service_role;
 alter default privileges in schema public grant all on sequences to anon, authenticated, service_role;
 alter default privileges in schema public grant all on functions to anon, authenticated, service_role;
+
+-- Platform objects migrations often touch: the realtime publication, Supabase's internal roles and a
+-- pg_cron stand-in (the probe steps over `create extension pg_cron`, so `cron.schedule` must exist).
+create publication supabase_realtime;
+create role supabase_admin nologin;
+create role supabase_auth_admin nologin;
+create role supabase_storage_admin nologin;
+create role supabase_realtime_admin nologin;
+create role dashboard_user nologin;
+create role pgbouncer nologin;
+create schema cron;
+create function cron.schedule(job_name text, schedule text, command text) returns bigint
+language sql as $$ select 1::bigint $$;
+create function cron.schedule(schedule text, command text) returns bigint
+language sql as $$ select 1::bigint $$;
+create function cron.unschedule(job_name text) returns boolean
+language sql as $$ select true $$;

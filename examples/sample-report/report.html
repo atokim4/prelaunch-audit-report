@@ -70,8 +70,11 @@ tr{break-inside:avoid}
 td:first-child{white-space:nowrap}
 
 /* Findings */
-.finding{display:grid;grid-template-columns:30mm 1fr;gap:6mm;padding:5mm 0 3mm;border-top:1px solid var(--ink);break-inside:avoid-page}
+.finding{display:grid;grid-template-columns:30mm 1fr;gap:6mm;padding:5mm 0 3mm;border-top:1px solid var(--ink)}
 .finding+.finding{break-before:auto}
+h2{break-after:avoid}
+.body h4,.where{break-after:avoid}
+.snippet,.probe,.partial,.caveats li,.evidence{break-inside:avoid}
 .apparatus{font:400 8pt/1.4 var(--sans);color:var(--ink-2)}
 .apparatus .fid{font:600 15pt/1 var(--serif);color:var(--ink);margin-bottom:2mm}
 .apparatus dl{margin:3mm 0 0}.apparatus dt{font-weight:600;letter-spacing:.05em;text-transform:uppercase;font-size:7pt;margin-top:2mm}
@@ -87,37 +90,64 @@ td:first-child{white-space:nowrap}
 .d-file{display:block;color:var(--ink-2);font-weight:600}
 .caveats{margin:0;padding-left:4mm;font-size:9.5pt}.caveats li{margin-bottom:1mm}
 .appendix p,.appendix li{font-size:9.5pt}
+
+/* RLS probe */
+.probe{margin:3mm 0 1mm}
+.probe-what,.probe-after{font:400 8.5pt/1.45 var(--sans);color:var(--ink-2)}
+.probe-after b{color:var(--ink)}
+.probe-grid{width:auto;margin:1.5mm 0 2mm}
+.probe-grid th,.probe-grid td{padding:1.2mm 3mm 1.2mm 0}
+.probe-grid thead th{font-weight:600}
+.probe-grid tbody th{font-weight:400;color:var(--ink);border-bottom:1px solid var(--rule);text-align:left;padding-right:5mm}
+.pc{text-align:center;font-variant-numeric:tabular-nums;white-space:nowrap}
+.matrix{table-layout:fixed}.matrix th:first-child{width:30%}
+.matrix .pc{text-align:left;white-space:normal}
+.pc-leak{color:var(--critical);font-weight:600}
+.pc-leak::before{content:"";display:inline-block;width:1.8mm;height:1.8mm;border-radius:.4mm;background:var(--critical);margin-right:1.2mm;vertical-align:.2mm}
+.pc-ok{color:var(--ink-2)}
+.pc-na{color:var(--rule)}
+.pc-unknown{color:var(--medium);font-weight:600}
+.pc-leak-text{color:var(--critical)}
+.partial{font-size:9.5pt;border-left:2px solid var(--high);padding-left:3mm}
+.partial b{color:var(--high)}
+.kind{font-size:7.5pt;color:var(--ink-2);text-transform:uppercase;letter-spacing:.05em}
 </style>
 </head>
 <body><main class="sheet"><section class="cover">
     <div class="mast"><span>Automated scan with patches</span><span>9 November 2026</span></div>
     <h1>Pre-launch security audit</h1>
     <p class="app">broken-notes-app</p>
-    <p class="note">Sample report. broken-notes-app is a small Next.js + Supabase + Stripe demo built with security holes on purpose (github.com/atokim4/supabase-scanner-bench). Every finding below is real scanner output on that code. It is not a client project.</p>
+    <p class="note">Sample report. broken-notes-app is a small Next.js + Supabase + Stripe demo written with security holes on purpose for this repo&#39;s tests (test/fixtures/broken-notes-app). Every finding below is real tool output on that code. It is not a client project.</p>
     <div class="result">
-      <div class="counts"><div class="sev-critical"><b>7</b><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></div><div class="sev-high"><b>3</b><span class="sev sev-high"><i aria-hidden="true"></i>High</span></div><div class="sev-medium"><b>1</b><span class="sev sev-medium"><i aria-hidden="true"></i>Medium</span></div><div class="sev-low"><b>1</b><span class="sev sev-low"><i aria-hidden="true"></i>Low</span></div></div>
-      <div class="tally" role="img" aria-label="12 findings by severity"><i class="t-critical" title="PA-01"></i><i class="t-critical" title="PA-02"></i><i class="t-critical" title="PA-03"></i><i class="t-critical" title="PA-04"></i><i class="t-critical" title="PA-05"></i><i class="t-critical" title="PA-06"></i><i class="t-critical" title="PA-07"></i><i class="t-high" title="PA-08"></i><i class="t-high" title="PA-09"></i><i class="t-high" title="PA-10"></i><i class="t-medium" title="PA-11"></i><i class="t-low" title="PA-12"></i></div>
+      <div class="counts"><div class="sev-critical"><b>9</b><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></div><div class="sev-high"><b>1</b><span class="sev sev-high"><i aria-hidden="true"></i>High</span></div><div class="sev-medium"><b>1</b><span class="sev sev-medium"><i aria-hidden="true"></i>Medium</span></div><div class="sev-low"><b>1</b><span class="sev sev-low"><i aria-hidden="true"></i>Low</span></div></div>
+      <div class="tally" role="img" aria-label="12 findings by severity"><i class="t-critical" title="PA-01"></i><i class="t-critical" title="PA-02"></i><i class="t-critical" title="PA-03"></i><i class="t-critical" title="PA-04"></i><i class="t-critical" title="PA-05"></i><i class="t-critical" title="PA-06"></i><i class="t-critical" title="PA-07"></i><i class="t-critical" title="PA-08"></i><i class="t-critical" title="PA-09"></i><i class="t-high" title="PA-10"></i><i class="t-medium" title="PA-11"></i><i class="t-low" title="PA-12"></i></div>
     </div>
     <div class="scope">
       <div><h4>What was checked</h4><ul>
+        <li>Project: Next.js (App Router), 13 Supabase migrations.</li>
         <li>Supabase migrations: RLS, policies, views, SECURITY DEFINER functions, storage buckets.</li>
+        <li>Row Level Security by behaviour: 8 tables and views tried as a visitor and as a second user in a local Postgres, before and after the patches.</li>
         <li>App code: server keys in browser code, public env prefixes, the Stripe webhook.</li>
         <li>Credentials in the files and in git history.</li>
         
-        <li>Tools: vibe-preflight 1.3.0, secret-scan (built in) 10 patterns.</li>
+        
+        <li>Tools: vibe-preflight 1.3.0, secret-scan (built in) 10 patterns, rls-probe 1.1.0.</li>
       </ul></div>
-      <div><h4>What was not checked</h4><ul><li>The deployed site: no URL was given, so HTTPS, security headers, cookies and the built JavaScript bundles were not checked.</li><li>Business logic and authorization inside your own API routes and server actions (beyond the Stripe webhook).</li><li>The live database: policies or grants changed in the Supabase dashboard and not saved as migrations are invisible to a repo scan.</li><li>Dependencies with known CVEs (run <code>npm audit</code> or Dependabot for that).</li><li>Rate limiting, abuse and brute-force protection, email/auth settings in the Supabase dashboard.</li><li>Manual penetration testing: every finding here comes from automated scanners and was not exploited against a running app.</li></ul></div>
+      <div><h4>What was not checked</h4><ul><li>The deployed site: no URL was given, so HTTPS, security headers, cookies and the built JavaScript bundles were not checked.</li><li>Business logic and authorization inside your own API routes, server actions and edge functions (beyond the Stripe webhook).</li><li>The live database: policies or grants changed in the Supabase dashboard and not saved as migrations are invisible to a repo scan. The RLS probe runs your migrations in a local Postgres, not against your project.</li><li>Rate limiting, abuse and brute-force protection, email/auth settings in the Supabase dashboard.</li><li>Manual penetration testing: every finding here comes from automated scanners and a local probe, and nothing was tried against your running app.</li><li>Dependencies with known CVEs: the repo has no package-lock.json, so npm audit did not run.</li></ul></div>
     </div>
   </section><section class="part">
     <h2>Summary</h2>
-    <p>The scan found <strong>12 issues</strong>: 7 critical, 3 high, 1 medium, 1 low.
+    <p>The scan found <strong>12 issues</strong>: 9 critical, 1 high, 1 medium, 1 low.
     Fixing the 10 critical and high ones is about 7 to 22 hours of developer time, and 11 of the 12 come with a patch that applies to the code as it is.</p>
-    <h4>The three biggest risks</h4><ol class="risks"><li><div><strong>The master key to your database is sent to every visitor&#39;s browser.</strong><span class="meta">Critical · <a href="#PA-01">PA-01</a> · Server-only key used in browser code</span></div></li><li><div><strong>Anyone can fake a &#39;payment received&#39; message and get paid features for free.</strong><span class="meta">Critical · <a href="#PA-02">PA-02</a> · Stripe webhook accepts unsigned requests</span></div></li><li><div><strong>A secret key (for example your Stripe key) is built into the public website code.</strong><span class="meta">Critical · <a href="#PA-03">PA-03</a> · Secret in a browser-exposed environment variable</span></div></li></ol>
+    <h4>The three biggest risks</h4><ol class="risks"><li><div><strong>The master key to your database is sent to every visitor&#39;s browser.</strong><span class="meta">Critical · <a href="#PA-01">PA-01</a> · Server-only key used in browser code</span></div></li><li><div><strong>Anyone can fake a &#39;payment received&#39; message and get paid features for free.</strong><span class="meta">Critical · <a href="#PA-02">PA-02</a> · Stripe webhook accepts unsigned requests</span></div></li><li><div><strong>Your Stripe secret key sits in a public variable, so any browser code that reads it ships the key to visitors.</strong><span class="meta">Critical · <a href="#PA-03">PA-03</a> · Secret in a browser-exposed environment variable</span></div></li></ol>
     <h4>All findings</h4>
     <table>
       <thead><tr><th>ID</th><th>Severity</th><th>Issue</th><th>Where</th><th>Effort</th><th>Patch</th></tr></thead>
-      <tbody><tr><td><a href="#PA-01">PA-01</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Server-only key used in browser code</td><td><code>app/admin/users-table.tsx:6</code></td><td>1-4 hours</td><td>yes</td></tr><tr><td><a href="#PA-02">PA-02</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Stripe webhook accepts unsigned requests</td><td><code>app/api/stripe/webhook/route.ts:8</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-03">PA-03</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Secret in a browser-exposed environment variable</td><td><code>lib/stripe.ts:3</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-04">PA-04</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Table open to the public API (Row Level Security off)</td><td><code>supabase/migrations/20261101000700_audit_log.sql:2</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-05">PA-05</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Privileged database function callable by anyone</td><td><code>supabase/migrations/20261101001000_admin_set_plan.sql:13</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-06">PA-06</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>User accounts table exposed through a view</td><td><code>supabase/migrations/20261101001100_user_directory.sql:2</code></td><td>1-4 hours</td><td>yes</td></tr><tr><td><a href="#PA-07">PA-07</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Public storage bucket</td><td><code>supabase/migrations/20261101001200_invoices_bucket.sql:2</code></td><td>1-4 hours</td><td>yes</td></tr><tr><td><a href="#PA-08">PA-08</a></td><td><span class="sev sev-high"><i aria-hidden="true"></i>High</span></td><td>Users can edit their own plan or role column</td><td><code>supabase/migrations/20261101000100_profiles.sql:17</code></td><td>1-4 hours</td><td>yes</td></tr><tr><td><a href="#PA-09">PA-09</a></td><td><span class="sev sev-high"><i aria-hidden="true"></i>High</span></td><td>View skips Row Level Security</td><td><code>supabase/migrations/20261101000500_recent_notes.sql:2</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-10">PA-10</a></td><td><span class="sev sev-high"><i aria-hidden="true"></i>High</span></td><td>Policy lets everyone through (using true)</td><td><code>supabase/migrations/20261101000600_messages.sql:15</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-11">PA-11</a></td><td><span class="sev sev-medium"><i aria-hidden="true"></i>Medium</span></td><td>SECURITY DEFINER function without a fixed search_path</td><td><code>supabase/migrations/20261101000900_message_stats.sql:2</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-12">PA-12</a></td><td><span class="sev sev-low"><i aria-hidden="true"></i>Low</span></td><td>Table has Row Level Security on and no policies</td><td><code>supabase/migrations/20261101000800_feature_flags.sql:2</code></td><td>under 1 hour</td><td>no</td></tr></tbody>
+      <tbody><tr><td><a href="#PA-01">PA-01</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Server-only key used in browser code</td><td><code>app/admin/users-table.tsx:6</code></td><td>1-4 hours</td><td>yes</td></tr><tr><td><a href="#PA-02">PA-02</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Stripe webhook accepts unsigned requests</td><td><code>app/api/stripe/webhook/route.ts:8</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-03">PA-03</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Secret in a browser-exposed environment variable</td><td><code>lib/stripe.ts:3</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-04">PA-04</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>View skips Row Level Security</td><td><code>supabase/migrations/20261101000500_recent_notes.sql:2</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-05">PA-05</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Policy lets everyone through (using true)</td><td><code>supabase/migrations/20261101000600_messages.sql:15</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-06">PA-06</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Table open to the public API (Row Level Security off)</td><td><code>supabase/migrations/20261101000700_audit_log.sql:2</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-07">PA-07</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Privileged database function callable by anyone</td><td><code>supabase/migrations/20261101001000_admin_set_plan.sql:13</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-08">PA-08</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>User accounts table exposed through a view</td><td><code>supabase/migrations/20261101001100_user_directory.sql:2</code></td><td>1-4 hours</td><td>yes</td></tr><tr><td><a href="#PA-09">PA-09</a></td><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Public storage bucket</td><td><code>supabase/migrations/20261101001200_invoices_bucket.sql:2</code></td><td>1-4 hours</td><td>yes</td></tr><tr><td><a href="#PA-10">PA-10</a></td><td><span class="sev sev-high"><i aria-hidden="true"></i>High</span></td><td>Users can edit their own plan or role column</td><td><code>supabase/migrations/20261101000100_profiles.sql:17</code></td><td>1-4 hours</td><td>yes</td></tr><tr><td><a href="#PA-11">PA-11</a></td><td><span class="sev sev-medium"><i aria-hidden="true"></i>Medium</span></td><td>SECURITY DEFINER function without a fixed search_path</td><td><code>supabase/migrations/20261101000900_message_stats.sql:2</code></td><td>under 1 hour</td><td>yes</td></tr><tr><td><a href="#PA-12">PA-12</a></td><td><span class="sev sev-low"><i aria-hidden="true"></i>Low</span></td><td>Table has Row Level Security on and no policies</td><td><code>supabase/migrations/20261101000800_feature_flags.sql:2</code></td><td>under 1 hour</td><td>no</td></tr></tbody>
     </table>
+    <h4>Who can reach user A's rows</h4>
+    <p class="probe-what">The RLS probe ran your migrations in a local Postgres, gave user A one row per table and tried every action as a visitor without an account and as a second user. Red cells got through: "1/1" means one of user A's one rows. "Self-upgrade" is user A changing a plan or billing column on their own row. A table with no owner column of its own belongs to the owner of the row its foreign key points at; shared tables with no owner at all (price lists) count only writes. "?" is a try that failed for another reason and proves nothing.</p>
+    <table class="matrix"><thead><tr><th>Table</th><th>Visitor read</th><th>Visitor write</th><th>User B read</th><th>User B write</th><th>Self-upgrade</th></tr></thead><tbody><tr><td><code>audit_log</code></td><td class="pc pc-leak">1/1</td><td class="pc pc-leak">all</td><td class="pc pc-leak">1/1</td><td class="pc pc-leak">all</td><td class="pc pc-ok">none</td></tr><tr><td><code>feature_flags</code></td><td class="pc pc-ok">0</td><td class="pc pc-ok">none</td><td class="pc pc-ok">0</td><td class="pc pc-ok">none</td><td class="pc pc-ok">none</td></tr><tr><td><code>messages</code></td><td class="pc pc-leak">1/1</td><td class="pc pc-ok">none</td><td class="pc pc-leak">1/1</td><td class="pc pc-ok">none</td><td class="pc pc-ok">none</td></tr><tr><td><code>note_counts</code> <span class="kind">view</span></td><td class="pc pc-ok">0</td><td class="pc pc-ok">none</td><td class="pc pc-ok">0</td><td class="pc pc-ok">none</td><td class="pc pc-ok">none</td></tr><tr><td><code>notes</code></td><td class="pc pc-ok">0</td><td class="pc pc-ok">none</td><td class="pc pc-ok">0</td><td class="pc pc-ok">none</td><td class="pc pc-ok">none</td></tr><tr><td><code>profiles</code></td><td class="pc pc-ok">0</td><td class="pc pc-ok">none</td><td class="pc pc-ok">0</td><td class="pc pc-ok">none</td><td class="pc pc-leak">plan +1</td></tr><tr><td><code>recent_notes</code> <span class="kind">view</span></td><td class="pc pc-leak">1/1</td><td class="pc pc-ok">none</td><td class="pc pc-leak">1/1</td><td class="pc pc-ok">none</td><td class="pc pc-ok">none</td></tr><tr><td><code>user_directory</code> <span class="kind">view</span></td><td class="pc pc-leak">1/1</td><td class="pc pc-ok">none</td><td class="pc pc-leak">1/1</td><td class="pc pc-ok">none</td><td class="pc pc-ok">none</td></tr></tbody></table>
   </section><section class="part"><h2>Findings</h2><article class="finding" id="PA-01">
     <aside class="apparatus">
       <p class="fid">PA-01</p>
@@ -137,11 +167,13 @@ td:first-child{white-space:nowrap}
       <h4>Why it matters</h4>
       <p>Code in this file runs in the visitor&#39;s browser. A Supabase service role key or Stripe secret key there gives full control of the database or the Stripe account to anyone who opens developer tools. If it was ever deployed, treat the key as leaked.</p>
       <h4>Fix</h4>
-      <p>Use the public anon key in the browser and keep the secret key in server code only. Rotate the key if this was ever deployed.</p>
+      <p>Use only public keys in the browser (the Supabase anon or publishable key, the Stripe publishable key) and keep secret keys in server code. Rotate the key if this was ever deployed.</p>
+      
       <p class="cwe">CWE-668: Exposure of Resource to Wrong Sphere</p>
       <section class="patch">
         <h4>Patch</h4>
         <p>The browser component now uses the public anon key (NEXT_PUBLIC_SUPABASE_ANON_KEY), so its queries run under Row Level Security as the signed-in user.</p>
+        
         <pre class="diff"><code><span class="d-file">--- a/app/admin/users-table.tsx</span><span class="d-file">+++ b/app/admin/users-table.tsx</span><span class="d-hunk">@@ -3,7 +3,7 @@</span><span class="d-ctx"> import { useEffect, useState } from &quot;react&quot;;</span><span class="d-ctx"> import { createClient } from &quot;@supabase/supabase-js&quot;;</span><span class="d-ctx"> </span><span class="d-del">-const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);</span><span class="d-add">+const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!);</span><span class="d-ctx"> </span><span class="d-ctx"> type Profile = { id: string; display_name: string | null; plan: string };</span><span class="d-ctx"> </span></code></pre>
         <p class="check">Applies cleanly to the audited code (<code>git apply --check</code>).</p>
         <ul class="caveats"><li>The component now sees only the rows its user may see. If it is an admin screen that needs every row, move the query to a route handler that checks the caller is an admin and uses the service role there.</li><li>Rotate the service role key if this ever shipped.</li></ul>
@@ -170,10 +202,12 @@ td:first-child{white-space:nowrap}
       <p>The webhook acts on whatever JSON it receives. Anyone who finds the URL can post a fake &#39;payment completed&#39; event and get the paid plan for free.</p>
       <h4>Fix</h4>
       <p>Verify the <code>stripe-signature</code> header with <code>stripe.webhooks.constructEvent</code> on the raw request body before acting on the event.</p>
+      
       <p class="cwe">CWE-345: Insufficient Verification of Data Authenticity</p>
       <section class="patch">
         <h4>Patch</h4>
         <p>Reads the raw body and checks the stripe-signature header with constructEventAsync before the handler touches the event. Unsigned or tampered requests get a 400.</p>
+        
         <pre class="diff"><code><span class="d-file">--- a/app/api/stripe/webhook/route.ts</span><span class="d-file">+++ b/app/api/stripe/webhook/route.ts</span><span class="d-hunk">@@ -1,9 +1,24 @@</span><span class="d-ctx"> import { NextResponse } from &quot;next/server&quot;;</span><span class="d-ctx"> import type Stripe from &quot;stripe&quot;;</span><span class="d-ctx"> import { supabaseAdmin } from &quot;@/lib/supabase/admin&quot;;</span><span class="d-add">+import { stripe } from &quot;@/lib/stripe&quot;;</span><span class="d-ctx"> </span><span class="d-ctx"> export async function POST(request: Request) {</span><span class="d-del">-  const event = (await request.json()) as Stripe.Event;</span><span class="d-add">+  const signature = request.headers.get(&quot;stripe-signature&quot;);</span><span class="d-add">+  if (!signature) {</span><span class="d-add">+    return NextResponse.json({ error: &quot;Missing stripe-signature header&quot; }, { status: 400 });</span><span class="d-add">+  }</span><span class="d-add">+</span><span class="d-add">+  let event: Stripe.Event;</span><span class="d-add">+  try {</span><span class="d-add">+    event = await stripe.webhooks.constructEventAsync(</span><span class="d-add">+      await request.text(),</span><span class="d-add">+      signature,</span><span class="d-add">+      process.env.STRIPE_WEBHOOK_SECRET!,</span><span class="d-add">+    );</span><span class="d-add">+  } catch {</span><span class="d-add">+    return NextResponse.json({ error: &quot;Invalid signature&quot; }, { status: 400 });</span><span class="d-add">+  }</span><span class="d-ctx"> </span><span class="d-ctx">   if (event.type === &quot;checkout.session.completed&quot;) {</span><span class="d-ctx">     const session = event.data.object;</span></code></pre>
         <p class="check">Applies cleanly to the audited code (<code>git apply --check</code>).</p>
         <ul class="caveats"><li>Set STRIPE_WEBHOOK_SECRET to the endpoint&#39;s signing secret (whsec_…) in every environment.</li><li>Test with <code>stripe listen --forward-to localhost:3000/api/stripe/webhook</code> and <code>stripe trigger checkout.session.completed</code>.</li></ul>
@@ -199,10 +233,12 @@ td:first-child{white-space:nowrap}
       <p>Next.js copies every <code>NEXT_PUBLIC_</code> variable into the JavaScript it sends to visitors (Vite does the same with <code>VITE_</code>). A secret under that prefix is public as soon as the site is built.</p>
       <h4>Fix</h4>
       <p>Rename the variable without the public prefix, read it only in server code, and rotate the key if it was ever deployed.</p>
+      
       <p class="cwe">CWE-668: Exposure of Resource to Wrong Sphere</p>
       <section class="patch">
         <h4>Patch</h4>
         <p>Renames NEXT_PUBLIC_STRIPE_SECRET_KEY to STRIPE_SECRET_KEY in .env.example, lib/stripe.ts, and marks lib/stripe.ts server-only so a browser import fails the build.</p>
+        
         <pre class="diff"><code><span class="d-file">--- a/.env.example</span><span class="d-file">+++ b/.env.example</span><span class="d-hunk">@@ -1,6 +1,6 @@</span><span class="d-ctx"> NEXT_PUBLIC_SUPABASE_URL=</span><span class="d-ctx"> NEXT_PUBLIC_SUPABASE_ANON_KEY=</span><span class="d-ctx"> SUPABASE_SERVICE_ROLE_KEY=</span><span class="d-del">-NEXT_PUBLIC_STRIPE_SECRET_KEY=</span><span class="d-add">+STRIPE_SECRET_KEY=</span><span class="d-ctx"> STRIPE_WEBHOOK_SECRET=</span><span class="d-ctx"> STRIPE_PRICE_ID=</span><span class="d-file">--- a/lib/stripe.ts</span><span class="d-file">+++ b/lib/stripe.ts</span><span class="d-hunk">@@ -1,3 +1,4 @@</span><span class="d-add">+import &quot;server-only&quot;;</span><span class="d-ctx"> import Stripe from &quot;stripe&quot;;</span><span class="d-ctx"> </span><span class="d-del">-export const stripe = new Stripe(process.env.NEXT_PUBLIC_STRIPE_SECRET_KEY!);</span><span class="d-add">+export const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);</span></code></pre>
         <p class="check">Applies cleanly to the audited code (<code>git apply --check</code>).</p>
         <ul class="caveats"><li>Rename the variable in your hosting dashboard too, and rotate the key if a build with NEXT_PUBLIC_ ever went live.</li></ul>
@@ -211,6 +247,85 @@ td:first-child{white-space:nowrap}
   </article><article class="finding" id="PA-04">
     <aside class="apparatus">
       <p class="fid">PA-04</p>
+      <span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span>
+      <dl>
+        <dt>CWE</dt><dd><a href="https://cwe.mitre.org/data/definitions/863.html">CWE-863</a></dd>
+        <dt>Effort</dt><dd>under 1 hour</dd>
+        <dt>Source</dt><dd>vibe-preflight<br><span class="rule">view-bypasses-rls</span></dd>
+      </dl>
+    </aside>
+    <div class="body">
+      <h3>View skips Row Level Security</h3>
+      <p class="where"><code>supabase/migrations/20261101000500_recent_notes.sql:2</code></p>
+      <p class="evidence">View <code>public.recent_notes</code> has no <code>security_invoker</code>, so it reads the tables below it without RLS.</p>
+      <pre class="snippet"><code>   2 | create view public.recent_notes as
+   3 |   select id, user_id, title, created_at
+   4 |   from public.notes
+   5 |   order by created_at desc</code></pre>
+      
+      <h4>Why it matters</h4>
+      <p>Postgres views run with the rights of whoever created them, so they ignore the policies of the tables below. Supabase serves the view over the API, which gives every caller the rows your policies were meant to hide.</p>
+      <h4>Fix</h4>
+      <p>Set <code>security_invoker = true</code> on the view (Postgres 15+), so it runs with the caller&#39;s rights and the table policies apply.</p>
+      <section class="probe">
+    <h4>Tested in Postgres</h4>
+    <p class="probe-what">User A owns the rows behind this view; each cell is what the actor got in a rolled-back transaction (owner column: <code>user_id</code>).</p>
+    <table class="probe-grid"><thead><tr><th></th><th>read</th><th>insert as A</th><th>update</th><th>delete</th></tr></thead><tbody><tr><th scope="row">Visitor, no account</th><td class="pc pc-leak">1/1</td><td class="pc pc-na">–</td><td class="pc pc-na">–</td><td class="pc pc-na">–</td></tr><tr><th scope="row">Another user</th><td class="pc pc-leak">1/1</td><td class="pc pc-na">–</td><td class="pc pc-na">–</td><td class="pc pc-na">–</td></tr></tbody></table>
+    
+    <p class="probe-after">Same harness with the report's patches applied: <b>0 leaks</b>.</p>
+  </section>
+      <p class="cwe">CWE-863: Incorrect Authorization</p>
+      <section class="patch">
+        <h4>Patch</h4>
+        <p>Sets security_invoker on public.recent_notes, so the policies of the tables below it apply to whoever queries it.</p>
+        
+        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090000_security_invoker_recent_notes.sql</span><span class="d-hunk">@@ -0,0 +1,3 @@</span><span class="d-add">+-- PA-04: make public.recent_notes respect the caller&#39;s RLS.</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+alter view public.recent_notes set (security_invoker = true);</span></code></pre>
+        <p class="check">Applies cleanly to the audited code (<code>git apply --check</code>).</p>
+        <ul class="caveats"><li>Needs Postgres 15 or newer (every current Supabase project is).</li></ul>
+      </section>
+    </div>
+  </article><article class="finding" id="PA-05">
+    <aside class="apparatus">
+      <p class="fid">PA-05</p>
+      <span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span>
+      <dl>
+        <dt>CWE</dt><dd><a href="https://cwe.mitre.org/data/definitions/863.html">CWE-863</a></dd>
+        <dt>Effort</dt><dd>under 1 hour</dd>
+        <dt>Source</dt><dd>vibe-preflight<br><span class="rule">rls-permissive-policy</span></dd>
+      </dl>
+    </aside>
+    <div class="body">
+      <h3>Policy lets everyone through (using true)</h3>
+      <p class="where"><code>supabase/migrations/20261101000600_messages.sql:15</code></p>
+      <p class="evidence">Policy &quot;Enable read access for all users&quot; on <code>public.messages</code> (select) lets anyone (signed in or not) read every row.</p>
+      <pre class="snippet"><code>  15 | create policy &quot;Enable read access for all users&quot;
+  16 |   on public.messages for select
+  17 |   using (true);</code></pre>
+      
+      <h4>Why it matters</h4>
+      <p>A policy with <code>using (true)</code> or <code>with check (true)</code> allows the action for every caller, including visitors who are not signed in. If the table holds anything private, it is public.</p>
+      <h4>Fix</h4>
+      <p>Replace the policy with one that compares <code>auth.uid()</code> to the owner column, and limit it to the <code>authenticated</code> role.</p>
+      <section class="probe">
+    <h4>Tested in Postgres</h4>
+    <p class="probe-what">User A owns one row; each cell is what the actor got in a rolled-back transaction (owner column: <code>sender_id</code>, <code>recipient_id</code>).</p>
+    <table class="probe-grid"><thead><tr><th></th><th>read</th><th>insert as A</th><th>update</th><th>delete</th></tr></thead><tbody><tr><th scope="row">Visitor, no account</th><td class="pc pc-leak">1/1</td><td class="pc pc-ok">blocked</td><td class="pc pc-ok">0</td><td class="pc pc-ok">0</td></tr><tr><th scope="row">Another user</th><td class="pc pc-leak">1/1</td><td class="pc pc-ok">blocked</td><td class="pc pc-ok">0</td><td class="pc pc-ok">0</td></tr></tbody></table>
+    
+    <p class="probe-after">Same harness with the report's patches applied: <b>0 leaks</b>.</p>
+  </section>
+      <p class="cwe">CWE-863: Incorrect Authorization</p>
+      <section class="patch">
+        <h4>Patch</h4>
+        <p>Replaces &quot;Enable read access for all users&quot; with &quot;Users can select rows they are in&quot;: signed-in users whose id is in sender_id or recipient_id.</p>
+        
+        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090001_scope_policy_messages.sql</span><span class="d-hunk">@@ -0,0 +1,8 @@</span><span class="d-add">+-- PA-05: limit &quot;Enable read access for all users&quot; to the users in the row.</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+drop policy &quot;Enable read access for all users&quot; on public.messages;</span><span class="d-add">+</span><span class="d-add">+create policy &quot;Users can select rows they are in&quot;</span><span class="d-add">+  on public.messages for select</span><span class="d-add">+  to authenticated</span><span class="d-add">+  using ((select auth.uid()) = sender_id or (select auth.uid()) = recipient_id);</span></code></pre>
+        <p class="check">Applies cleanly to the audited code (<code>git apply --check</code>).</p>
+        <ul class="caveats"><li>Check that sender_id / recipient_id really is who should have access. If the rows are meant to be public, keep the old policy and say so in a comment.</li></ul>
+      </section>
+    </div>
+  </article><article class="finding" id="PA-06">
+    <aside class="apparatus">
+      <p class="fid">PA-06</p>
       <span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span>
       <dl>
         <dt>CWE</dt><dd><a href="https://cwe.mitre.org/data/definitions/862.html">CWE-862</a></dd>
@@ -231,18 +346,26 @@ td:first-child{white-space:nowrap}
       <p>Supabase serves every table in the public schema over its REST API, and the key it needs ships in your website. With Row Level Security off, anyone can read, change or delete every row of this table from a browser console.</p>
       <h4>Fix</h4>
       <p>Enable Row Level Security on the table. With no policies the API gets nothing, and your server code (service role) keeps working. Add policies only for what the browser really needs.</p>
+      <section class="probe">
+    <h4>Tested in Postgres</h4>
+    <p class="probe-what">User A owns one row; each cell is what the actor got in a rolled-back transaction (owner column: <code>user_id</code>).</p>
+    <table class="probe-grid"><thead><tr><th></th><th>read</th><th>insert as A</th><th>update</th><th>delete</th></tr></thead><tbody><tr><th scope="row">Visitor, no account</th><td class="pc pc-leak">1/1</td><td class="pc pc-leak">got in</td><td class="pc pc-leak">1/1</td><td class="pc pc-leak">1/1</td></tr><tr><th scope="row">Another user</th><td class="pc pc-leak">1/1</td><td class="pc pc-leak">got in</td><td class="pc pc-leak">1/1</td><td class="pc pc-leak">1/1</td></tr></tbody></table>
+    
+    <p class="probe-after">Same harness with the report's patches applied: <b>0 leaks</b>.</p>
+  </section>
       <p class="cwe">CWE-862: Missing Authorization</p>
       <section class="patch">
         <h4>Patch</h4>
         <p>Turns on Row Level Security for public.audit_log. With no policies the public API gets nothing; server code using the service role key keeps working.</p>
-        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090000_enable_rls_audit_log.sql</span><span class="d-hunk">@@ -0,0 +1,3 @@</span><span class="d-add">+-- PA-04: turn on Row Level Security for public.audit_log.</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+alter table public.audit_log enable row level security;</span></code></pre>
+        
+        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090002_enable_rls_audit_log.sql</span><span class="d-hunk">@@ -0,0 +1,3 @@</span><span class="d-add">+-- PA-06: turn on Row Level Security for public.audit_log.</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+alter table public.audit_log enable row level security;</span></code></pre>
         <p class="check">Applies cleanly to the audited code (<code>git apply --check</code>).</p>
         <ul class="caveats"><li>If the browser needs to read or write this table, add policies for exactly those rows.</li></ul>
       </section>
     </div>
-  </article><article class="finding" id="PA-05">
+  </article><article class="finding" id="PA-07">
     <aside class="apparatus">
-      <p class="fid">PA-05</p>
+      <p class="fid">PA-07</p>
       <span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span>
       <dl>
         <dt>CWE</dt><dd><a href="https://cwe.mitre.org/data/definitions/269.html">CWE-269</a></dd>
@@ -260,18 +383,20 @@ td:first-child{white-space:nowrap}
       <p>The function runs with its owner&#39;s rights, so it skips Row Level Security. Supabase exposes it at /rest/v1/rpc/, and visitors who are not signed in may call it.</p>
       <h4>Fix</h4>
       <p>Revoke execute from <code>public</code>, <code>anon</code> and <code>authenticated</code>, grant it only to the roles that need it, and check the caller inside the function.</p>
+      
       <p class="cwe">CWE-269: Improper Privilege Management</p>
       <section class="patch">
         <h4>Patch</h4>
         <p>Revokes execute on public.admin_set_plan() from public, anon and authenticated. The service role keeps its own grant, so server code can still call it.</p>
-        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090001_revoke_admin_set_plan.sql</span><span class="d-hunk">@@ -0,0 +1,3 @@</span><span class="d-add">+-- PA-05: stop the API roles from calling public.admin_set_plan().</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+revoke execute on function public.admin_set_plan(target_user uuid, new_plan text) from public, anon, authenticated;</span></code></pre>
+        
+        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090003_revoke_admin_set_plan.sql</span><span class="d-hunk">@@ -0,0 +1,3 @@</span><span class="d-add">+-- PA-07: stop the API roles from calling public.admin_set_plan().</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+revoke execute on function public.admin_set_plan(target_user uuid, new_plan text) from public, anon, authenticated;</span></code></pre>
         <p class="check">Applies cleanly to the audited code (<code>git apply --check</code>).</p>
         <ul class="caveats"><li>Call it only from server code that has checked the user is allowed to (for an admin action: that they are an admin).</li></ul>
       </section>
     </div>
-  </article><article class="finding" id="PA-06">
+  </article><article class="finding" id="PA-08">
     <aside class="apparatus">
-      <p class="fid">PA-06</p>
+      <p class="fid">PA-08</p>
       <span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span>
       <dl>
         <dt>CWE</dt><dd><a href="https://cwe.mitre.org/data/definitions/359.html">CWE-359</a></dd>
@@ -291,18 +416,26 @@ td:first-child{white-space:nowrap}
       <p><code>auth.users</code> holds every account&#39;s email and sign-in data. A view over it in the public schema puts that list on the API, so anyone can download your user list.</p>
       <h4>Fix</h4>
       <p>Revoke API access to the view, and give users the lookup they need through a function that checks the caller and returns only safe columns.</p>
+      <section class="probe">
+    <h4>Tested in Postgres</h4>
+    <p class="probe-what">User A owns the rows behind this view; each cell is what the actor got in a rolled-back transaction (owner column: <code>id</code>).</p>
+    <table class="probe-grid"><thead><tr><th></th><th>read</th><th>insert as A</th><th>update</th><th>delete</th></tr></thead><tbody><tr><th scope="row">Visitor, no account</th><td class="pc pc-leak">1/1</td><td class="pc pc-na">–</td><td class="pc pc-na">–</td><td class="pc pc-na">–</td></tr><tr><th scope="row">Another user</th><td class="pc pc-leak">1/1</td><td class="pc pc-na">–</td><td class="pc pc-na">–</td><td class="pc pc-na">–</td></tr></tbody></table>
+    
+    <p class="probe-after">Same harness with the report's patches applied: <b>0 leaks</b>.</p>
+  </section>
       <p class="cwe">CWE-359: Exposure of Private Personal Information to an Unauthorized Actor</p>
       <section class="patch">
         <h4>Patch</h4>
         <p>Revokes API access to public.user_directory, so the account list is no longer readable through /rest/v1/.</p>
-        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090002_revoke_user_directory.sql</span><span class="d-hunk">@@ -0,0 +1,3 @@</span><span class="d-add">+-- PA-06: take public.user_directory off the public API.</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+revoke all on public.user_directory from anon, authenticated;</span></code></pre>
+        
+        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090004_revoke_user_directory.sql</span><span class="d-hunk">@@ -0,0 +1,3 @@</span><span class="d-add">+-- PA-08: take public.user_directory off the public API.</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+revoke all on public.user_directory from anon, authenticated;</span></code></pre>
         <p class="check">Applies cleanly to the audited code (<code>git apply --check</code>).</p>
         <ul class="caveats"><li>The feature that used this view stops working. Replace it with a function that checks the caller and returns only what it needs (for example the id for one exact email).</li></ul>
       </section>
     </div>
-  </article><article class="finding" id="PA-07">
+  </article><article class="finding" id="PA-09">
     <aside class="apparatus">
-      <p class="fid">PA-07</p>
+      <p class="fid">PA-09</p>
       <span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span>
       <dl>
         <dt>CWE</dt><dd><a href="https://cwe.mitre.org/data/definitions/552.html">CWE-552</a></dd>
@@ -321,18 +454,20 @@ td:first-child{white-space:nowrap}
       <p>Files in a public bucket open for anyone with the link. When a select policy on storage.objects also lets anyone list the bucket, the links are no secret either: anyone can download every file.</p>
       <h4>Fix</h4>
       <p>Make the bucket private, drop the open select policy, and hand out short-lived signed URLs from the server after checking who is asking.</p>
+      
       <p class="cwe">CWE-552: Files or Directories Accessible to External Parties</p>
       <section class="patch">
         <h4>Patch</h4>
         <p>Makes the invoices bucket private and drops &quot;Anyone can list invoices&quot;. Files stay where they are.</p>
-        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090003_private_bucket_invoices.sql</span><span class="d-hunk">@@ -0,0 +1,4 @@</span><span class="d-add">+-- PA-07: make the invoices bucket private.</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+update storage.buckets set public = false where id = &#39;invoices&#39;;</span><span class="d-add">+drop policy if exists &quot;Anyone can list invoices&quot; on storage.objects;</span></code></pre>
+        
+        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090005_private_bucket_invoices.sql</span><span class="d-hunk">@@ -0,0 +1,4 @@</span><span class="d-add">+-- PA-09: make the invoices bucket private.</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+update storage.buckets set public = false where id = &#39;invoices&#39;;</span><span class="d-add">+drop policy if exists &quot;Anyone can list invoices&quot; on storage.objects;</span></code></pre>
         <p class="check">Applies cleanly to the audited code (<code>git apply --check</code>).</p>
         <ul class="caveats"><li>Links to these files stop working. Serve them with createSignedUrl() from server code after checking the file belongs to the user.</li></ul>
       </section>
     </div>
-  </article><article class="finding" id="PA-08">
+  </article><article class="finding" id="PA-10">
     <aside class="apparatus">
-      <p class="fid">PA-08</p>
+      <p class="fid">PA-10</p>
       <span class="sev sev-high"><i aria-hidden="true"></i>High</span>
       <dl>
         <dt>CWE</dt><dd><a href="https://cwe.mitre.org/data/definitions/915.html">CWE-915</a></dd>
@@ -353,76 +488,21 @@ td:first-child{white-space:nowrap}
       <p>The update policy lets a signed-in user change any column of their own row, including the one that says what they paid for. One request from the browser console turns a free account into a paid one.</p>
       <h4>Fix</h4>
       <p>Limit what users may update with column privileges (grant update only on the safe columns) and add <code>with check</code> to the policy. Change the plan only from the server, after Stripe confirms payment.</p>
+      <section class="probe">
+    <h4>Tested in Postgres</h4>
+    <p class="probe-what">User A owns one row; each cell is what the actor got in a rolled-back transaction (owner column: <code>id</code>).</p>
+    <table class="probe-grid"><thead><tr><th></th><th>read</th><th>insert as A</th><th>update</th><th>delete</th></tr></thead><tbody><tr><th scope="row">Visitor, no account</th><td class="pc pc-ok">0</td><td class="pc pc-ok">blocked</td><td class="pc pc-ok">0</td><td class="pc pc-ok">0</td></tr><tr><th scope="row">Another user</th><td class="pc pc-ok">0</td><td class="pc pc-ok">blocked</td><td class="pc pc-ok">0</td><td class="pc pc-ok">0</td></tr></tbody></table>
+    <p class="probe-what">Owner editing paid columns on their own row: <code>plan</code> <b class="pc-leak-text">changed</b>, <code>stripe_customer_id</code> <b class="pc-leak-text">changed</b>.</p>
+    <p class="probe-after">Same harness with the report's patches applied: <b>0 leaks</b>.</p>
+  </section>
       <p class="cwe">CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes</p>
       <section class="patch">
         <h4>Patch</h4>
         <p>Users can update only display_name; plan, stripe_customer_id can be changed only by the server. Adds a WITH CHECK to the policy.</p>
-        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090004_lock_columns_profiles.sql</span><span class="d-hunk">@@ -0,0 +1,12 @@</span><span class="d-add">+-- PA-08: users may only edit safe columns of public.profiles.</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+revoke update on public.profiles from anon, authenticated;</span><span class="d-add">+grant update (display_name) on public.profiles to authenticated;</span><span class="d-add">+</span><span class="d-add">+drop policy &quot;Users can update own profile&quot; on public.profiles;</span><span class="d-add">+</span><span class="d-add">+create policy &quot;Users can update own profile&quot;</span><span class="d-add">+  on public.profiles for update</span><span class="d-add">+  to authenticated</span><span class="d-add">+  using ((select auth.uid()) = id)</span><span class="d-add">+  with check ((select auth.uid()) = id);</span></code></pre>
+        
+        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090006_lock_columns_profiles.sql</span><span class="d-hunk">@@ -0,0 +1,12 @@</span><span class="d-add">+-- PA-10: users may only edit safe columns of public.profiles.</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+revoke update on public.profiles from anon, authenticated;</span><span class="d-add">+grant update (display_name) on public.profiles to authenticated;</span><span class="d-add">+</span><span class="d-add">+drop policy &quot;Users can update own profile&quot; on public.profiles;</span><span class="d-add">+</span><span class="d-add">+create policy &quot;Users can update own profile&quot;</span><span class="d-add">+  on public.profiles for update</span><span class="d-add">+  to authenticated</span><span class="d-add">+  using ((select auth.uid()) = id)</span><span class="d-add">+  with check ((select auth.uid()) = id);</span></code></pre>
         <p class="check">Applies cleanly to the audited code (<code>git apply --check</code>).</p>
         <ul class="caveats"><li>If the app updates other columns from the browser, add them to the grant. Change paid columns only in server code (for example the Stripe webhook).</li></ul>
-      </section>
-    </div>
-  </article><article class="finding" id="PA-09">
-    <aside class="apparatus">
-      <p class="fid">PA-09</p>
-      <span class="sev sev-high"><i aria-hidden="true"></i>High</span>
-      <dl>
-        <dt>CWE</dt><dd><a href="https://cwe.mitre.org/data/definitions/863.html">CWE-863</a></dd>
-        <dt>Effort</dt><dd>under 1 hour</dd>
-        <dt>Source</dt><dd>vibe-preflight<br><span class="rule">view-bypasses-rls</span></dd>
-      </dl>
-    </aside>
-    <div class="body">
-      <h3>View skips Row Level Security</h3>
-      <p class="where"><code>supabase/migrations/20261101000500_recent_notes.sql:2</code></p>
-      <p class="evidence">View <code>public.recent_notes</code> has no <code>security_invoker</code>, so it reads the tables below it without RLS.</p>
-      <pre class="snippet"><code>   2 | create view public.recent_notes as
-   3 |   select id, user_id, title, created_at
-   4 |   from public.notes
-   5 |   order by created_at desc</code></pre>
-      
-      <h4>Why it matters</h4>
-      <p>Postgres views run with the rights of whoever created them, so they ignore the policies of the tables below. Supabase serves the view over the API, which gives every caller the rows your policies were meant to hide.</p>
-      <h4>Fix</h4>
-      <p>Set <code>security_invoker = true</code> on the view (Postgres 15+), so it runs with the caller&#39;s rights and the table policies apply.</p>
-      <p class="cwe">CWE-863: Incorrect Authorization</p>
-      <section class="patch">
-        <h4>Patch</h4>
-        <p>Sets security_invoker on public.recent_notes, so the policies of the tables below it apply to whoever queries it.</p>
-        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090005_security_invoker_recent_notes.sql</span><span class="d-hunk">@@ -0,0 +1,3 @@</span><span class="d-add">+-- PA-09: make public.recent_notes respect the caller&#39;s RLS.</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+alter view public.recent_notes set (security_invoker = true);</span></code></pre>
-        <p class="check">Applies cleanly to the audited code (<code>git apply --check</code>).</p>
-        <ul class="caveats"><li>Needs Postgres 15 or newer (every current Supabase project is).</li></ul>
-      </section>
-    </div>
-  </article><article class="finding" id="PA-10">
-    <aside class="apparatus">
-      <p class="fid">PA-10</p>
-      <span class="sev sev-high"><i aria-hidden="true"></i>High</span>
-      <dl>
-        <dt>CWE</dt><dd><a href="https://cwe.mitre.org/data/definitions/863.html">CWE-863</a></dd>
-        <dt>Effort</dt><dd>under 1 hour</dd>
-        <dt>Source</dt><dd>vibe-preflight<br><span class="rule">rls-permissive-policy</span></dd>
-      </dl>
-    </aside>
-    <div class="body">
-      <h3>Policy lets everyone through (using true)</h3>
-      <p class="where"><code>supabase/migrations/20261101000600_messages.sql:15</code></p>
-      <p class="evidence">Policy &quot;Enable read access for all users&quot; on <code>public.messages</code> (select) lets anyone (signed in or not) read every row.</p>
-      <pre class="snippet"><code>  15 | create policy &quot;Enable read access for all users&quot;
-  16 |   on public.messages for select
-  17 |   using (true);</code></pre>
-      
-      <h4>Why it matters</h4>
-      <p>A policy with <code>using (true)</code> or <code>with check (true)</code> allows the action for every caller, including visitors who are not signed in. If the table holds anything private, it is public.</p>
-      <h4>Fix</h4>
-      <p>Replace the policy with one that compares <code>auth.uid()</code> to the owner column, and limit it to the <code>authenticated</code> role.</p>
-      <p class="cwe">CWE-863: Incorrect Authorization</p>
-      <section class="patch">
-        <h4>Patch</h4>
-        <p>Replaces &quot;Enable read access for all users&quot; with &quot;Users can select rows they are in&quot;: signed-in users whose id is in sender_id or recipient_id.</p>
-        <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090006_scope_policy_messages.sql</span><span class="d-hunk">@@ -0,0 +1,8 @@</span><span class="d-add">+-- PA-10: limit &quot;Enable read access for all users&quot; to the users in the row.</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+drop policy &quot;Enable read access for all users&quot; on public.messages;</span><span class="d-add">+</span><span class="d-add">+create policy &quot;Users can select rows they are in&quot;</span><span class="d-add">+  on public.messages for select</span><span class="d-add">+  to authenticated</span><span class="d-add">+  using ((select auth.uid()) = sender_id or (select auth.uid()) = recipient_id);</span></code></pre>
-        <p class="check">Applies cleanly to the audited code (<code>git apply --check</code>).</p>
-        <ul class="caveats"><li>Check that sender_id / recipient_id really is who should have access. If the rows are meant to be public, keep the old policy and say so in a comment.</li></ul>
       </section>
     </div>
   </article><article class="finding" id="PA-11">
@@ -448,10 +528,12 @@ td:first-child{white-space:nowrap}
       <p>The function runs with its owner&#39;s rights. Without a fixed <code>search_path</code>, a caller who can create objects in a schema on the path can make it run their code with those rights. Supabase&#39;s own linter flags this.</p>
       <h4>Fix</h4>
       <p>Add <code>set search_path = &#39;&#39;</code> to the function and schema-qualify every table it uses.</p>
+      
       <p class="cwe">CWE-426: Untrusted Search Path</p>
       <section class="patch">
         <h4>Patch</h4>
         <p>Pins search_path to &#39;&#39; for public.get_message_stats(), so the function only sees the objects it names in full.</p>
+        
         <pre class="diff"><code><span class="d-file">--- /dev/null</span><span class="d-file">+++ b/supabase/migrations/20261109090007_search_path_get_message_stats.sql</span><span class="d-hunk">@@ -0,0 +1,3 @@</span><span class="d-add">+-- PA-11: pin the search_path of public.get_message_stats().</span><span class="d-add">+-- Generated by prelaunch-audit. Review before applying.</span><span class="d-add">+alter function public.get_message_stats() set search_path = &#39;&#39;;</span></code></pre>
         <p class="check">Applies cleanly to the audited code (<code>git apply --check</code>).</p>
         <ul class="caveats"><li>Every table and function in the body must be schema-qualified (public.messages, auth.uid()).</li></ul>
@@ -480,21 +562,28 @@ td:first-child{white-space:nowrap}
       <p>This is safe: the API returns nothing. But if the app reads this table from the browser, that read silently comes back empty, which looks like a bug at launch.</p>
       <h4>Fix</h4>
       <p>If the browser needs the table, add a read policy for the rows it should see. If only the server uses it, leave it and note that on purpose.</p>
+      <section class="probe">
+    <h4>Tested in Postgres</h4>
+    <p class="probe-what">User A owns one row; each cell is what the actor got in a rolled-back transaction, no owner column (shared data).</p>
+    <table class="probe-grid"><thead><tr><th></th><th>read</th><th>insert as A</th><th>update</th><th>delete</th></tr></thead><tbody><tr><th scope="row">Visitor, no account</th><td class="pc pc-ok">0</td><td class="pc pc-ok">blocked</td><td class="pc pc-ok">0</td><td class="pc pc-ok">0</td></tr><tr><th scope="row">Another user</th><td class="pc pc-ok">0</td><td class="pc pc-ok">blocked</td><td class="pc pc-ok">0</td><td class="pc pc-ok">0</td></tr></tbody></table>
+    
+    
+  </section>
       
       
     </div>
   </article></section><section class="part appendix">
     <h2>Appendix</h2>
     <h4>How severity is rated</h4>
-    <p>Each rule is placed by the first line that fits. Live-site findings keep the severity apify-launch-audit gives them.</p>
+    <p>Each rule is placed by the first line that fits. Live-site findings keep the severity apify-launch-audit gives them. When the RLS probe ran, the severity follows what it could really do: a visitor reading user rows is Critical even if the policy only looked suspicious, and an open read on a table with no owner column and no write leak is Low. Dependency advisories are one level below npm's rating, because the scan does not prove your code reaches the affected function.</p>
     <table><tbody><tr><td><span class="sev sev-critical"><i aria-hidden="true"></i>Critical</span></td><td>Anyone on the internet, without an account, can read private data, change data, take money-related actions or get a key that does those things.</td></tr><tr><td><span class="sev sev-high"><i aria-hidden="true"></i>High</span></td><td>A signed-in user can reach other users&#39; data or give themselves something they did not pay for, or private data is exposed but only under a condition the scanner cannot rule out.</td></tr><tr><td><span class="sev sev-medium"><i aria-hidden="true"></i>Medium</span></td><td>A missing safeguard that makes another bug easier to exploit or worse when it happens (headers, search_path, cookie flags), or a bug that breaks a feature in a way that fails closed.</td></tr><tr><td><span class="sev sev-low"><i aria-hidden="true"></i>Low</span></td><td>Hygiene and launch polish: worth fixing, no direct path to an attack.</td></tr></tbody></table>
     <h4>Tools</h4>
-    <table><thead><tr><th>Tool</th><th>Version</th><th>What ran</th></tr></thead><tbody><tr><td>vibe-preflight</td><td>1.3.0</td><td><code>node vendor/vibe-preflight/preflight.mjs broken-notes-app --format json --fail-on never</code></td></tr><tr><td>secret-scan (built in)</td><td>10 patterns</td><td><code>working tree (git ls-files) + git log -p --all</code></td></tr></tbody></table>
+    <table><thead><tr><th>Tool</th><th>Version</th><th>What ran</th></tr></thead><tbody><tr><td>vibe-preflight</td><td>1.3.0</td><td><code>node vendor/vibe-preflight/preflight.mjs broken-notes-app --format json --fail-on never</code></td></tr><tr><td>secret-scan (built in)</td><td>10 patterns</td><td><code>working tree (git ls-files) + git log -p --all</code></td></tr><tr><td>npm audit</td><td>10.9.9</td><td><code>npm audit --json --package-lock-only --omit=dev</code><br>No package-lock.json, so npm audit cannot resolve versions.</td></tr><tr><td>rls-probe</td><td>1.1.0</td><td><code>prelaunch-audit rls-probe (PGlite + Supabase shim, rolled-back tries as anon and a second user)</code><br>8 tables and views tried as anon and as a second user.</td></tr></tbody></table>
     <h4>Reproduce</h4>
     <pre><code>prelaunch-audit broken-notes-app</code></pre>
     <h4>Apply the patches</h4>
     <p>Each patch is in <code>patches/&lt;id&gt;.diff</code>. From the root of the repository: <code>git apply --check patches/PA-01.diff</code>, then <code>git apply patches/PA-01.diff</code>. New migrations go through <code>supabase db push</code> as usual. Read every patch first: they are written from the code as it was scanned and cannot know your intent.</p>
     <h4>Repo rules and their CWE</h4>
-    <table><thead><tr><th>Rule</th><th>Issue</th><th>CWE</th></tr></thead><tbody><tr><td><code>rls-disabled</code></td><td>Table open to the public API (Row Level Security off)</td><td>CWE-862</td></tr><tr><td><code>rls-permissive-policy</code></td><td>Policy lets everyone through (using true)</td><td>CWE-863</td></tr><tr><td><code>rls-no-policy</code></td><td>Table has Row Level Security on and no policies</td><td>none</td></tr><tr><td><code>rls-update-privileged-column</code></td><td>Users can edit their own plan or role column</td><td>CWE-915</td></tr><tr><td><code>view-bypasses-rls</code></td><td>View skips Row Level Security</td><td>CWE-863</td></tr><tr><td><code>auth-users-exposed</code></td><td>User accounts table exposed through a view</td><td>CWE-359</td></tr><tr><td><code>definer-search-path</code></td><td>SECURITY DEFINER function without a fixed search_path</td><td>CWE-426</td></tr><tr><td><code>definer-function-anon</code></td><td>Privileged database function callable by anyone</td><td>CWE-269</td></tr><tr><td><code>storage-public-bucket</code></td><td>Public storage bucket</td><td>CWE-552</td></tr><tr><td><code>server-secret-in-client</code></td><td>Server-only key used in browser code</td><td>CWE-668</td></tr><tr><td><code>public-env-secret</code></td><td>Secret in a browser-exposed environment variable</td><td>CWE-668</td></tr><tr><td><code>stripe-webhook-unverified</code></td><td>Stripe webhook accepts unsigned requests</td><td>CWE-345</td></tr><tr><td><code>stripe-webhook-parsed-body</code></td><td>Stripe signature checked against a parsed body</td><td>CWE-345</td></tr><tr><td><code>env-file-committed</code></td><td>Environment file with values in git</td><td>CWE-312</td></tr><tr><td><code>secret-in-tree</code></td><td>Credential in the repository</td><td>CWE-798</td></tr><tr><td><code>secret-in-history</code></td><td>Credential left in git history</td><td>CWE-798</td></tr></tbody></table>
+    <table><thead><tr><th>Rule</th><th>Issue</th><th>CWE</th></tr></thead><tbody><tr><td><code>rls-disabled</code></td><td>Table open to the public API (Row Level Security off)</td><td>CWE-862</td></tr><tr><td><code>rls-permissive-policy</code></td><td>Policy lets everyone through (using true)</td><td>CWE-863</td></tr><tr><td><code>rls-no-policy</code></td><td>Table has Row Level Security on and no policies</td><td>none</td></tr><tr><td><code>rls-update-privileged-column</code></td><td>Users can edit their own plan or role column</td><td>CWE-915</td></tr><tr><td><code>view-bypasses-rls</code></td><td>View skips Row Level Security</td><td>CWE-863</td></tr><tr><td><code>auth-users-exposed</code></td><td>User accounts table exposed through a view</td><td>CWE-359</td></tr><tr><td><code>definer-search-path</code></td><td>SECURITY DEFINER function without a fixed search_path</td><td>CWE-426</td></tr><tr><td><code>definer-function-anon</code></td><td>Privileged database function callable by anyone</td><td>CWE-269</td></tr><tr><td><code>storage-public-bucket</code></td><td>Public storage bucket</td><td>CWE-552</td></tr><tr><td><code>server-secret-in-client</code></td><td>Server-only key used in browser code</td><td>CWE-668</td></tr><tr><td><code>public-env-secret</code></td><td>Secret in a browser-exposed environment variable</td><td>CWE-668</td></tr><tr><td><code>stripe-webhook-unverified</code></td><td>Stripe webhook accepts unsigned requests</td><td>CWE-345</td></tr><tr><td><code>stripe-webhook-parsed-body</code></td><td>Stripe signature checked against a parsed body</td><td>CWE-345</td></tr><tr><td><code>env-file-committed</code></td><td>Environment file with values in git</td><td>CWE-312</td></tr><tr><td><code>secret-in-tree</code></td><td>Credential in the repository</td><td>CWE-798</td></tr><tr><td><code>secret-in-history</code></td><td>Credential left in git history</td><td>CWE-798</td></tr><tr><td><code>stripe-webhook-jwt-gate</code></td><td>Stripe webhook function behind Supabase&#39;s JWT check</td><td>none</td></tr><tr><td><code>rls-probe-leak (anon)</code></td><td>Visitors without an account can reach users&#39; rows</td><td>CWE-862</td></tr><tr><td><code>rls-probe-leak (other-user)</code></td><td>Policy exists but lets one user reach another user&#39;s rows</td><td>CWE-863</td></tr><tr><td><code>rls-probe-leak (owner)</code></td><td>Users can change what they paid for on their own row</td><td>CWE-915</td></tr><tr><td><code>rls-probe-leak (anon-write)</code></td><td>Anyone can change shared data</td><td>CWE-862</td></tr></tbody></table>
   </section></main></body>
 </html>

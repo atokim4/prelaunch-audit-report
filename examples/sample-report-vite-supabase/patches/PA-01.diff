@@ -1,0 +1,21 @@
+diff --git a/.env.example b/.env.example
+--- a/.env.example
++++ b/.env.example
+@@ -1,4 +1,4 @@
+ VITE_SUPABASE_URL=https://your-project.supabase.co
+ VITE_SUPABASE_PUBLISHABLE_KEY=
+-VITE_STRIPE_SECRET_KEY=
++STRIPE_SECRET_KEY=
+ VITE_STRIPE_PRICE_PRO=
+diff --git a/src/lib/billing.ts b/src/lib/billing.ts
+--- a/src/lib/billing.ts
++++ b/src/lib/billing.ts
+@@ -1,7 +1,7 @@
+ import Stripe from "stripe";
+ 
+ // Used by the Billing page to show the customer's past payments.
+-const stripe = new Stripe(import.meta.env.VITE_STRIPE_SECRET_KEY);
++const stripe = new Stripe(import.meta.env.STRIPE_SECRET_KEY);
+ 
+ export async function listPayments(customerId: string) {
+   const charges = await stripe.charges.list({ customer: customerId, limit: 20 });

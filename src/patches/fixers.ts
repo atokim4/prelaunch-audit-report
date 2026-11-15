@@ -1,6 +1,17 @@
-import type { Finding } from "../types.ts";
+import { functionTable } from "../shape.ts";
+import type { Finding, ProbePolicy, Proof } from "../types.ts";
 import type { FileEdit } from "./diff.ts";
-import { functionArgs, ident, literal, policies, qualify, tableColumns, type SqlFile } from "./sql.ts";
+import {
+  functionArgs,
+  ident,
+  identPart,
+  literal,
+  policies,
+  publicRel,
+  qualify,
+  tableColumns,
+  type SqlFile,
+} from "./sql.ts";
 
 export interface FixContext {
   /** Text of a repo file, or undefined when it does not exist. */
@@ -16,6 +27,8 @@ export interface PatchDraft {
   edits: FileEdit[];
   summary: string;
   caveats: string[];
+  /** What the patch leaves for a person, when it only closes the exposure. */
+  partial?: string;
 }
 
 type Fixer = (finding: Finding, ctx: FixContext) => Promise<PatchDraft | undefined>;
@@ -263,9 +276,30 @@ const publicEnvSecret: Fixer = async (finding, ctx) => {
   };
 };
 
+/**
+ * A secret under a browser prefix, read in browser code. Dropping the prefix takes it out of the bundle at
+ * the next build; the browser code then gets undefined, so the feature fails closed until it moves server-side.
+ */
+const browserPrefixedSecret: Fixer = async (finding, ctx) => {
+  const draft = await publicEnvSecret(finding, ctx);
+  if (!draft) return undefined;
+  const name = subject(finding) ?? "";
+  const vite = name.startsWith("VITE_");
+  const serverSide = ctx.files.some((f) => f.startsWith("supabase/functions/"))
+    ? "a Supabase Edge Function that reads it with `Deno.env.get()` and checks the caller's JWT"
+    : vite
+      ? "a server route or Supabase Edge Function"
+      : "a route handler or server action";
+  return {
+    ...draft,
+    partial: `The key is out of the browser bundle after the next build, but the code that used it still runs in the browser and now gets an empty value. Move that code to ${serverSide}, and look up whose data it may touch from the session there, never from an argument the browser sends. Until then the feature is off, which is safer than a key anyone can copy.`,
+  };
+};
+
 const ANON_KEY_NAMES = ["NEXT_PUBLIC_SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY"];
 
 const serverSecretInClient: Fixer = async (finding, ctx) => {
+  if (/^(NEXT_PUBLIC_|VITE_|EXPO_PUBLIC_)/.test(subject(finding) ?? "")) return browserPrefixedSecret(finding, ctx);
   if (finding.location.kind !== "file" || subject(finding) !== "SUPABASE_SERVICE_ROLE_KEY") return undefined;
   const path = finding.location.file;
   const before = await ctx.read(path);
@@ -312,14 +346,80 @@ function insertImports(source: string, imports: string[]): string {
   return `${source.slice(0, at)}\n${imports.join("\n")}${source.slice(at)}`;
 }
 
+/** Matches `const event = await req.json()` (optionally wrapped in parens and cast to Stripe.Event). */
+const PARSED_EVENT =
+  /^([ \t]*)(?:const|let)\s+(\w+)\s*=\s*\(?\s*await\s+(\w+)\.json\(\)\s*\)?(?:\s+as\s+Stripe\.Event)?\s*;[ \t]*$/m;
+
+/** Any default import of Stripe, whatever the specifier (npm:, esm.sh, or a bare name from an import map). */
+const DENO_STRIPE_IMPORT = /^import\s+Stripe\s*(?:,\s*\{[^}]*\})?\s+from\s+["'][^"']+["'];?$/m;
+
+/**
+ * Supabase Edge Function (Deno) version: Deno has no Node crypto, so the signature check needs
+ * constructEventAsync with Stripe's SubtleCrypto provider, on the raw text of the request.
+ */
+async function denoWebhookFix(path: string, before: string): Promise<PatchDraft | undefined> {
+  const parse = before.match(PARSED_EVENT);
+  if (!parse) return undefined;
+  const [line, indent = "  ", eventVar, requestVar] = parse;
+  // A type-only import cannot back `new Stripe(...)`: make it a value import of the same module.
+  let source = before.replace(/^import\s+type\s+(Stripe\s+from\s+["'][^"']+["'];?)$/m, "import $1");
+  const top: string[] = [];
+  if (!DENO_STRIPE_IMPORT.test(source)) top.push('import Stripe from "npm:stripe@19.3.1";');
+  const client = source.match(/^(?:export\s+)?const\s+(\w+)\s*=\s*new\s+Stripe\(/m)?.[1];
+  const stripeRef = client ?? "stripe";
+  const setup = [
+    ...(client
+      ? []
+      : [
+          'const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY") ?? "", { httpClient: Stripe.createFetchHttpClient() });',
+        ]),
+    "const cryptoProvider = Stripe.createSubtleCryptoProvider();",
+  ];
+  const i = indent;
+  const verified = [
+    `${i}const signature = ${requestVar}.headers.get("stripe-signature");`,
+    `${i}if (!signature) {`,
+    `${i}  return new Response("Missing stripe-signature header", { status: 400 });`,
+    `${i}}`,
+    "",
+    `${i}let ${eventVar}: Stripe.Event;`,
+    `${i}try {`,
+    `${i}  ${eventVar} = await ${stripeRef}.webhooks.constructEventAsync(`,
+    `${i}    await ${requestVar}.text(),`,
+    `${i}    signature,`,
+    `${i}    Deno.env.get("STRIPE_WEBHOOK_SECRET") ?? "",`,
+    `${i}    undefined,`,
+    `${i}    cryptoProvider,`,
+    `${i}  );`,
+    `${i}} catch {`,
+    `${i}  return new Response("Invalid signature", { status: 400 });`,
+    `${i}}`,
+  ].join("\n");
+  source = source.replace(line, verified);
+  // New imports and the client go right after the last import, so the file still reads top to bottom.
+  const last = [...source.matchAll(/^import .*;$/gm)].pop();
+  const at = last ? (last.index ?? 0) + last[0].length : 0;
+  const block = [...top, "", ...setup].join("\n");
+  const after = last ? `${source.slice(0, at)}\n${block}${source.slice(at)}` : `${block}\n${source}`;
+  return {
+    edits: [{ path, before, after }],
+    summary: `Reads the raw body and checks the stripe-signature header with constructEventAsync and Stripe's SubtleCrypto provider (Deno has no Node crypto) before the function touches the event. Unsigned or tampered requests get a 400.`,
+    caveats: [
+      `Set the secret: \`supabase secrets set STRIPE_WEBHOOK_SECRET=whsec_...\` (the endpoint's signing secret from the Stripe dashboard).`,
+      `Keep \`verify_jwt = false\` for this function in supabase/config.toml: Stripe sends no Supabase token, and the signature is now the gate.`,
+      `Test: \`stripe listen --forward-to <project>.supabase.co/functions/v1/${path.split("/")[2] ?? "stripe-webhook"}\`, then \`stripe trigger checkout.session.completed\`.`,
+    ],
+  };
+}
+
 const stripeWebhookUnverified: Fixer = async (finding, ctx) => {
   if (finding.location.kind !== "file") return undefined;
   const path = finding.location.file;
   const before = await ctx.read(path);
-  if (!before || !/export\s+async\s+function\s+POST\s*\(/.test(before)) return undefined; // App Router only
-  const parse = before.match(
-    /^([ \t]*)(?:const|let)\s+(\w+)\s*=\s*\(?\s*await\s+(\w+)\.json\(\)\s*\)?(?:\s+as\s+Stripe\.Event)?\s*;[ \t]*$/m,
-  );
+  if (!before) return undefined;
+  if (path.startsWith("supabase/functions/")) return denoWebhookFix(path, before);
+  if (!/export\s+async\s+function\s+POST\s*\(/.test(before)) return undefined; // App Router route handlers
+  const parse = before.match(PARSED_EVENT);
   if (!parse) return undefined;
   const [line, indent = "  ", eventVar, requestVar] = parse;
 
@@ -374,7 +474,132 @@ const stripeWebhookUnverified: Fixer = async (finding, ctx) => {
   };
 };
 
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** True when the expression ties the row to the caller: auth.uid() next to one of the owner columns. */
+function scopesToCaller(expression: string | undefined, owners: string[]): boolean {
+  if (!expression || !/auth\.uid\(\)/.test(expression)) return false;
+  return owners.some((c) => new RegExp(String.raw`(^|[^\w"])"?${escapeRegExp(c)}"?([^\w"]|$)`).test(expression));
+}
+
+/** The columns a scoped policy has to compare: the owner columns, or the link to the owning parent. */
+const scopeColumns = (proof: Proof): string[] =>
+  proof.ownerColumns.length ? proof.ownerColumns : proof.ownedVia ? [proof.ownedVia.column] : [];
+
+const ROLE_OF = { anon: "anon", "other-user": "authenticated", owner: "authenticated" } as const;
+
+/** Permissive policies that let the probe's leaks through: right command and role, not scoped to the caller. */
+export function weakPolicies(proof: Proof): ProbePolicy[] {
+  const weak = new Map<string, ProbePolicy>();
+  for (const leak of proof.leaks) {
+    if (leak.actor === "owner") continue;
+    for (const policy of proof.policies) {
+      if (policy.command !== leak.action && policy.command !== "all") continue;
+      if (!policy.roles.includes("public") && !policy.roles.includes(ROLE_OF[leak.actor])) continue;
+      const checked =
+        leak.action === "insert"
+          ? [policy.withCheck ?? policy.using]
+          : leak.action === "update"
+            ? [policy.using, policy.withCheck ?? policy.using]
+            : [policy.using];
+      if (checked.every((e) => scopesToCaller(e, scopeColumns(proof)))) continue;
+      weak.set(policy.name, policy);
+    }
+  }
+  return [...weak.values()];
+}
+
+/** SQL condition "this row belongs to the caller", or undefined when the probe cannot say how. */
+function ownerCondition(proof: Proof): string | undefined {
+  if (proof.ownerColumns.length) {
+    return proof.ownerColumns.map((c) => `(select auth.uid()) = ${identPart(c)}`).join(" or ");
+  }
+  const via = proof.ownedVia;
+  if (!via?.parentOwners.length) return undefined; // owned two levels up: needs a person to write the join
+  const owner = via.parentOwners.map((c) => `p.${identPart(c)} = (select auth.uid())`).join(" or ");
+  return `exists (\n    select 1 from ${publicRel(via.parent)} p\n    where p.${identPart(via.parentColumn)} = ${publicRel(proof.table)}.${identPart(via.column)} and (${owner})\n  )`;
+}
+
+function scopedPolicy(policy: ProbePolicy, table: string, condition: string): string[] {
+  const { command } = policy;
+  const clause =
+    command === "insert"
+      ? `with check (${condition})`
+      : command === "select" || command === "delete"
+        ? `using (${condition})`
+        : `using (${condition})\n  with check (${condition})`;
+  return [
+    `drop policy ${identPart(policy.name)} on ${publicRel(table)};`,
+    "",
+    `create policy ${identPart(policy.name)}`,
+    `  on ${publicRel(table)} for ${command}`,
+    "  to authenticated",
+    `  ${clause};`,
+  ];
+}
+
+/**
+ * For leaks the probe measured: rewrite each policy that let them through so it checks the owner (or,
+ * for a child table, the owner of the parent row). Also the fallback when a static rule's own fixer
+ * cannot handle the table (an open policy on a child table has no owner column to compare).
+ */
+export const probeLeak: Fixer = async (finding, ctx) => {
+  const proof = finding.proof;
+  if (!proof || proof.kind !== "table") return undefined;
+  const condition = ownerCondition(proof);
+  if (!condition) return undefined;
+  const weak = weakPolicies(proof);
+  if (!weak.length) return undefined;
+  const body = weak.flatMap((p, n) => [...(n ? [""] : []), ...scopedPolicy(p, proof.table, condition)]);
+  const who = proof.ownerColumns.length
+    ? `${proof.ownerColumns.join(" or ")} must equal the signed-in user's id`
+    : `the ${proof.ownedVia?.parent} row that ${proof.ownedVia?.column} points at must belong to the signed-in user`;
+  return {
+    edits: [
+      migration(
+        ctx,
+        `scope_policies_${slugOf(proof.table)}`,
+        `${finding.id}: tie ${proof.table} policies to the row owner.`,
+        body,
+      ),
+    ],
+    summary: `Rewrites ${weak.map((p) => `"${p.name}"`).join(", ")} so ${who}. The names stay, so nothing else that refers to them breaks.`,
+    caveats: [
+      `Check that this is who should have access. If a team or shared workspace should see the rows too, scope the policy to that membership instead.`,
+    ],
+  };
+};
+
+/** Turns the Supabase JWT gate off for a Stripe webhook function that already checks the signature. */
+const stripeWebhookJwtGate: Fixer = async (finding, ctx) => {
+  const name = finding.subject;
+  const before = await ctx.read("supabase/config.toml");
+  if (!name || before === undefined) return undefined;
+  const lines = before.split("\n");
+  const header = lines.findIndex((l) => functionTable(name).test(l.trim()));
+  let after: string;
+  if (header === -1) {
+    after = `${before}${before === "" || before.endsWith("\n") ? "" : "\n"}\n[functions.${name}]\nverify_jwt = false\n`;
+  } else {
+    let end = lines.findIndex((l, i) => i > header && l.trim().startsWith("["));
+    if (end === -1) end = lines.length;
+    const setting = lines.findIndex((l, i) => i > header && i < end && /^\s*verify_jwt\s*=/.test(l));
+    if (setting === -1) lines.splice(header + 1, 0, "verify_jwt = false");
+    else lines[setting] = "verify_jwt = false";
+    after = lines.join("\n");
+  }
+  return {
+    edits: [{ path: "supabase/config.toml", before, after }],
+    summary: `Sets verify_jwt = false for ${name}, so Stripe's requests reach the code, where the signature check decides.`,
+    caveats: [
+      "Deploy with `supabase functions deploy` from this config, or pass `--no-verify-jwt` if you deploy another way.",
+    ],
+  };
+};
+
 export const FIXERS: Record<string, Fixer> = {
+  "rls-probe-leak": probeLeak,
+  "stripe-webhook-jwt-gate": stripeWebhookJwtGate,
   "rls-disabled": rlsDisabled,
   "view-bypasses-rls": viewBypassesRls,
   "auth-users-exposed": authUsersExposed,
