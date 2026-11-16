@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ruleInfo, severityOf } from "./rubric.ts";
+import { ADMIN_GATE_TEXT, adminGateNote } from "./scanners/admin-gate.ts";
 import { contextNote } from "./scanners/static-context.ts";
 import { SEVERITIES, SEVERITY_RANK, type Finding, type RawFinding, type Severity } from "./types.ts";
 
@@ -97,8 +98,9 @@ export async function normalize(repo: string, raws: RawFinding[]): Promise<{ fin
     );
     const [lead, ...rest] = group;
     if (!lead) continue;
-    const info = ruleInfo(lead.raw);
-    if (!info) continue;
+    const rule = ruleInfo(lead.raw);
+    if (!rule) continue;
+    const info = lead.raw.adminGate ? { ...rule, ...ADMIN_GATE_TEXT } : rule;
     const others = [...new Set(rest.map((r) => r.raw.rule).filter((rule) => rule !== lead.raw.rule))];
     findings.push({
       id: "",
@@ -108,7 +110,7 @@ export async function normalize(repo: string, raws: RawFinding[]): Promise<{ fin
       title: info.title,
       cwe: info.cwe,
       location: lead.raw.location,
-      evidence: [evidenceOf(lead.raw), contextNote(lead.raw)].filter(Boolean).join(" "),
+      evidence: [evidenceOf(lead.raw), contextNote(lead.raw), adminGateNote(lead.raw)].filter(Boolean).join(" "),
       snippet: await snippetFor(repo, lead.raw, cache),
       whyItMatters: info.whyItMatters,
       fix: info.fix,
@@ -117,6 +119,7 @@ export async function normalize(repo: string, raws: RawFinding[]): Promise<{ fin
       proof: group.find((g) => g.raw.proof)?.raw.proof,
       live: group.find((g) => g.raw.live)?.raw.live,
       ...(group.some((g) => g.raw.phi) ? { phi: group.find((g) => g.raw.phi)?.raw.phi } : {}),
+      ...(lead.raw.adminGate ? { adminGate: lead.raw.adminGate } : {}),
       alsoFlaggedBy: others,
     });
   }

@@ -16,6 +16,17 @@ const PUBLIC_CONTENT_BUCKET = /(^|[-_])(public|cms|site|static|marketing|brand(i
 const CALLER = /\bauth\.(?:uid|jwt)\s*\(/i;
 
 /**
+ * True when the RLS probe tried what the static finding claims. The probe tests a column escalation only on
+ * paid or role column names (plan, role…), so a finding about `plan_id` keeps its static context.
+ */
+export function proofTestsClaim(raw: RawFinding): boolean {
+  if (!raw.proof) return false;
+  if (raw.rule !== "rls-update-privileged-column") return true;
+  const column = raw.message.match(/including `(\w+)`/)?.[1];
+  return raw.proof.checks.some((c) => c.actor === "owner" && c.column === column);
+}
+
+/**
  * Adds what the repo's SQL says to findings the RLS probe could not prove (it did not run, or did not load
  * that table): whether an open read policy sits on a table of public content, and whether a definer function
  * open to visitors works on the caller's own id. The rubric uses it to rate those two cases lower.
@@ -23,7 +34,7 @@ const CALLER = /\bauth\.(?:uid|jwt)\s*\(/i;
 export function addStaticContext(raws: RawFinding[], sql: SqlFile[]): void {
   const tables = new Map([...createdTables(sql)].map(([name, columns]) => [name.toLowerCase(), columns]));
   for (const raw of raws) {
-    if (raw.proof || !raw.subject) continue;
+    if (proofTestsClaim(raw) || !raw.subject) continue;
     const subject = raw.subject.toLowerCase();
     if (raw.rule === "rls-permissive-policy" && /\(select\)/.test(raw.message)) {
       const columns = tables.get(subject);
@@ -49,7 +60,7 @@ export function addStaticContext(raws: RawFinding[], sql: SqlFile[]): void {
 /** Static context that lowers a finding's severity, with the sentence that says why in the report. */
 export function contextNote(raw: RawFinding): string | undefined {
   const c = raw.context;
-  if (!c || raw.proof || raw.live?.verdict === "leak") return undefined;
+  if (!c || proofTestsClaim(raw) || raw.proof?.leaks.length || raw.live?.verdict === "leak") return undefined;
   if (raw.rule === "rls-permissive-policy" && c.tableOwned === false && c.tablePersonal === false && !raw.phi?.length) {
     return "The table has no owner column and no personal columns, so this looks like public content. Confirm it is meant to be public and that nothing private is added to it later.";
   }

@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { PGlite, type Extensions, type Transaction } from "@electric-sql/pglite";
-import type { SqlFile } from "../patches/sql.ts";
+import { statements, type SqlFile } from "../patches/sql.ts";
+import { isStrict, loadOrder } from "./sources.ts";
 import type { Actor, OwnedVia, ProbeCheck, ProbePolicy } from "../types.ts";
 
 /**
@@ -13,7 +14,7 @@ import type { Actor, OwnedVia, ProbeCheck, ProbePolicy } from "../types.ts";
  * values break) is recorded as inconclusive, never as "blocked".
  */
 
-export const PROBE_VERSION = "1.1.0";
+export const PROBE_VERSION = "1.2.0";
 export const SHIM_PATH = new URL("./supabase-shim.sql", import.meta.url);
 
 export const USER_A = "00000000-0000-4000-8000-00000000000a";
@@ -43,8 +44,21 @@ export interface ProbeResult {
   migrations: number;
   /** Supabase platform extensions the probe could not load and stepped over. */
   skippedExtensions: string[];
+  /** Statements of schema files outside supabase/migrations that Postgres rejected (stepped over). */
+  failedStatements: FailedStatement[];
+  /** SECURITY DEFINER functions in public after the load, and whether anon may execute any overload. */
+  definerFunctions?: { name: string; anon: boolean }[];
   /** Set when the migrations did not load; no tables then. */
   error?: string;
+}
+
+export interface FailedStatement {
+  file: string;
+  /** 1-based index of the statement in the file. */
+  index: number;
+  message: string;
+  /** The statement text, for telling which tables it was about. */
+  text: string;
 }
 
 /** True when rows belong to someone: an owner column, or a parent that has one. */
@@ -137,8 +151,16 @@ const isText = (type: string): boolean => /^(text|character varying|character|ci
 const isNumber = (type: string): boolean => /^(smallint|integer|bigint|numeric|real|double precision)$/.test(type);
 
 /** A value Postgres accepts for the column type, as text to cast; undefined when there is no safe guess. */
+/** Enum labels that grant something: user A must start without them, or an escalation check proves nothing. */
+const PRIVILEGED_LABEL = /admin|super|owner|staff|manager|moderator|root|pro|premium|enterprise|paid|business/i;
+
 function sampleValue(column: ColumnInfo): string | undefined {
-  if (column.enumLabels?.length) return column.enumLabels[0];
+  if (column.enumLabels?.length) {
+    const plain = PRIVILEGED_COLUMN.test(column.name)
+      ? column.enumLabels.find((l) => !PRIVILEGED_LABEL.test(l))
+      : undefined;
+    return plain ?? column.enumLabels[0];
+  }
   const type = baseType(column);
   if (type.endsWith("[]")) return "{}";
   // Unique columns need a fresh value per insert, or a second insert fails on the index, not on RLS.
@@ -171,6 +193,52 @@ function ownerColumnsOf(columns: ColumnInfo[]): string[] {
   return columns.filter((c) => OWNER_NAME.test(c.name) && c.type === "uuid").map((c) => c.name);
 }
 
+/**
+ * Functions without arguments that return the caller's id: `auth.uid()` behind a wrapper such as
+ * `private.current_uid()` (no table read in the body). Policies that compare a column to one of them own
+ * rows by that column.
+ */
+async function callerIdFunctions(db: PGlite): Promise<string[]> {
+  const { rows } = await db.query<{ name: string }>(
+    `select p.proname::text as name from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where p.pronargs = 0 and n.nspname not in ('pg_catalog', 'information_schema', 'auth')
+        and p.prorettype in ('uuid'::regtype, 'text'::regtype)
+        and p.prosrc ~* 'auth\\.uid\\s*\\(' and p.prosrc !~* '\\mfrom\\M'`,
+  );
+  return rows.map((r) => r.name);
+}
+
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Owner columns read from the table's policies, for tables with no column tied to auth.users (ids kept as
+ * text, as Prisma does): a uuid or text column compared with `auth.uid()` or a caller-id wrapper.
+ */
+async function ownerColumnsFromPolicies(db: PGlite, info: TableInfo, wrappers: string[]): Promise<string[]> {
+  const { rows } = await db.query<{ expr: string }>(
+    `select coalesce(qual, '') || ' ' || coalesce(with_check, '') as expr
+       from pg_policies where schemaname = 'public' and tablename = $1`,
+    [info.name],
+  );
+  const caller = [String.raw`auth\.uid\(\)`, ...wrappers.map((w) => String.raw`(?:\w+\.)?${escapeRegExp(w)}\(\)`)].join(
+    "|",
+  );
+  // `col = auth.uid()`, `col = ( SELECT auth.uid() AS uid)`, `col = (auth.uid())::text`, and the reverse.
+  const call = String.raw`[(\s]*(?:select\s+)?[(\s]*(?:${caller})`;
+  const column = String.raw`(?:"((?:[^"]|"")+)"|([a-z_]\w*))`;
+  const patterns = [
+    new RegExp(`${column}\\s*=\\s*${call}`, "gi"),
+    new RegExp(`(?:${caller})[^=]{0,40}=\\s*\\(*\\s*${column}`, "gi"),
+  ];
+  const names = new Set<string>();
+  for (const { expr } of rows) {
+    for (const pattern of patterns) {
+      for (const m of expr.matchAll(pattern)) names.add((m[1] ?? m[2] ?? "").replaceAll('""', '"'));
+    }
+  }
+  return info.columns.filter((c) => names.has(c.name) && (c.type === "uuid" || isText(baseType(c)))).map((c) => c.name);
+}
+
 async function tablesOf(db: PGlite): Promise<TableInfo[]> {
   const { rows } = await db.query<{ name: string; oid: number; relkind: string; rls: boolean }>(
     `select c.relname::text as name, c.oid::int as oid, c.relkind::text as relkind, c.relrowsecurity as rls
@@ -190,6 +258,10 @@ async function tablesOf(db: PGlite): Promise<TableInfo[]> {
       ownerColumns: ownerColumnsOf(columns),
       mine: "false",
     });
+  }
+  const wrappers = await callerIdFunctions(db);
+  for (const info of out.filter((t) => t.kind === "table" && !t.ownerColumns.length)) {
+    info.ownerColumns = await ownerColumnsFromPolicies(db, info, wrappers);
   }
   // Views have no foreign keys: an owner column there is one that carries a base table's owner column name.
   const baseOwners = new Set(out.filter((t) => t.kind === "table").flatMap((t) => t.ownerColumns));
@@ -242,7 +314,7 @@ function linkOwnership(ordered: TableInfo[]): void {
 /** Freezes "user A's rows" into literal SQL, so the condition means the same for every actor. */
 async function fixMine(db: PGlite, info: TableInfo, byName: Map<string, TableInfo>): Promise<void> {
   if (info.ownerColumns.length) {
-    info.mine = `(${info.ownerColumns.map((c) => `${quote(c)} = '${USER_A}'::uuid`).join(" or ")})`;
+    info.mine = `(${info.ownerColumns.map((c) => `${quote(c)}::text = '${USER_A}'`).join(" or ")})`;
     return;
   }
   const via = info.ownedVia;
@@ -566,21 +638,62 @@ function stepOverPlatformExtensions(text: string, skipped: Set<string>): string 
   });
 }
 
-export async function probeRls(migrations: SqlFile[]): Promise<ProbeResult> {
-  const ordered = [...migrations].sort((a, b) => a.path.localeCompare(b.path));
+/** Error codes for an object that already exists: a second copy of the schema (install bundle + baseline). */
+const ALREADY_THERE = new Set(["42P07", "42710", "42P06", "42723", "42701", "42P16", "42P05"]);
+
+/**
+ * Loads one schema file that does not live in supabase/migrations statement by statement. Such files are
+ * often dumps or bundles that repeat objects, or use a psql command; a statement Postgres rejects is
+ * stepped over and recorded, so the tables it was about can be left out of the probe instead of tested in
+ * a state the real database is not in.
+ */
+async function loadTolerant(db: PGlite, file: SqlFile, text: string, failed: FailedStatement[]): Promise<void> {
+  const list = statements(text);
+  for (const [i, statement] of list.entries()) {
+    try {
+      await db.exec(statement);
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code && ALREADY_THERE.has(code)) continue;
+      const message = error instanceof Error ? error.message : String(error);
+      failed.push({ file: file.path, index: i + 1, message, text: statement });
+    }
+  }
+}
+
+/** The statement names the table (quoted names exactly, plain names in any case). */
+function mentions(statement: string, table: string): boolean {
+  const name = escapeRegExp(table);
+  const plain = /^[a-z_][a-z0-9_]*$/.test(table) ? `|\\b${name}\\b` : "";
+  return new RegExp(`"${name}"${plain}`, plain ? "i" : "").test(statement);
+}
+
+/**
+ * `tolerant` loads every file statement by statement, supabase/migrations included: used for the retry
+ * with a base schema file, where migrations may repeat objects the base file already made.
+ */
+export async function probeRls(migrations: SqlFile[], tolerant = false): Promise<ProbeResult> {
+  const ordered = loadOrder(migrations);
   const skippedExtensions = new Set<string>();
+  const failedStatements: FailedStatement[] = [];
   const db = await PGlite.create({ extensions: await extensionsFor(ordered) });
   const fail = (error: string): ProbeResult => ({
     tables: [],
     migrations: ordered.length,
     skippedExtensions: [...skippedExtensions],
+    failedStatements,
     error,
   });
   try {
     await db.exec(await readFile(SHIM_PATH, "utf8"));
     for (const migration of ordered) {
+      const text = stepOverPlatformExtensions(migration.text, skippedExtensions);
+      if (tolerant || !isStrict(migration.path)) {
+        await loadTolerant(db, migration, text, failedStatements);
+        continue;
+      }
       try {
-        await db.exec(stepOverPlatformExtensions(migration.text, skippedExtensions));
+        await db.exec(text);
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         return fail(`${migration.path} did not load in PGlite: ${reason}.`);
@@ -593,11 +706,24 @@ export async function probeRls(migrations: SqlFile[]): Promise<ProbeResult> {
     );
 
     const tables = await tablesOf(db);
+    const { rows: definerFunctions } = await db.query<{ name: string; anon: boolean }>(
+      `select p.proname::text as name, bool_or(has_function_privilege('anon', p.oid, 'execute')) as anon
+         from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'public' and p.prosecdef group by p.proname order by 1`,
+    );
     const byName = new Map(tables.map((t) => [t.name, t]));
     const ordering = seedOrder(tables.filter((t) => t.kind === "table"));
     linkOwnership(ordering);
     const skipped = new Map<string, string>();
+    // A table a rejected statement was about (its RLS switch, a policy) is not in the state the real database
+    // is in, so the probe leaves it out rather than report what that missing statement would have blocked.
+    for (const info of tables) {
+      const hit = failedStatements.find((f) => mentions(f.text, info.name));
+      if (hit)
+        skipped.set(info.name, `statement ${hit.index} of ${hit.file} that names it did not load: ${hit.message}`);
+    }
     for (const info of ordering) {
+      if (skipped.has(info.name)) continue;
       await fixMine(db, info, byName);
       const reason = await seed(db, info, byName);
       if (reason) skipped.set(info.name, reason);
@@ -621,7 +747,13 @@ export async function probeRls(migrations: SqlFile[]): Promise<ProbeResult> {
         reason ? { ...base, checks: [], skipped: reason } : { ...base, checks: await probeTable(db, info, byName) },
       );
     }
-    return { tables: out, migrations: ordered.length, skippedExtensions: [...skippedExtensions] };
+    return {
+      tables: out,
+      migrations: ordered.length,
+      skippedExtensions: [...skippedExtensions],
+      failedStatements,
+      definerFunctions,
+    };
   } catch (error) {
     return fail(`the probe stopped: ${error instanceof Error ? error.message : String(error)}`);
   } finally {

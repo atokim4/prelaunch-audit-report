@@ -10,6 +10,8 @@ import { runNpmAudit } from "./scanners/npm-audit.ts";
 import { markPhi, runPhiScan } from "./scanners/phi.ts";
 import { filterPreflight, runPreflight } from "./scanners/preflight.ts";
 import { addStaticContext, dynamicRlsTables } from "./scanners/static-context.ts";
+import { probeSources } from "./probe/sources.ts";
+import { markAdminGates } from "./scanners/admin-gate.ts";
 import { mergeProbe, runRlsProbe, toProof } from "./scanners/rls-probe.ts";
 import { runSecretScan } from "./scanners/secrets.ts";
 import { detectShape, edgeConfigFindings } from "./shape.ts";
@@ -77,12 +79,28 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
   const ctx = await fixContext(repo, await listFiles(repo, git), now);
   const shape = await detectShape(ctx.files, ctx.read);
 
-  const [preflight, secrets, probe, deps] = await Promise.all([
+  const [preflight, secrets, first, deps] = await Promise.all([
     runPreflight(repo),
     runSecretScan(repo),
-    runRlsProbe(ctx.migrations),
+    runRlsProbe(ctx.probeSql),
     options.npmAudit === false ? undefined : runNpmAudit(repo),
   ]);
+  // supabase/migrations that build on a schema.sql (the first migration was never saved) fail alone: try
+  // again with the base file loaded first, every statement stepped over on error.
+  let probe = first;
+  let tolerant = false;
+  const wider = probeSources(ctx.schemaSql, true);
+  if (first.tool.status === "failed" && wider.length > ctx.probeSql.length) {
+    const retry = await runRlsProbe(wider, true);
+    if (retry.tool.status === "ok") {
+      const added = wider.filter((f) => !ctx.probeSql.some((m) => m.path === f.path)).map((f) => f.path);
+      probe = retry;
+      tolerant = true;
+      ctx.probeSql = wider;
+      probe.tool.note =
+        `${probe.tool.note ?? ""} supabase/migrations alone did not load (${first.tool.note ?? ""}), so the probe ran again with ${added.join(", ")} loaded first.`.trim();
+    }
+  }
   const kept = await filterPreflight(preflight.findings, ctx.read, ARCHIVED_SQL);
   preflight.findings = kept.findings;
   if (kept.archived.length) {
@@ -100,6 +118,19 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
       `Row Level Security turned on by a loop of dynamic SQL (${covered.map((f) => `\`${f.subject ?? ""}\``).join(", ")}): not reported as off, and the policies that loop creates were not read.`,
     );
   }
+  // The static rule reads grants line by line and misses `revoke … from public, anon` in some layouts; the
+  // probe's database has the real privileges after every migration ran, so it settles the question.
+  const revoked = new Set(
+    (probe.result?.definerFunctions ?? []).filter((f) => !f.anon).map((f) => `public.${f.name}`.toLowerCase()),
+  );
+  const notCallable = preflight.findings.filter(
+    (f) => f.rule === "definer-function-anon" && revoked.has((f.subject ?? "").toLowerCase()),
+  );
+  if (notCallable.length) {
+    preflight.findings = preflight.findings.filter((f) => !notCallable.includes(f));
+    probe.tool.note =
+      `${probe.tool.note ?? ""} ${notCallable.length} SECURITY DEFINER function(s) the static rule called open to visitors are not executable by anon once the schema is loaded (${notCallable.map((f) => `\`${f.subject ?? ""}\``).join(", ")}); not reported.`.trim();
+  }
   for (const result of [preflight, secrets, ...(deps ? [deps] : [])]) {
     raws.push(...result.findings);
     tools.push(result.tool);
@@ -108,7 +139,7 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
   if (!deps) notChecked.push("Dependencies with known CVEs: npm audit was turned off for this run.");
   tools.push(probe.tool);
   raws.push(...(await edgeConfigFindings(shape, ctx.read)));
-  if (probe.result) raws.push(...mergeProbe(raws, probe.result, ctx.migrations));
+  if (probe.result) raws.push(...mergeProbe(raws, probe.result, ctx.probeSql));
   if (probe.note) notChecked.unshift(probe.note);
 
   let live: LiveResult | undefined;
@@ -137,6 +168,7 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
   }
 
   addStaticContext(raws, ctx.schemaSql);
+  markAdminGates(raws, ctx.schemaSql);
 
   if (options.url) {
     const live = await runLaunchAudit({
@@ -158,12 +190,15 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
   // Re-run the probe with every verified patch applied: a patch for a leak has to bring it to zero.
   let matrix: Proof[] | undefined;
   if (probe.result) {
-    const after = await probeRls(patchedMigrations(ctx.migrations, edits)).catch((error: unknown): ProbeResult => ({
-      tables: [],
-      migrations: 0,
-      skippedExtensions: [],
-      error: error instanceof Error ? error.message : String(error),
-    }));
+    const after = await probeRls(patchedMigrations(ctx.probeSql, edits), tolerant).catch(
+      (error: unknown): ProbeResult => ({
+        tables: [],
+        migrations: 0,
+        skippedExtensions: [],
+        failedStatements: [],
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
     const afterByTable = new Map(after.tables.map((t) => [t.table, t]));
     matrix = probe.result.tables.filter((t) => !t.skipped).map(toProof);
     if (after.error) {

@@ -96,14 +96,16 @@ describe("schema SQL outside supabase/migrations", () => {
     expect(result.notChecked.join("\n")).toMatch(/dynamic SQL \(`public\.family_members`, `public\.medical_records`\)/);
   });
 
-  it("maps PHI tables from schema.sql when the probe has nothing to load", async () => {
+  it("maps PHI tables from schema.sql and probes them there", async () => {
     const dir = await app({ "package.json": pkg, "supabase/schema.sql": VAULT_TABLES });
     const result = await audit({ repo: dir, now: NOW, npmAudit: false, phi: true });
     const tables = result.phi?.tables ?? [];
-    expect(tables.map((t) => [t.table, t.untested])).toEqual([
-      ["public.family_members", "not probed"],
-      ["public.medical_records", "not probed"],
+    // Run 6: the probe loads schema.sql too, so access comes from behaviour, not "not probed".
+    expect(tables.map((t) => [t.table, t.untested, t.readBy])).toEqual([
+      ["public.family_members", undefined, ["anon", "other-user"]],
+      ["public.medical_records", undefined, ["anon", "other-user"]],
     ]);
+    expect(find(result, "rls-disabled", "public.medical_records")?.severity).toBe("critical");
     // With RLS off, a PHI table read by anyone is Critical and carries its columns.
     expect(find(result, "rls-disabled", "public.medical_records")?.phi).toEqual(["file_url", "extracted_data"]);
   });
@@ -283,9 +285,11 @@ create function public.wipe_old() returns void language sql security definer as 
   });
 
   it("rates a public content table Low and a caller-checking definer function Medium; controls keep their level", async () => {
+    // PostGIS is not in PGlite, so the strict migration load fails and only the static reading is left.
     const dir = await app({
       "package.json": pkg,
-      "supabase/schema.sql": `${SQL}
+      "supabase/migrations/20240101000000_init.sql": `create extension if not exists postgis;
+${SQL}
 alter table public.homepage_sections enable row level security;
 create policy "read sections" on public.homepage_sections for select using (true);
 alter table public.bookings enable row level security;
@@ -293,6 +297,7 @@ create policy "read bookings" on public.bookings for select using (true);
 `,
     });
     const result = await audit({ repo: dir, now: NOW, npmAudit: false });
+    expect(result.tools.find((t) => t.name === "rls-probe")?.status).toBe("failed");
     expect(find(result, "rls-permissive-policy", "public.homepage_sections")?.severity).toBe("low");
     expect(find(result, "rls-permissive-policy", "public.homepage_sections")?.evidence).toMatch(
       /looks like public content/,

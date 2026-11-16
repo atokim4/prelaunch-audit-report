@@ -100,21 +100,29 @@ export function mergeProbe(raws: RawFinding[], result: ProbeResult, migrations: 
 
 export async function runRlsProbe(
   migrations: SqlFile[],
+  tolerant = false,
 ): Promise<{ result?: ProbeResult; tool: ToolRun; note?: string }> {
   const command = "prelaunch-audit rls-probe (PGlite + Supabase shim, rolled-back tries as anon and a second user)";
   const tool: ToolRun = { name: "rls-probe", version: PROBE_VERSION, command, status: "ok" };
   if (!migrations.length) {
-    return { tool: { ...tool, status: "skipped", note: "No supabase/migrations folder." } };
+    return {
+      tool: {
+        ...tool,
+        status: "skipped",
+        note: "No SQL schema files (supabase/migrations, schema.sql, sql/, prisma/migrations).",
+      },
+    };
   }
   let result: ProbeResult;
   try {
-    result = await probeRls(migrations);
+    result = await probeRls(migrations, tolerant);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     result = {
       tables: [],
       migrations: migrations.length,
       skippedExtensions: [],
+      failedStatements: [],
       error: `the probe crashed: ${reason}`,
     };
   }
@@ -133,6 +141,9 @@ export async function runRlsProbe(
       note: [
         `${tested} tables and views tried as anon and as a second user.`,
         skipped.length ? `Not tried: ${skipped.map((t) => `${t.table} (${t.skipped})`).join("; ")}.` : "",
+        result.failedStatements.length
+          ? `Stepped over ${result.failedStatements.length} statement(s) of schema files outside supabase/migrations that Postgres rejected (${[...new Set(result.failedStatements.map((f) => f.file))].join(", ")}); tables they name were not tried.`
+          : "",
         result.skippedExtensions.length
           ? `Stepped over platform extensions: ${result.skippedExtensions.join(", ")}.`
           : "",

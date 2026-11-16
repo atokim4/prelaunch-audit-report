@@ -613,14 +613,14 @@
     },
     {
       "name": "rls-probe",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "command": "prelaunch-audit rls-probe (PGlite + Supabase shim, rolled-back tries as anon and a second user)",
       "status": "ok",
       "note": "5 tables and views tried as anon and as a second user."
     },
     {
       "name": "phi-scan",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "command": "prelaunch-audit --phi (PHI column map by name, trackers, vendor calls, logs, buckets, audit triggers)",
       "status": "ok",
       "note": "5 tables and views with health data by column name; 4 source files read and use them."

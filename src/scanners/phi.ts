@@ -20,7 +20,7 @@ import type {
  * code that sends it to an AI, email or SMS vendor, logs, and public storage buckets. It reads files only.
  */
 
-export const PHI_SCAN_VERSION = "1.0.0";
+export const PHI_SCAN_VERSION = "1.1.0";
 /** The day the checklist below was copied from Supabase's docs. */
 export const HIPAA_DOCS_READ_ON = "2026-11-16";
 export const HIPAA_DOCS_URL = "https://supabase.com/docs/guides/deployment/shared-responsibility-model";
@@ -39,9 +39,11 @@ const SERVER =
 const GLOBAL =
   /^(index\.html|public\/index\.html|(src\/)?main\.[jt]sx?|(src\/)?App\.[jt]sx?|(src\/)?index\.[jt]sx?|(src\/)?app\/layout\.[jt]sx?|(src\/)?pages\/_(app|document)\.[jt]sx?)$/;
 
-const isServer = (f: string): boolean => SERVER.test(f);
-const isClient = (f: string): boolean =>
-  (SOURCE.test(f) || /(^|\/)index\.html$/.test(f)) && !isServer(f) && !TEST.test(f) && !TOOLING.test(f);
+/** A Next.js server action: the file, or a function in it, starts with the "use server" directive. */
+const USE_SERVER = /^\s*["']use server["'];?\s*$/m;
+const isServer = (f: string, text?: string): boolean => SERVER.test(f) || (text !== undefined && USE_SERVER.test(text));
+const isClient = (f: string, text?: string): boolean =>
+  (SOURCE.test(f) || /(^|\/)index\.html$/.test(f)) && !isServer(f, text) && !TEST.test(f) && !TOOLING.test(f);
 
 interface Tracker {
   vendor: string;
@@ -89,6 +91,22 @@ const VENDORS: { vendor: string; pattern: RegExp }[] = [
   { vendor: "Twilio", pattern: /api\.twilio\.com|from\s+["'](?:npm:)?twilio(?:@[^"']*)?["']/ },
 ];
 
+/** AI vendors a browser bundle can call directly, with the env names their keys go by. */
+const BROWSER_AI: { vendor: string; pattern: RegExp }[] = [
+  { vendor: "OpenAI", pattern: /api\.openai\.com|from\s+["']openai["']/ },
+  { vendor: "Anthropic", pattern: /api\.anthropic\.com|from\s+["']@anthropic-ai\/sdk["']/ },
+  {
+    vendor: "Google Gemini",
+    pattern: /generativelanguage\.googleapis\.com|from\s+["']@google\/(?:genai|generative-ai)["']/,
+  },
+];
+/** The key is in the page: a browser-prefixed env name for an AI vendor, or the SDK's browser opt-in. */
+const KEY_IN_PAGE =
+  /\b(?:NEXT_PUBLIC|VITE|EXPO_PUBLIC|PUBLIC|REACT_APP)_\w*(?:OPENAI|ANTHROPIC|CLAUDE|GEMINI|GOOGLE_AI|GENAI)\w*|dangerouslyAllowBrowser\s*:\s*true|anthropic-dangerous-direct-browser-access/;
+/** Identifiers that carry clinical content, for code that gets it as arguments instead of reading a table. */
+const CLINICAL =
+  /\b(?:patient\w*|symptoms?|diagnos\w*|medical\w*|clinical\w*|medications?|prescriptions?|allerg\w*|vitals?|lab_?results?|chief_?complaint)\b/gi;
+
 /** Bucket names that say what they hold. */
 const PHI_BUCKET =
   /(^|[-_])(labs?|lab-results|medical|patients?|records?|health|insurance|scans?|x-?rays?|imaging|prescriptions?|intake|charts?|referrals?)($|[-_])/i;
@@ -112,7 +130,9 @@ async function phiTables(ctx: FixContext, probed: TableProbe[]): Promise<{ table
   // still mapped from their create table statements.
   for (const [table, columns] of createdTables(ctx.schemaSql)) {
     const name = bare(table);
-    if (!byName.has(name)) {
+    // The probe keeps a quoted name's case ("Appointment"); the SQL reader lowers it.
+    const seen = [...byName.keys()].some((k) => k.toLowerCase() === name.toLowerCase());
+    if (!seen) {
       byName.set(name, { relation: "table", columns: columns.map((c) => c.name), foundIn: new Set(["migrations"]) });
     }
   }
@@ -237,10 +257,10 @@ function trackerFindings(
 ): { trackers: PhiTracker[]; findings: RawFinding[] } {
   const trackers: PhiTracker[] = [];
   const findings: RawFinding[] = [];
-  const pages = uses.filter((u) => isClient(u.file));
-  for (const file of ctx.files.filter(isClient)) {
+  const pages = uses.filter((u) => isClient(u.file, u.text));
+  for (const file of ctx.files) {
     const text = texts.get(file);
-    if (!text) continue;
+    if (!text || !isClient(file, text)) continue;
     for (const tracker of TRACKERS) {
       const match = tracker.pattern.exec(text);
       if (!match) continue;
@@ -266,7 +286,7 @@ function trackerFindings(
 
 function vendorFindings(uses: PhiUse[]): RawFinding[] {
   const out: RawFinding[] = [];
-  for (const use of uses.filter((u) => isServer(u.file))) {
+  for (const use of uses.filter((u) => isServer(u.file, u.text))) {
     for (const { vendor, pattern } of VENDORS) {
       const match = pattern.exec(use.text);
       if (!match) continue;
@@ -278,6 +298,49 @@ function vendorFindings(uses: PhiUse[]): RawFinding[] {
         location: at(use.file, lineAt(use.text, match.index)),
         subject: `${vendor} (${use.file})`,
         phi: use.columns,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * AI calls made from the browser: a client file that loads an AI SDK or calls its API with the key in the
+ * page, and handles health data (reads a PHI table, or names clinical fields it gets as arguments). The
+ * text goes from the patient's or clinician's browser to the vendor, outside any server the app controls.
+ */
+function browserAiFindings(texts: Map<string, string>, uses: PhiUse[], tables: PhiTable[]): RawFinding[] {
+  const out: RawFinding[] = [];
+  const phiColumns = [...new Set(tables.flatMap((t) => searchable(t.columns)))];
+  for (const [file, text] of texts) {
+    if (!isClient(file, text)) continue;
+    const key = KEY_IN_PAGE.exec(text);
+    if (!key) continue;
+    const code = codeOnly(text);
+    const read = uses.find((u) => u.file === file);
+    const fields = read?.columns.length
+      ? read.columns
+      : [
+          ...new Set([
+            ...phiColumns.filter((c) => word(c).test(code)),
+            // Variables and fields (patientInfo, patient_age), not type or constant names.
+            ...[...code.matchAll(CLINICAL)]
+              .map((m) => m[0])
+              .filter((n) => /^[a-z]/.test(n) && !/^[a-z]+_[A-Z]/.test(n)),
+          ]),
+        ].slice(0, 6);
+    if (!fields.length) continue;
+    for (const { vendor, pattern } of BROWSER_AI) {
+      const match = pattern.exec(text);
+      if (!match) continue;
+      out.push({
+        source: "phi-scan",
+        rule: "phi-vendor-egress",
+        toolSeverity: "egress-browser",
+        message: `\`${file}\` calls ${vendor} from the browser (\`${key[0]}\`) and the code handles ${list(fields)}: the text leaves from the user's browser, with the API key in the page.`,
+        location: at(file, lineAt(text, match.index)),
+        subject: `${vendor} (${file})`,
+        phi: fields,
       });
     }
   }
@@ -319,13 +382,18 @@ function splitValues(tuple: string): string[] {
 
 function logFindings(uses: PhiUse[]): RawFinding[] {
   const out: RawFinding[] = [];
-  for (const use of uses.filter((u) => isServer(u.file))) {
+  for (const use of uses.filter((u) => isServer(u.file, u.text))) {
     const names = phiNames(use);
     const calls: number[] = [];
     let logged: string[] = [];
     for (const m of use.text.matchAll(/\bconsole\.(log|info|warn|error|debug)\s*\(/g)) {
       const args = balanced(use.text, m.index + m[0].length - 1) ?? "";
-      const hits = names.filter((n) => word(n).test(codeOnly(args)));
+      // `row.id`, `job.patient_id` or `rows.length` in a log line is a reference or a count, not the record.
+      const printed = codeOnly(args).replace(
+        /[A-Za-z_$][\w$]*\s*\??\.\s*(?:id|length|count|size|[A-Za-z_$][\w$]*(?:_id|Id))\b(?![\w$(.[])/g,
+        " ",
+      );
+      const hits = names.filter((n) => word(n).test(printed));
       if (!hits.length) continue;
       calls.push(lineAt(use.text, m.index));
       logged = [...new Set([...logged, ...hits])];
@@ -577,6 +645,7 @@ export async function runPhiScan(ctx: FixContext, probed: TableProbe[]): Promise
   const findings: RawFinding[] = [
     ...trackerRaws,
     ...vendorFindings(uses),
+    ...browserAiFindings(texts, uses, tables),
     ...logFindings(uses),
     ...bucketFindings(bucketsOf(ctx.schemaSql, await ctx.read("supabase/config.toml")), ctx, texts, tables),
     ...(await unmanagedFindings(tables, ctx, typesFile)),

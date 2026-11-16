@@ -46,6 +46,18 @@ export interface RawFinding {
   phi?: string[];
   /** What the repo's SQL says about the object, for findings the probe has no proof for. */
   context?: StaticContext;
+  /** The column the row's owner can write decides admin access (see scanners/admin-gate.ts). */
+  adminGate?: AdminGate;
+}
+
+/** A role column that policies use to grant admin access, and where the SQL shows it. */
+export interface AdminGate {
+  /** `public.<name>`, lower case. */
+  table: string;
+  column: string;
+  /** How it decides access, in words: the helper function and the policy that calls it. */
+  via: string;
+  location: Location;
 }
 
 /** Read from the create table / create function statements, never from running anything. */
@@ -150,6 +162,8 @@ export interface Finding {
   live?: LiveTable | LiveBucket;
   /** With --phi: the health-data columns involved (PHI on a table, or PHI fields the code handles). */
   phi?: string[];
+  /** Set when the column the user can write decides admin access. */
+  adminGate?: AdminGate;
   /** Other rules that flagged the same thing and were folded into this finding. */
   alsoFlaggedBy: string[];
 }

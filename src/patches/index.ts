@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { SEVERITY_RANK, type Finding } from "../types.ts";
 import { applies, unifiedDiff, type FileEdit } from "./diff.ts";
 import { FIXERS, probeLeak, type FixContext } from "./fixers.ts";
+import { probeSources } from "../probe/sources.ts";
 import type { SqlFile } from "./sql.ts";
 
 const MIGRATIONS_DIR = "supabase/migrations";
@@ -43,6 +44,7 @@ export async function fixContext(repo: string, files: string[], now: Date): Prom
     files,
     migrations,
     schemaSql,
+    probeSql: probeSources(schemaSql),
     newMigration(slug) {
       const name = `${MIGRATIONS_DIR}/${stamp(new Date(next))}_${slug}.sql`;
       next += 1000;

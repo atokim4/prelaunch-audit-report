@@ -80,13 +80,14 @@ the cover.
 
 ### Row Level Security, by behaviour
 
-`supabase/migrations/*.sql` are loaded in order into PGlite on top of a small stand-in for the parts of Supabase
+The schema SQL is loaded in order into PGlite on top of a small stand-in for the parts of Supabase
 they rely on (the `anon`, `authenticated` and `service_role` roles, `auth.users`, `auth.uid()`, storage tables,
 Supabase's default grants, the realtime publication, Supabase's internal roles and a `cron.schedule` stand-in).
 Extensions PGlite ships (`uuid-ossp`, `pgcrypto`, `pg_trgm`, `citext` and others) are loaded when a migration asks
 for them; platform-only ones such as `pg_net` or `pg_cron` are stepped over and named in the appendix. Two users
 are created. Every table in `public` gets one row owned by user A. Owner columns are the ones that reference
-`auth.users`, or are called `user_id`, `owner_id` and similar; a table without one that has a foreign key to an
+`auth.users`, or are called `user_id`, `owner_id` and similar, or (for ids kept as text, as Prisma does) a column
+a policy compares with `auth.uid()` or a wrapper of it such as `private.current_uid()`. A table without one that has a foreign key to an
 owned table (messages of a project) belongs to the parent row's owner. Parents are seeded first, and unique
 columns get fresh values. Then, each in a transaction that is rolled back:
 
@@ -96,11 +97,22 @@ columns get fresh values. Then, each in a transaction that is rolled back:
   counting it only when the stored value really changed (a trigger that resets or rejects it counts as blocked);
 - for views: select as the visitor and as user B.
 
+Which SQL loads: `supabase/migrations` when the repo has it, with Prisma or Drizzle migrations first (they create
+the tables those migrations add policies to). Without it, the base files (`schema.sql`, `sql/baseline.sql`) and
+then each `migrations/` folder, in path order. Seeds, demo data, rollbacks, tests, docs and read-only diagnostics
+are left out. Files outside `supabase/migrations` load one statement at a time: a statement Postgres rejects is
+stepped over and listed, and any table it names is left out of the probe, so a policy that failed to load is
+never reported as a hole. When `supabase/migrations` builds on a `schema.sql` it never created, the probe runs
+again with that file first. Role columns of user A start at a plain value (`receptionist`, not `admin`).
+
 Only a permission error or an RLS violation counts as "blocked". A try that fails for another reason (a check
 constraint or trigger rejecting the test values) is shown as "?" and proves nothing either way.
 
 What gets through decides the severity. A visitor reaching user rows is Critical. User B reaching A's rows, or
-A upgrading their own plan, is High. A table that belongs to no user at all (a price list) may be readable by
+A upgrading their own plan, is High. A raising their own role is Critical when that column decides admin access:
+a helper such as `is_admin()` or `current_role()` reads it and a policy calls the helper, or a policy checks it in
+a subquery (`(select role from profiles …) = 'admin'`). The patch revokes update on the table and grants it back
+on every other column. A table that belongs to no user at all (a price list) may be readable by
 everyone; only writes to it count. When no static rule explains a leak, it becomes its own finding pointing at the policy that
 let it through. The two most common shapes it catches that policy linters pass are `using (auth.role() =
 'authenticated')` on a select and `with check (auth.uid() is not null)` on an insert.
@@ -210,9 +222,12 @@ For apps that store patient data. It reads files only, like the repo checks.
   Pixel, Mixpanel, Segment, the Lovable editor script) is Medium. A script counts when it loads in a global file
   (`index.html`, `main.tsx`, `App.tsx`, `app/layout`, `pages/_app`) or on the page itself, and a page counts when
   it reads a PHI table and names a PHI column.
-- **Vendors.** Server code (edge functions, `app/api`, `pages/api`, `server/`) that reads a PHI table, names PHI
-  fields and calls OpenAI, Anthropic, Gemini, Resend, SendGrid, Postmark, Mailgun or Twilio is High: the vendor
-  must sign a Business Associate Agreement (BAA) first. The report never says a vendor is or is not compliant.
+- **Vendors.** Server code (edge functions, `app/api`, `pages/api`, `server/`, and files or functions marked
+  `"use server"`) that reads a PHI table, names PHI fields and calls OpenAI, Anthropic, Gemini, Resend, SendGrid,
+  Postmark, Mailgun or Twilio is High: the vendor must sign a Business Associate Agreement (BAA) first. The same
+  goes for browser code that calls OpenAI, Anthropic or Gemini with the key in the page (`NEXT_PUBLIC_`/`VITE_`
+  key names, `dangerouslyAllowBrowser: true`) and handles PHI fields or clinical variables such as `patientInfo`
+  or `symptoms`. The report never says a vendor is or is not compliant.
 - **Logs and buckets.** `console.*` calls in that server code that print PHI rows or fields (Medium), and public
   buckets whose name or upload code says they hold patient files (Critical).
 - **Audit trail.** Without a trigger that writes changes of the PHI tables to an audit table, the report adds a
@@ -241,19 +256,21 @@ The cover of every report lists this too:
 
 With `--phi`, also: HIPAA compliance as a whole (that needs a risk analysis, policies, training and signed
 agreements), PHI in columns whose names don't give it away, reads of health records (triggers log changes only),
-Next.js server actions outside `app/api`, and whether a vendor already signed a BAA with you.
+server actions that call a vendor through a helper in another file (only the file that names the vendor is
+read), and whether a vendor already signed a BAA with you.
 
 The probe also has limits worth knowing: it seeds one row per table with guessed values, so a table whose check
 constraints or triggers reject those values is listed as "not tried"; it tests the two API roles, not
-`service_role`; functions called over `/rest/v1/rpc/` are checked statically, not called; and it only loads
-`supabase/migrations`. SQL kept anywhere else is read statically (rules, PHI map), not run.
+`service_role`; functions called over `/rest/v1/rpc/` are checked statically, not called; and SQL in docs, seeds or a folder it
+does not recognise as schema is read statically (rules, PHI map), not run.
 
 ## Severity rubric
 
 A rule gets the first level that fits:
 
 1. **Critical**: anyone on the internet, without an account, can read private data, change data, take
-   money-related actions or get a key that does those things.
+   money-related actions or get a key that does those things. Also: any signed-in user can make themselves an
+   admin (on an app with open sign-up, that is anyone).
 2. **High**: a signed-in user can reach other users' data or give themselves something they did not pay for, or
    private data is exposed under a condition the scanner cannot rule out.
 3. **Medium**: a missing safeguard that makes another bug easier to exploit or worse, or a bug that breaks a
@@ -274,7 +291,8 @@ the code rules. Each patch is a unified diff that applies with `git apply` from 
 `git apply --check` on it against the code as scanned before it calls the patch verified. Some of them:
 
 - A leak only the probe found: each policy that let it through is rewritten in place (same name) so the owner
-  column must equal `(select auth.uid())`.
+  column must equal `(select auth.uid())`. When the leak is the owner raising their own role or plan, update is
+  revoked on the table and granted back on every other column instead.
 - Stripe webhook in a Next.js route handler: raw body plus `constructEventAsync`.
 - Stripe webhook in a Supabase Edge Function (Deno): raw body plus `constructEventAsync` with
   `Stripe.createSubtleCryptoProvider()`, because Deno has no Node crypto. The test suite runs the bench app's
@@ -371,7 +389,7 @@ ones have a verified patch; the `open_tasks` view has none of its own, because t
 Regenerate the samples with `npm run sample`, `npm run sample:phi` and `npm run sample:vite` (the second one needs `npm run postgrest`
 once, which downloads PostgREST and checks its SHA-256).
 
-## Run on 7 real clinic codebases
+## Run on real clinic codebases
 
 The demo apps above test what I already knew to look for, so on 16 November 2026 I ran `--phi` on seven public
 open-source clinic and health-record repos from GitHub. Static only: clone, scan the code and SQL, read every
@@ -380,38 +398,68 @@ finding by hand. Nothing was sent to their deployments. Each repo was pinned at 
 The first run (v0.4.0) gave 61 findings. 12 were wrong: RLS turned on by a `DO` loop of dynamic SQL read as RLS
 off (5), policies in a `supabase/archive` folder that a later migration replaces (3), sample key headers inside a
 committed `node_modules` (2), a Supabase anon key under an unusual env name (1), and a diet plan column read as a
-paid plan (1). The PHI map was empty on all seven, because it only knew tables the probe had loaded from
-`supabase/migrations`, and most of these repos keep their SQL somewhere else.
+paid plan (1). The PHI map was empty on all seven, and the RLS probe ran on one, because both only knew
+`supabase/migrations` and most of these repos keep their SQL somewhere else.
 
-Each of those now has a fixture test in `test/real-repo-shapes.test.ts`, with a control case that must still be
-reported. The same run also turned up a probe bug (an insert into a table where every column has a default) and
-tables that are public on purpose (CMS sections, clinic schedules) rated High; with the SQL showing no owner and
-no personal column, those are now Low with a "confirm it is meant to be public" line.
+v0.4.1 fixed those, each with a fixture test in `test/real-repo-shapes.test.ts`. v0.5.0 closed the misses that
+were left (`test/held-out-misses.test.ts`): the probe now loads `schema.sql`, `sql/` and Prisma migrations, finds
+owners through a wrapper of `auth.uid()`, rates a self-service role change Critical when that role decides admin
+access, and the PHI check reads server actions and AI calls made from the browser. Same commits, v0.5.0:
 
-After the fixes, on the same commits:
+| repo                            | Critical | High | Medium | Low | PHI tables | RLS probe |
+| ------------------------------- | -------- | ---- | ------ | --- | ---------- | --------- |
+| ahmedbahnese/clinic             | 0        | 0    | 4      | 9   | 2          | ran       |
+| kareeem7/clinic                 | 5        | 9    | 4      | 6   | 4          | ran       |
+| goldhoang/clinic-booking        | 1        | 0    | 1      | 0   | 1          | ran       |
+| mustafakbaser/ClinicManager-App | 4        | 0    | 1      | 0   | 1          | ran       |
+| pranavgawasproject/medi-care    | 2        | 1    | 1      | 2   | 6          | ran       |
+| phanindraks2005/medivault       | 0        | 0    | 1      | 0   | 3          | ran       |
+| Nico2603/ClinicAI               | 0        | 9    | 17     | 0   | 1          | ran       |
 
-| repo                            | Critical | High | Medium | Low | PHI tables | RLS probe                      |
-| ------------------------------- | -------- | ---- | ------ | --- | ---------- | ------------------------------ |
-| ahmedbahnese/clinic             | 0        | 0    | 4      | 9   | 2          | ran                            |
-| kareeem7/clinic                 | 5        | 9    | 4      | 6   | 4          | no `supabase/migrations`       |
-| goldhoang/clinic-booking        | 0        | 0    | 1      | 0   | 1          | failed (tables made by Prisma) |
-| mustafakbaser/ClinicManager-App | 4        | 0    | 1      | 0   | 1          | no `supabase/migrations`       |
-| pranavgawasproject/medi-care    | 0        | 2    | 1      | 2   | 6          | no `supabase/migrations`       |
-| phanindraks2005/medivault       | 0        | 0    | 1      | 0   | 3          | no `supabase/migrations`       |
-| Nico2603/ClinicAI               | 0        | 5    | 17     | 0   | 1          | no `supabase/migrations`       |
+The new Criticals and Highs are the two role escalations and four browser-side AI calls that run 5 had missed,
+plus one the probe found: an audit-log policy that lets any signed-in user write rows in someone else's name.
 
-No wrong finding is left that I know of. Two calls are still debatable: kareeem7's 5 Critical are patient-portal
-functions granted to visitors on purpose and gated by a session token inside, which needs a person to judge, and a
-public doctors directory stays High because the table links to user accounts.
+### Five repos it had never seen
 
-What it missed, found by reading the schemas:
+Fixing a tool on the repos you then measure it on flatters it, so I took five more health repos pushed in the
+week before (an EHR, a prescription vault, a dental dashboard, a lab report service and a CT analysis app). The
+first pass gave 56 findings and 14 of them were wrong, a precision of 75%:
 
-- A user able to change their own `role` when the policy checks ownership through a wrapper function instead of
-  `auth.uid()` directly. The static rule doesn't see it, and the probe would have, but it couldn't load that repo.
-- A browser-side call to an AI API with clinical text. The PHI vendor check reads server code only, so the only
-  signal was the `NEXT_PUBLIC_` key finding.
-- A role change that leads to admin rights is rated High, where Critical would be fairer.
-- An AI chat history table in a health app, whose column names say nothing about health.
+- 12 privileged functions reported as callable by visitors, where one `revoke … from public, anon` covered
+  several functions and the static rule read only part of it. These findings are now checked against the schema
+  the probe loaded: if `anon` has no EXECUTE there, the finding is dropped and listed.
+- 1 Critical "user can make themselves an admin" that came from the probe itself: it seeded user A's role with
+  the enum's first label, which was `admin`. Role columns now start at a plain label.
+- 1 "health data in logs" for a log line that printed only row ids. Ids and counts no longer count.
+
+One probe failed too: the migrations built on a `schema.sql` they never created. It now retries with that file
+first. After the fixes:
+
+| app                | Critical | High | Medium | Low | PHI tables | patches for Critical/High |
+| ------------------ | -------- | ---- | ------ | --- | ---------- | ------------------------- |
+| lab report service | 19       | 0    | 0      | 1   | 0          | 2 of 19                   |
+| EHR                | 0        | 3    | 10     | 3   | 1          | 0 of 3                    |
+| dental dashboard   | 0        | 1    | 3      | 0   | 2          | 1 of 1                    |
+| CT analysis app    | 1        | 0    | 0      | 0   | 0          | 1 of 1                    |
+| prescription vault | 0        | 0    | 0      | 1   | 0          | -                         |
+
+42 findings, none wrong that I know of. Two are debatable: a share-link function granted to visitors on purpose
+(it checks a token inside) is rated Critical, and a delivery history table with no owner column is Low.
+
+Because 3 of those 14 fixes came from this set, it is not a clean held-out measure any more. The next real-repo
+run should use new repos again.
+
+What it still misses:
+
+- Health data the column names don't reveal. The PHI map found nothing in 3 of the 5 new apps: CT predictions,
+  prescription documents kept as files, and a patients table that holds only names, emails and phone numbers.
+  Run 5 had the same gap with an AI chat history table.
+- Patches for tables owned by an organization rather than a user: 17 of the lab service's 19 Criticals have
+  none, because the fix is a membership policy that needs a person to write it.
+- Tables whose CHECK constraints reject the probe's guessed values (6 in the new five) are listed as "not tried".
+- Calls that need a person's judgment: patient-portal or share-link functions that are public on purpose and
+  check a token, and a public doctors directory, which the probe now rates Critical because its rows link to user
+  accounts.
 
 Real gaps in these repos go to their maintainers, through the channel each repo asks for, and not into this
 README.

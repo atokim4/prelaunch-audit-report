@@ -24,6 +24,8 @@ export interface FixContext {
    * sql/, prisma/migrations…), archived folders left out. Read statically when the probe cannot load it.
    */
   schemaSql: SqlFile[];
+  /** What the RLS probe loads, in load order (see probe/sources.ts). */
+  probeSql: SqlFile[];
   /** Path for a new migration; unique per call, ordered after the existing ones. */
   newMigration(slug: string): string;
 }
@@ -198,12 +200,15 @@ const updatePrivilegedColumn: Fixer = async (finding, ctx) => {
   const policy = policyName(finding);
   if (!name || !policy) return undefined;
   const table = qualify(name);
-  const existing = policies(ctx.migrations, table).find((p) => p.name === policy);
-  const columns = tableColumns(ctx.migrations, table);
+  // SQL keeps the name's case: a Prisma table "User" is not public.user.
+  const plain = name.replace(/"/g, "");
+  const rel = plain.includes(".") ? ident(plain) : publicRel(plain);
+  const existing = policies(ctx.probeSql, table).find((p) => p.name === policy);
+  const columns = tableColumns(ctx.probeSql, table);
   if (!existing?.using || !columns) return undefined;
   const editable = columns
-    .filter((c) => !c.primaryKey && !c.referencesAuthUsers && !PRIVILEGED.test(c.name))
-    .filter((c) => !/^(created_at|updated_at|inserted_at)$/.test(c.name))
+    .filter((c) => !c.primaryKey && c.name !== "id" && !c.referencesAuthUsers && !PRIVILEGED.test(c.name))
+    .filter((c) => !/^(created_?at|updated_?at|inserted_?at)$/i.test(c.name))
     .map((c) => c.name);
   const locked = columns.filter((c) => PRIVILEGED.test(c.name)).map((c) => c.name);
   if (!editable.length) return undefined;
@@ -211,13 +216,13 @@ const updatePrivilegedColumn: Fixer = async (finding, ctx) => {
   return {
     edits: [
       migration(ctx, `lock_columns_${slugOf(table)}`, `${finding.id}: users may only edit safe columns of ${table}.`, [
-        `revoke update on ${ident(table)} from anon, authenticated;`,
-        `grant update (${editable.map(ident).join(", ")}) on ${ident(table)} to authenticated;`,
+        `revoke update on ${rel} from anon, authenticated;`,
+        `grant update (${editable.map(ident).join(", ")}) on ${rel} to authenticated;`,
         "",
-        `drop policy if exists ${ident(policy)} on ${ident(table)};`,
+        `drop policy if exists ${ident(policy)} on ${rel};`,
         "",
         `create policy ${ident(policy)}`,
-        `  on ${ident(table)} for update`,
+        `  on ${rel} for update`,
         `  to ${roles}`,
         `  using (${existing.using})`,
         `  with check (${existing.withCheck ?? existing.using});`,
@@ -548,9 +553,46 @@ function scopedPolicy(policy: ProbePolicy, table: string, condition: string): st
  * for a child table, the owner of the parent row). Also the fallback when a static rule's own fixer
  * cannot handle the table (an open policy on a child table has no owner column to compare).
  */
+/**
+ * The probe saw the owner write a paid or role column of their own row: revoke update on the table and
+ * grant it back on every other column, so the locked ones can change only from the server.
+ */
+function lockEscalatedColumns(finding: Finding, ctx: FixContext, proof: Proof): PatchDraft | undefined {
+  const locked = [...new Set(proof.leaks.filter((c) => c.actor === "owner" && c.column).map((c) => c.column ?? ""))];
+  const columns = tableColumns(ctx.probeSql, qualify(proof.table));
+  if (!locked.length || !columns) return undefined;
+  const keep = new Set([...locked, ...proof.ownerColumns]);
+  const editable = columns
+    .map((c) => c.name)
+    .filter((c) => !keep.has(c) && !PRIVILEGED.test(c) && c !== "id")
+    .filter((c) => !/^(created_?at|inserted_?at)$/i.test(c));
+  if (!editable.length) return undefined;
+  const table = publicRel(proof.table);
+  return {
+    edits: [
+      migration(
+        ctx,
+        `lock_columns_${slugOf(proof.table)}`,
+        `${finding.id}: users may not change ${locked.join(", ")} on ${proof.table}.`,
+        [
+          `revoke update on ${table} from anon, authenticated;`,
+          `grant update (${editable.map(identPart).join(", ")}) on ${table} to authenticated;`,
+        ],
+      ),
+    ],
+    summary: `Users can update only ${editable.join(", ")} of ${proof.table}; ${locked.join(", ")} can be changed only by the server (service role) or in the dashboard.`,
+    caveats: [
+      "If admins change roles from the browser today, move that to a server function that checks the caller is an admin and uses the service role.",
+      "If the app updates other columns from the browser, add them to the grant.",
+    ],
+  };
+}
+
 export const probeLeak: Fixer = async (finding, ctx) => {
   const proof = finding.proof;
   if (!proof || proof.kind !== "table") return undefined;
+  if (proof.leaks.length && proof.leaks.every((c) => c.actor === "owner"))
+    return lockEscalatedColumns(finding, ctx, proof);
   const condition = ownerCondition(proof);
   if (!condition) return undefined;
   const weak = weakPolicies(proof);
@@ -689,7 +731,11 @@ const liveStorageLeak: Fixer = async (finding, ctx) => {
  * The API roles cannot read, change or delete it; a guard trigger stops updates and deletes by anyone.
  */
 const phiNoAuditLog: Fixer = async (finding, ctx) => {
-  const tables = [...finding.evidence.matchAll(/`([^`]+)`/g)].map((m) => qualify(m[1] ?? ""));
+  // Names keep their case: a Prisma table "Appointment" is not public.appointment.
+  const tables = [...finding.evidence.matchAll(/`([^`]+)`/g)].map((m) => {
+    const name = (m[1] ?? "").replace(/"/g, "");
+    return name.includes(".") ? name : `public.${name}`;
+  });
   if (!tables.length) return undefined;
   const body = [
     "create table if not exists public.phi_audit_log (",

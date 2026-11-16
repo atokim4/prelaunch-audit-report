@@ -1475,7 +1475,7 @@
     },
     {
       "name": "rls-probe",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "command": "prelaunch-audit rls-probe (PGlite + Supabase shim, rolled-back tries as anon and a second user)",
       "status": "ok",
       "note": "9 tables and views tried as anon and as a second user."

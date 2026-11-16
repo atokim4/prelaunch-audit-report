@@ -1,6 +1,7 @@
-import { contextNote } from "./scanners/static-context.ts";
+import { contextNote, proofTestsClaim } from "./scanners/static-context.ts";
 import {
   SEVERITY_RANK,
+  type AdminGate,
   type Cwe,
   type Effort,
   type LiveBucket,
@@ -17,7 +18,7 @@ import {
 export const RUBRIC: { severity: Severity; rule: string }[] = [
   {
     severity: "critical",
-    rule: "Anyone on the internet, without an account, can read private data, change data, take money-related actions or get a key that does those things.",
+    rule: "Anyone on the internet, without an account, can read private data, change data, take money-related actions or get a key that does those things. Also: any signed-in user can make themselves an admin (on an app with open sign-up, that is anyone).",
   },
   {
     severity: "high",
@@ -436,9 +437,14 @@ const CONTEXT_SEVERITY: Record<string, Severity> = {
 };
 
 export function severityOf(raw: RawFinding, info: RuleInfo): Severity {
+  // The owner can write the column the admin policies trust (markAdminGates only sets it when the probe
+  // did not show that write blocked).
+  if (raw.adminGate) return "critical";
   const base = max(info.severity(raw), liveSeverity(raw.live));
   const proof = raw.proof;
-  if (!proof) {
+  // A proof that did not try what the static rule claims (an escalation of `plan_id`) and saw no leak
+  // leaves the static reading in charge.
+  if (!proof || (!proofTestsClaim(raw) && !proof.leaks.length)) {
     if (raw.phi?.length && readByOthers(raw)) return "critical";
     // Without a probe, the repo's SQL can still show a public content table or a definer function that
     // acts on the caller's own id (see scanners/static-context.ts).
@@ -621,6 +627,7 @@ export function plainRisk(finding: {
   subject?: string;
   proof?: Proof;
   phi?: string[];
+  adminGate?: AdminGate;
 }): string {
   const stripeKey = /STRIPE/i.test(finding.subject ?? "");
   if (stripeKey && finding.rule === "server-secret-in-client") {
@@ -640,6 +647,9 @@ export function plainRisk(finding: {
       : finding.proof?.leaks.some((c) => c.actor === "anon")
         ? "Visitors without an account can read patients' health records."
         : "Any signed-in user can read other patients' health records.";
+  }
+  if (finding.adminGate) {
+    return "Any signed-in user can make themselves an admin and then see or change everyone's data.";
   }
   if (finding.source === "rls-probe") {
     const kind = finding.proof && proofClass(finding.proof);
