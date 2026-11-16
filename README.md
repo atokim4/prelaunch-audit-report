@@ -197,8 +197,11 @@ For apps that store patient data. It reads files only, like the repo checks.
 - **PHI map.** Columns are matched by name: clinical content (`diagnosis`, `medications`, `allergies`,
   `lab_*`, `clinical_*`; `notes` or `reason` only on tables such as `patients` or `appointments`) and identifiers
   (`date_of_birth`, `mrn`, `ssn`, `insurance_*`). A birthday on a plain `profiles` table is not counted. Views get
-  the kinds of the columns they copy. Tables come from the migrations and from the generated types file, so a table
-  made in the dashboard shows up too.
+  the kinds of the columns they copy. Tables named like health records (`medical_records`, `vaccinations`,
+  `lab_reports`) count as a whole when a column ties them to a person, and national ID columns (`tckn`, `aadhaar`,
+  `cpf`, `passport*`) count as identifiers. Tables come from every `.sql` file outside archive folders
+  (`supabase/migrations`, a `schema.sql`, `sql/`, `prisma/migrations`) and from the generated types file, so a
+  table made in the dashboard shows up too. Tables the probe could not load are listed as "not tried".
 - **Who can read it.** The map is joined with the RLS probe. With `--phi`, a PHI table or view that a visitor
   or a second user can read is Critical, where the same leak in a CRM is High. A view that skips RLS stays
   Critical when the probe had no row to disprove it (a view filtered to today's date, for example).
@@ -216,7 +219,8 @@ For apps that store patient data. It reads files only, like the repo checks.
   migration: `phi_audit_log` with the user id from `auth.uid()`, the role, the operation and the row id (no row
   values, so the log holds no PHI), filled by a trigger on every PHI table, revoked from `anon` and
   `authenticated`, and guarded so even the table owner gets SQLSTATE 42501 on update, delete or truncate. The
-  suite loads it in PGlite and proves both.
+  suite loads it in PGlite and proves both. When the app inserts audit rows from its own code instead, the
+  finding drops to Low and names that file: the trail exists, but changes made outside the app are not in it.
 - **Checklist.** The report copies the customer side of
   [Supabase's shared responsibility model](https://supabase.com/docs/guides/deployment/shared-responsibility-model)
   for health data (read 16 November 2026: BAA on the Team plan or above with the HIPAA add-on, High Compliance,
@@ -241,7 +245,8 @@ Next.js server actions outside `app/api`, and whether a vendor already signed a 
 
 The probe also has limits worth knowing: it seeds one row per table with guessed values, so a table whose check
 constraints or triggers reject those values is listed as "not tried"; it tests the two API roles, not
-`service_role`; and functions called over `/rest/v1/rpc/` are checked statically, not called.
+`service_role`; functions called over `/rest/v1/rpc/` are checked statically, not called; and it only loads
+`supabase/migrations`. SQL kept anywhere else is read statically (rules, PHI map), not run.
 
 ## Severity rubric
 
@@ -365,6 +370,51 @@ ones have a verified patch; the `open_tasks` view has none of its own, because t
 
 Regenerate the samples with `npm run sample`, `npm run sample:phi` and `npm run sample:vite` (the second one needs `npm run postgrest`
 once, which downloads PostgREST and checks its SHA-256).
+
+## Run on 7 real clinic codebases
+
+The demo apps above test what I already knew to look for, so on 16 November 2026 I ran `--phi` on seven public
+open-source clinic and health-record repos from GitHub. Static only: clone, scan the code and SQL, read every
+finding by hand. Nothing was sent to their deployments. Each repo was pinned at one commit.
+
+The first run (v0.4.0) gave 61 findings. 12 were wrong: RLS turned on by a `DO` loop of dynamic SQL read as RLS
+off (5), policies in a `supabase/archive` folder that a later migration replaces (3), sample key headers inside a
+committed `node_modules` (2), a Supabase anon key under an unusual env name (1), and a diet plan column read as a
+paid plan (1). The PHI map was empty on all seven, because it only knew tables the probe had loaded from
+`supabase/migrations`, and most of these repos keep their SQL somewhere else.
+
+Each of those now has a fixture test in `test/real-repo-shapes.test.ts`, with a control case that must still be
+reported. The same run also turned up a probe bug (an insert into a table where every column has a default) and
+tables that are public on purpose (CMS sections, clinic schedules) rated High; with the SQL showing no owner and
+no personal column, those are now Low with a "confirm it is meant to be public" line.
+
+After the fixes, on the same commits:
+
+| repo                            | Critical | High | Medium | Low | PHI tables | RLS probe                      |
+| ------------------------------- | -------- | ---- | ------ | --- | ---------- | ------------------------------ |
+| ahmedbahnese/clinic             | 0        | 0    | 4      | 9   | 2          | ran                            |
+| kareeem7/clinic                 | 5        | 9    | 4      | 6   | 4          | no `supabase/migrations`       |
+| goldhoang/clinic-booking        | 0        | 0    | 1      | 0   | 1          | failed (tables made by Prisma) |
+| mustafakbaser/ClinicManager-App | 4        | 0    | 1      | 0   | 1          | no `supabase/migrations`       |
+| pranavgawasproject/medi-care    | 0        | 2    | 1      | 2   | 6          | no `supabase/migrations`       |
+| phanindraks2005/medivault       | 0        | 0    | 1      | 0   | 3          | no `supabase/migrations`       |
+| Nico2603/ClinicAI               | 0        | 5    | 17     | 0   | 1          | no `supabase/migrations`       |
+
+No wrong finding is left that I know of. Two calls are still debatable: kareeem7's 5 Critical are patient-portal
+functions granted to visitors on purpose and gated by a session token inside, which needs a person to judge, and a
+public doctors directory stays High because the table links to user accounts.
+
+What it missed, found by reading the schemas:
+
+- A user able to change their own `role` when the policy checks ownership through a wrapper function instead of
+  `auth.uid()` directly. The static rule doesn't see it, and the probe would have, but it couldn't load that repo.
+- A browser-side call to an AI API with clinical text. The PHI vendor check reads server code only, so the only
+  signal was the `NEXT_PUBLIC_` key finding.
+- A role change that leads to admin rights is rated High, where Critical would be fairer.
+- An AI chat history table in a health app, whose column names say nothing about health.
+
+Real gaps in these repos go to their maintainers, through the channel each repo asks for, and not into this
+README.
 
 ## Development
 

@@ -3,12 +3,13 @@ import { basename, join, resolve } from "node:path";
 import { isGitRepo, listFiles } from "./files.ts";
 import { countBySeverity, normalize } from "./normalize.ts";
 import { leaks, probeRls, type ProbeResult } from "./probe/rls-probe.ts";
-import { attachPatches, fixContext, patchedMigrations } from "./patches/index.ts";
+import { ARCHIVED_SQL, attachPatches, fixContext, patchedMigrations } from "./patches/index.ts";
 import { runLaunchAudit } from "./scanners/launch-audit.ts";
 import { mergeLive, runLiveProbe, type LiveOptions } from "./scanners/live-probe.ts";
 import { runNpmAudit } from "./scanners/npm-audit.ts";
 import { markPhi, runPhiScan } from "./scanners/phi.ts";
-import { runPreflight } from "./scanners/preflight.ts";
+import { filterPreflight, runPreflight } from "./scanners/preflight.ts";
+import { addStaticContext, dynamicRlsTables } from "./scanners/static-context.ts";
 import { mergeProbe, runRlsProbe, toProof } from "./scanners/rls-probe.ts";
 import { runSecretScan } from "./scanners/secrets.ts";
 import { detectShape, edgeConfigFindings } from "./shape.ts";
@@ -82,6 +83,23 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
     runRlsProbe(ctx.migrations),
     options.npmAudit === false ? undefined : runNpmAudit(repo),
   ]);
+  const kept = await filterPreflight(preflight.findings, ctx.read, ARCHIVED_SQL);
+  preflight.findings = kept.findings;
+  if (kept.archived.length) {
+    notChecked.push(
+      `SQL in archive folders (${kept.archived.join(", ")}): treated as old copies that no longer run. If any of them still runs, it needs a review.`,
+    );
+  }
+  const dynamicRls = dynamicRlsTables(ctx.schemaSql);
+  const covered = preflight.findings.filter(
+    (f) => f.rule === "rls-disabled" && dynamicRls.has((f.subject ?? "").toLowerCase()),
+  );
+  if (covered.length) {
+    preflight.findings = preflight.findings.filter((f) => !covered.includes(f));
+    notChecked.push(
+      `Row Level Security turned on by a loop of dynamic SQL (${covered.map((f) => `\`${f.subject ?? ""}\``).join(", ")}): not reported as off, and the policies that loop creates were not read.`,
+    );
+  }
   for (const result of [preflight, secrets, ...(deps ? [deps] : [])]) {
     raws.push(...result.findings);
     tools.push(result.tool);
@@ -117,6 +135,8 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
     phi = scan.result;
     notChecked.push(...PHI_NOT_CHECKED);
   }
+
+  addStaticContext(raws, ctx.schemaSql);
 
   if (options.url) {
     const live = await runLaunchAudit({

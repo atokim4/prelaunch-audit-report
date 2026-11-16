@@ -1,3 +1,4 @@
+import { contextNote } from "./scanners/static-context.ts";
 import {
   SEVERITY_RANK,
   type Cwe,
@@ -338,7 +339,8 @@ const PHI: Record<string, RuleInfo> = {
   },
   "phi-no-audit-log": {
     title: "No audit trail for changes to health records",
-    severity: fixed("medium"),
+    // Low when the app logs from its own code: the trail exists but has gaps.
+    severity: (raw) => (raw.toolSeverity === "app-level" ? "low" : "medium"),
     cwe: CWE.insufficientLogging,
     whyItMatters:
       "The HIPAA Security Rule asks for audit controls: a record of who created, changed or deleted health data and when. Nothing in the migrations writes one, so after a mistake or a breach there is no way to tell who did what.",
@@ -421,12 +423,30 @@ export function liveSeverity(live: LiveTable | LiveBucket | undefined): Severity
 /**
  * Final severity of a raw finding. The probe can raise it (a "warning" policy that really lets visitors
  * read user rows is Critical) and lower one case: an open read policy on a table with no owner column and
- * no write leak is a public reference table, which is Low (confirm it is meant to be public).
+ * no write leak is a public reference table, which is Low (confirm it is meant to be public). With no
+ * probe, the same table read from the SQL is Low, and a definer function open to visitors through the
+ * default grant that reads auth.uid() is Medium.
  */
+/** Severity when the repo's SQL shows the static rule's worst reading does not apply (see contextNote). */
+const CONTEXT_SEVERITY: Record<string, Severity> = {
+  "rls-permissive-policy": "low",
+  "rls-update-privileged-column": "low",
+  "storage-public-bucket": "medium",
+  "definer-function-anon": "medium",
+};
+
 export function severityOf(raw: RawFinding, info: RuleInfo): Severity {
   const base = max(info.severity(raw), liveSeverity(raw.live));
   const proof = raw.proof;
-  if (!proof) return raw.phi?.length && readByOthers(raw) ? "critical" : base;
+  if (!proof) {
+    if (raw.phi?.length && readByOthers(raw)) return "critical";
+    // Without a probe, the repo's SQL can still show a public content table or a definer function that
+    // acts on the caller's own id (see scanners/static-context.ts).
+    const lowered = contextNote(raw) ? CONTEXT_SEVERITY[raw.rule] : undefined;
+    // Context only ever lowers: a Low public bucket stays Low.
+    if (lowered && SEVERITY_RANK[lowered] < SEVERITY_RANK[base]) return lowered;
+    return base;
+  }
   const sharedRead =
     raw.rule === "rls-permissive-policy" &&
     /\(select\)/.test(raw.message) &&

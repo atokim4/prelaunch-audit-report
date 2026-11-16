@@ -298,6 +298,8 @@ async function rowFor(
 }
 
 function insertSql(info: TableInfo, row: { columns: string[]; casts: string[] }): string {
+  // Every column has a default (a settings table keyed by 'default'): there is nothing to list.
+  if (!row.columns.length) return `insert into ${rel(info.name)} default values`;
   const placeholders = row.casts.map((cast, i) => `$${i + 1}::${cast}`);
   return `insert into ${rel(info.name)} (${row.columns.join(", ")}) values (${placeholders.join(", ")})`;
 }

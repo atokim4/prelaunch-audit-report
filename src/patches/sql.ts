@@ -95,25 +95,63 @@ export interface Column {
   primaryKey: boolean;
 }
 
+const CREATE_TABLE = new RegExp(String.raw`^create\s+table\s+(?:if\s+not\s+exists\s+)?${NAME}\s*\(`, "i");
+
+function columnsOf(stmt: string, match: RegExpMatchArray): Column[] | undefined {
+  const body = balanced(stmt, match[0].length - 1);
+  if (body === undefined) return undefined;
+  return splitTopLevel(body)
+    .filter((def) => !/^(constraint|primary\s+key|unique|check|foreign\s+key|exclude)\b/i.test(def))
+    .map((def) => ({
+      name: (def.split(/\s+/)[0] ?? "").replace(/"/g, ""),
+      definition: def,
+      referencesAuthUsers: /references\s+auth\.users\b/i.test(def),
+      primaryKey: /primary\s+key/i.test(def),
+    }));
+}
+
 export function tableColumns(files: SqlFile[], table: string): Column[] | undefined {
-  const head = new RegExp(String.raw`^create\s+table\s+(?:if\s+not\s+exists\s+)?${NAME}\s*\(`, "i");
   for (const file of files) {
     for (const stmt of statements(file.text)) {
-      const match = stmt.match(head);
+      const match = stmt.match(CREATE_TABLE);
       if (!match?.[1] || qualify(match[1]) !== table) continue;
-      const body = balanced(stmt, match[0].length - 1);
-      if (body === undefined) return undefined;
-      return splitTopLevel(body)
-        .filter((def) => !/^(constraint|primary\s+key|unique|check|foreign\s+key|exclude)\b/i.test(def))
-        .map((def) => ({
-          name: (def.split(/\s+/)[0] ?? "").replace(/"/g, ""),
-          definition: def,
-          referencesAuthUsers: /references\s+auth\.users\b/i.test(def),
-          primaryKey: /primary\s+key/i.test(def),
-        }));
+      return columnsOf(stmt, match);
     }
   }
   return undefined;
+}
+
+/** Every `create table` in the public schema, as `public.<name>` with its columns; later files win. */
+export function createdTables(files: SqlFile[]): Map<string, Column[]> {
+  const out = new Map<string, Column[]>();
+  for (const file of [...files].sort((a, b) => a.path.localeCompare(b.path))) {
+    for (const stmt of statements(file.text)) {
+      const match = stmt.match(CREATE_TABLE);
+      if (!match?.[1]) continue;
+      const table = qualify(match[1]);
+      const columns = columnsOf(stmt, match);
+      if (table.startsWith("public.") && columns?.length) out.set(table, columns);
+    }
+  }
+  return out;
+}
+
+/** Body of the newest `create function <name>` (the text between its dollar quotes), or undefined. */
+export function functionBody(files: SqlFile[], fn: string): string | undefined {
+  const head = new RegExp(String.raw`^create\s+(?:or\s+replace\s+)?function\s+${NAME}\s*\(`, "i");
+  let found: string | undefined;
+  for (const file of [...files].sort((a, b) => a.path.localeCompare(b.path))) {
+    for (const stmt of statements(file.text)) {
+      const match = stmt.match(head);
+      if (!match?.[1] || qualify(match[1]) !== fn) continue;
+      const tag = stmt.slice(match[0].length).match(/\$[A-Za-z_]*\$/)?.[0];
+      if (!tag) continue;
+      const start = stmt.indexOf(tag, match[0].length) + tag.length;
+      const end = stmt.indexOf(tag, start);
+      if (end > start) found = stmt.slice(start, end);
+    }
+  }
+  return found;
 }
 
 export interface Policy {

@@ -7,6 +7,9 @@ import type { SqlFile } from "./sql.ts";
 
 const MIGRATIONS_DIR = "supabase/migrations";
 
+/** Folders of SQL that no longer runs: old schema copies kept for reference. */
+export const ARCHIVED_SQL = /(?:^|\/)(?:archives?|archived|deprecated|old|backups?|legacy|unused)\//i;
+
 function stamp(date: Date): string {
   return date.toISOString().replace(/[-:T]/g, "").slice(0, 14);
 }
@@ -21,6 +24,10 @@ export async function fixContext(repo: string, files: string[], now: Date): Prom
   const migrationFiles = files.filter((f) => f.startsWith(`${MIGRATIONS_DIR}/`) && f.endsWith(".sql"));
   const migrations = [];
   for (const path of migrationFiles) migrations.push({ path, text: (await read(path)) ?? "" });
+  const schemaSql = [];
+  for (const path of files.filter((f) => f.endsWith(".sql") && !ARCHIVED_SQL.test(f))) {
+    schemaSql.push({ path, text: (await read(path)) ?? "" });
+  }
 
   const newest = migrationFiles
     .map((f) => f.slice(MIGRATIONS_DIR.length + 1).match(/^(\d{14})_/)?.[1])
@@ -35,6 +42,7 @@ export async function fixContext(repo: string, files: string[], now: Date): Prom
     read,
     files,
     migrations,
+    schemaSql,
     newMigration(slug) {
       const name = `${MIGRATIONS_DIR}/${stamp(new Date(next))}_${slug}.sql`;
       next += 1000;

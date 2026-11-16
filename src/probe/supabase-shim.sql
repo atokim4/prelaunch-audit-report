@@ -53,8 +53,13 @@ create table storage.buckets (
   id text primary key,
   name text not null unique,
   owner uuid,
+  owner_id text,
   public boolean not null default false,
-  created_at timestamptz not null default now()
+  file_size_limit bigint,
+  allowed_mime_types text[],
+  avif_autodetection boolean default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz default now()
 );
 
 create table storage.objects (
@@ -62,8 +67,14 @@ create table storage.objects (
   bucket_id text references storage.buckets (id),
   name text,
   owner uuid,
+  owner_id text,
   metadata jsonb,
-  created_at timestamptz not null default now()
+  user_metadata jsonb,
+  path_tokens text[] generated always as (string_to_array(name, '/')) stored,
+  version text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz default now(),
+  last_accessed_at timestamptz default now()
 );
 
 alter table storage.buckets enable row level security;

@@ -516,7 +516,7 @@ ul.plain{padding-left:4mm}
     <div class="body">
       <h3>Public storage bucket</h3>
       <p class="where"><code>supabase/migrations/20261116080400_storage.sql:10</code></p>
-      <p class="evidence">Storage bucket <code>clinic-logos</code> is public: anyone with a file&#39;s URL can download it.</p>
+      <p class="evidence">Storage bucket <code>clinic-logos</code> is public: anyone with a file&#39;s URL can download it. The bucket&#39;s name says it holds site content (logos, CMS images). Confirm nothing uploaded by users or patients ever lands in it.</p>
       <pre class="snippet"><code>  10 | insert into storage.buckets (id, name, public)
   11 | values (&#39;clinic-logos&#39;, &#39;clinic-logos&#39;, true);</code></pre>
       

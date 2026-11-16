@@ -44,6 +44,22 @@ export interface RawFinding {
   live?: LiveTable | LiveBucket;
   /** With --phi: the health-data columns of the table or the code this finding is about. */
   phi?: string[];
+  /** What the repo's SQL says about the object, for findings the probe has no proof for. */
+  context?: StaticContext;
+}
+
+/** Read from the create table / create function statements, never from running anything. */
+export interface StaticContext {
+  /** The table has a column that ties rows to a user (references auth.users, user_id, owner_id…). */
+  tableOwned?: boolean;
+  /** The table has columns the PHI map or the identifier list would call personal (email, phone, dob…). */
+  tablePersonal?: boolean;
+  /** The function reads the caller's identity (auth.uid() or auth.jwt()) in its body. */
+  checksCaller?: boolean;
+  /** The user-editable plan column points to a plan table with no pricing column. */
+  carePlan?: boolean;
+  /** The public bucket's name says it holds site content. */
+  publicContentBucket?: boolean;
 }
 
 export type Actor = "anon" | "other-user" | "owner";
@@ -193,8 +209,11 @@ export interface PhiTable {
   foundIn: ("migrations" | "types")[];
   /** Who could read user A's rows in the local RLS probe; undefined when the probe could not tell. */
   readBy?: ("anon" | "other-user")[];
-  /** Why there is no readBy: not in the migrations, or user A had no row to read (a view's filter). */
-  untested?: "not in migrations" | "no rows to test";
+  /**
+   * Why there is no readBy: not in the migrations, in repo SQL the probe could not load (another folder,
+   * or a migration that failed in PGlite), or user A had no row to read (a view's filter).
+   */
+  untested?: "not in migrations" | "not probed" | "no rows to test";
   /** A trigger in the migrations writes changes of this table to an audit table. */
   audited: boolean;
 }

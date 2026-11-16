@@ -19,6 +19,11 @@ export interface FixContext {
   /** Every source file path in the repo (relative, forward slashes). */
   files: string[];
   migrations: SqlFile[];
+  /**
+   * Every SQL file that may describe the schema, wherever it lives (supabase/migrations, a schema.sql,
+   * sql/, prisma/migrations…), archived folders left out. Read statically when the probe cannot load it.
+   */
+  schemaSql: SqlFile[];
   /** Path for a new migration; unique per call, ordered after the existing ones. */
   newMigration(slug: string): string;
 }

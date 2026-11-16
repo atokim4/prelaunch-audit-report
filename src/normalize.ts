@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ruleInfo, severityOf } from "./rubric.ts";
+import { contextNote } from "./scanners/static-context.ts";
 import { SEVERITIES, SEVERITY_RANK, type Finding, type RawFinding, type Severity } from "./types.ts";
 
 /** When two rules flag the same object with the same severity, the more specific one names the finding. */
@@ -15,6 +16,9 @@ const SPECIFICITY = [
 function dedupeKey(raw: RawFinding): string {
   const where = raw.location.kind === "file" ? raw.location.file : raw.location.url;
   if (raw.source === "launch-audit") return `${where}|${raw.rule}`;
+  // The same policy created again in a later migration is one finding, not one per file.
+  const policy = where.endsWith(".sql") ? raw.message.match(/^Policy "([^"]+)"/)?.[1] : undefined;
+  if (policy && raw.subject) return `policy|${raw.rule}|${raw.subject.toLowerCase()}|${policy}`;
   if (raw.subject) return `${where}|${raw.subject}`;
   return raw.location.kind === "file" ? `${where}:${raw.location.line}|${raw.rule}` : `${where}|${raw.rule}`;
 }
@@ -104,7 +108,7 @@ export async function normalize(repo: string, raws: RawFinding[]): Promise<{ fin
       title: info.title,
       cwe: info.cwe,
       location: lead.raw.location,
-      evidence: evidenceOf(lead.raw),
+      evidence: [evidenceOf(lead.raw), contextNote(lead.raw)].filter(Boolean).join(" "),
       snippet: await snippetFor(repo, lead.raw, cache),
       whyItMatters: info.whyItMatters,
       fix: info.fix,

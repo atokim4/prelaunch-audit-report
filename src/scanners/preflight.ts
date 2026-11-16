@@ -70,3 +70,47 @@ export async function runPreflight(repo: string): Promise<{ findings: RawFinding
   }
   return { findings: parsePreflight(result.stdout), tool };
 }
+
+/** A Supabase project key name that is not the secret one: SUPABASE_KEY, SUPABASE_API_KEY, SUPABASE_ANON_KEY… */
+const SUPABASE_CLIENT_KEY = /SUPABASE\w*KEY/i;
+const SERVER_KEY_WORD = /SERVICE|SECRET|ADMIN|ROLE|PRIVATE/i;
+
+export interface PreflightFilter {
+  findings: RawFinding[];
+  /** Files under an archive-like folder whose findings were dropped. */
+  archived: string[];
+}
+
+/**
+ * Drops two kinds of vibe-preflight findings that real repos showed to be noise:
+ * - findings in SQL under archive/old/backup folders, which are kept for reference and no longer run;
+ * - a browser env var named like a Supabase key (VITE_SUPABASE_API_KEY) read in a file that passes it to
+ *   `createClient`: the browser client only works with the anon or publishable key.
+ */
+export async function filterPreflight(
+  raws: RawFinding[],
+  read: (path: string) => Promise<string | undefined>,
+  archivedSql: RegExp,
+): Promise<PreflightFilter> {
+  const findings: RawFinding[] = [];
+  const archived = new Set<string>();
+  for (const raw of raws) {
+    const file = raw.location.kind === "file" ? raw.location.file : undefined;
+    if (file?.endsWith(".sql") && archivedSql.test(file)) {
+      archived.add(file);
+      continue;
+    }
+    const name = raw.subject ?? "";
+    if (
+      raw.rule === "public-env-secret" &&
+      file &&
+      SUPABASE_CLIENT_KEY.test(name) &&
+      !SERVER_KEY_WORD.test(name) &&
+      /\bcreateClient\s*\(/.test((await read(file)) ?? "")
+    ) {
+      continue;
+    }
+    findings.push(raw);
+  }
+  return { findings, archived: [...archived].sort() };
+}

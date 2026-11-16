@@ -1,6 +1,6 @@
 import { parseGeneratedTypes, TYPES_FILES } from "../live/targets.ts";
 import type { FixContext } from "../patches/fixers.ts";
-import { balanced, statements, type SqlFile } from "../patches/sql.ts";
+import { balanced, createdTables, statements, type SqlFile } from "../patches/sql.ts";
 import { phiColumns, searchable } from "../phi/columns.ts";
 import type { TableProbe } from "../probe/rls-probe.ts";
 import type {
@@ -108,6 +108,14 @@ async function phiTables(ctx: FixContext, probed: TableProbe[]): Promise<{ table
   for (const t of probed) {
     byName.set(t.name, { relation: t.kind, columns: t.columns, foundIn: new Set(["migrations"]) });
   }
+  // Tables the probe did not load (SQL outside supabase/migrations, or a migration PGlite rejected) are
+  // still mapped from their create table statements.
+  for (const [table, columns] of createdTables(ctx.schemaSql)) {
+    const name = bare(table);
+    if (!byName.has(name)) {
+      byName.set(name, { relation: "table", columns: columns.map((c) => c.name), foundIn: new Set(["migrations"]) });
+    }
+  }
   let typesFile: string | undefined;
   for (const path of TYPES_FILES) {
     const text = await ctx.read(path);
@@ -161,7 +169,7 @@ function phiTable(
   const probe = probed.find((p) => p.name === name);
   const reads = probe?.checks.filter((c) => c.action === "select" && c.actor !== "owner") ?? [];
   let access: Pick<PhiTable, "readBy" | "untested">;
-  if (!probe || probe.skipped) access = { untested: "not in migrations" };
+  if (!probe || probe.skipped) access = { untested: foundIn.has("migrations") ? "not probed" : "not in migrations" };
   else if (reads.some((c) => c.rows > 0)) {
     access = { readBy: [...new Set(reads.filter((c) => c.rows > 0).map((c) => c.actor as "anon" | "other-user"))] };
   } else if (reads.length && reads.every((c) => c.of > 0)) access = { readBy: [] };
@@ -428,7 +436,14 @@ function bucketFindings(
   return out;
 }
 
-function auditFinding(tables: PhiTable[], migrations: SqlFile[]): RawFinding | undefined {
+/** A source file that inserts rows into an audit table itself (`.from("audit_logs").insert(…)`). */
+const APP_AUDIT_WRITE = /\.from\(\s*["'`]\w*audit\w*["'`]\s*\)[\s\S]{0,200}?\.insert\(/;
+
+export function appAuditWriter(texts: Map<string, string>): string | undefined {
+  return [...texts].find(([, text]) => APP_AUDIT_WRITE.test(text))?.[0];
+}
+
+function auditFinding(tables: PhiTable[], migrations: SqlFile[], appWriter?: string): RawFinding | undefined {
   const missing = tables.filter((t) => t.relation === "table" && t.foundIn.includes("migrations") && !t.audited);
   const first = missing[0];
   if (!first) return undefined;
@@ -440,8 +455,10 @@ function auditFinding(tables: PhiTable[], migrations: SqlFile[]): RawFinding | u
   return {
     source: "phi-scan",
     rule: "phi-no-audit-log",
-    toolSeverity: "missing",
-    message: `No audit trail of changes to the tables with health data: ${list(missing.map((t) => t.table))}.`,
+    toolSeverity: appWriter ? "app-level" : "missing",
+    message: appWriter
+      ? `No audit trigger on the tables with health data: ${list(missing.map((t) => t.table))}. The app writes audit rows from its own code (${appWriter}), so changes made any other way (the dashboard, a direct API call with a user's token, a script) leave no record.`
+      : `No audit trail of changes to the tables with health data: ${list(missing.map((t) => t.table))}.`,
     location: file
       ? at(file.path, lineAt(file.text, file.text.search(created)))
       : at(migrations[0]?.path ?? "supabase/migrations", 1),
@@ -544,7 +561,7 @@ function hipaaControls(findings: RawFinding[], tables: PhiTable[]): HipaaControl
 /** The PHI pass. `probed` is what the RLS probe loaded from the migrations (empty when it did not run). */
 export async function runPhiScan(ctx: FixContext, probed: TableProbe[]): Promise<PhiScan> {
   const { tables, typesFile } = await phiTables(ctx, probed);
-  const audited = auditedTables(ctx.migrations);
+  const audited = auditedTables(ctx.schemaSql);
   for (const t of tables) t.audited = audited.has(bare(t.table));
 
   const texts = new Map<string, string>();
@@ -561,10 +578,10 @@ export async function runPhiScan(ctx: FixContext, probed: TableProbe[]): Promise
     ...trackerRaws,
     ...vendorFindings(uses),
     ...logFindings(uses),
-    ...bucketFindings(bucketsOf(ctx.migrations, await ctx.read("supabase/config.toml")), ctx, texts, tables),
+    ...bucketFindings(bucketsOf(ctx.schemaSql, await ctx.read("supabase/config.toml")), ctx, texts, tables),
     ...(await unmanagedFindings(tables, ctx, typesFile)),
   ];
-  const audit = auditFinding(tables, ctx.migrations);
+  const audit = auditFinding(tables, ctx.schemaSql, appAuditWriter(texts));
   if (audit) findings.push(audit);
 
   return {
@@ -582,9 +599,10 @@ export async function runPhiScan(ctx: FixContext, probed: TableProbe[]): Promise
 
 /** Marks findings about PHI tables so the rubric can rate a read of health data as Critical. */
 export function markPhi(raws: RawFinding[], tables: PhiTable[]): void {
-  const byTable = new Map(tables.map((t) => [t.table, t.columns.map((c) => c.name)]));
+  // Quoted Prisma names ("Appointment") come back lower-cased from the SQL reader and as written from the scanners.
+  const byTable = new Map(tables.map((t) => [t.table.toLowerCase(), t.columns.map((c) => c.name)]));
   for (const raw of raws) {
-    const columns = raw.subject ? byTable.get(raw.subject) : undefined;
+    const columns = raw.subject ? byTable.get(raw.subject.toLowerCase()) : undefined;
     if (columns && !raw.phi) raw.phi = columns;
   }
 }

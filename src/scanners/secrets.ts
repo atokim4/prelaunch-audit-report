@@ -113,8 +113,12 @@ export function findSecrets(text: string): SecretHit[] {
   return hits;
 }
 
+/**
+ * Lock files, binaries, and installed dependencies: a node_modules folder committed by mistake carries
+ * sample keys from package READMEs and test vectors that are not the app's secrets.
+ */
 const SKIP_FILES =
-  /(?:^|\/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$|\.(?:png|jpe?g|gif|webp|ico|pdf|zip|woff2?|ttf|mp4)$/i;
+  /(?:^|\/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$|\.(?:png|jpe?g|gif|webp|ico|pdf|zip|woff2?|ttf|mp4)$|(?:^|\/)(?:node_modules|bower_components|\.yarn\/cache)\//i;
 const MAX_BYTES = 1024 * 1024;
 
 async function scanTree(repo: string, git: boolean): Promise<{ findings: RawFinding[]; values: Set<string> }> {

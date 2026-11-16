@@ -488,7 +488,7 @@
         "file": "supabase/migrations/20261116080400_storage.sql",
         "line": 10
       },
-      "evidence": "Storage bucket `clinic-logos` is public: anyone with a file's URL can download it.",
+      "evidence": "Storage bucket `clinic-logos` is public: anyone with a file's URL can download it. The bucket's name says it holds site content (logos, CMS images). Confirm nothing uploaded by users or patients ever lands in it.",
       "snippet": "  10 | insert into storage.buckets (id, name, public)\n  11 | values ('clinic-logos', 'clinic-logos', true);",
       "whyItMatters": "Files in a public bucket open for anyone with the link. When a select policy on storage.objects also lets anyone list the bucket, the links are no secret either: anyone can download every file.",
       "fix": "Make the bucket private, drop the open select policy, and hand out short-lived signed URLs from the server after checking who is asking.",
