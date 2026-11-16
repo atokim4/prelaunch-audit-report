@@ -5,6 +5,8 @@ import { PHI_RUBRIC, plainRisk, repoRuleTable, RUBRIC } from "../rubric.ts";
 import {
   SEVERITIES,
   type Action,
+  type AccessCheck,
+  type AccessVerdict,
   type Actor,
   type AuditResult,
   type Effort,
@@ -120,11 +122,38 @@ const TENANT_LABEL: Record<Actor, string> = {
   "non-member": "Signed in, no org",
 };
 
+const WHO_LABEL: Record<AccessCheck["who"], string> = { owner: "user A", "org-admin": "user B in org B" };
+
+/** The positive checks in words: "user A read 1/1 of their own rows, update ok". */
+function accessText(access: AccessCheck[], tenant: boolean): string {
+  return access
+    .map((a) => {
+      const who = a.who === "owner" && tenant ? "the plain member of org A" : WHO_LABEL[a.who];
+      const whose = a.who === "org-admin" ? "org B's rows" : tenant ? "org A's rows" : "their own rows";
+      if (a.inconclusive) return `${who} ${a.action === "select" ? "reading" : "updating"} ${whose}: ?`;
+      if (a.action === "select") return `${who} read ${a.rows}/${a.of} of ${whose}`;
+      return `${who} ${a.rows ? "could update" : "could not update"} ${whose}`;
+    })
+    .join("; ");
+}
+
+const VERDICT_WORDS: Record<AccessVerdict, string> = {
+  leak: "leaks",
+  protected: "protected (positive check passed)",
+  locked: "owner can't read it either",
+  shared: "shared data",
+  untested: "not proven",
+};
+
 /** The probe's tries on one table, as a small grid: actors down, actions across. */
 function proofHtml(proof: Proof): string {
   const leaked = new Set(proof.leaks);
   const tenant = proof.tenant;
-  const labels = tenant ? TENANT_LABEL : ACTOR_LABEL;
+  const labels = !tenant
+    ? ACTOR_LABEL
+    : tenant.members.globalAdmin
+      ? { ...TENANT_LABEL, "other-user": "Member of org B" }
+      : TENANT_LABEL;
   const actors: Actor[] = tenant ? ["anon", "other-user", "non-member"] : ["anon", "other-user"];
   const rows = actors
     .map((actor) => {
@@ -148,13 +177,30 @@ function proofHtml(proof: Proof): string {
       return `${what}: ${c.inconclusive ? "?" : c.rows ? '<b class="pc-leak-text">got through</b>' : "refused"}`;
     });
   const after = proof.afterPatches;
+  const lockedOut = proof.lockedOut?.length
+    ? `<p class="probe-after"><b class="pc-leak-text">The patches lock the legitimate user out</b>: ${esc(accessText(proof.lockedOut, Boolean(tenant)))}. Do not apply them as written.</p>`
+    : "";
+  const offApi = proof.offApi
+    ? `<p class="probe-after">The patch takes ${proof.kind === "view" ? "this view" : "this table"} off the public API on purpose, so after it nobody reads it through <code>/rest/v1/</code>, user A included.</p>`
+    : "";
+  const writesLost = proof.writesLost?.length
+    ? `<p class="probe-after">After the patches ${proof.tenant ? "the plain member" : "user A"} can no longer update ${proof.tenant ? "org A's rows" : "their own rows"} here from the browser; that write has to go through the server${proof.tenant ? " or an admin" : ""}.</p>`
+    : "";
+  const stillIn = proof.afterAccess?.some((a) => a.action === "select" && a.rows > 0)
+    ? ` and ${esc(
+        accessText(
+          proof.afterAccess.filter((a) => a.action === "select"),
+          Boolean(tenant),
+        ),
+      )}`
+    : "";
   const verdict =
     after === undefined
       ? ""
       : proof.leaks.length === 0
-        ? ""
+        ? lockedOut
         : after.length === 0
-          ? `<p class="probe-after">Same harness with the report's patches applied: <b>0 leaks</b>.</p>`
+          ? `<p class="probe-after">Same harness with the report's patches applied: <b>0 leaks</b>${stillIn}.</p>${lockedOut}${offApi}${writesLost}`
           : `<p class="probe-after">Same harness with the report's patches applied: <b>${after.length} still open</b> (${after.map((c) => `${labels[c.actor].toLowerCase()} ${c.scenario === "self-join" ? "joins org A" : c.column ? `changes ${c.column}` : ACTION_LABEL[c.action]}`).join(", ")}).</p>`;
   return `<section class="probe">
     <h4>Tested in Postgres</h4>
@@ -162,8 +208,19 @@ function proofHtml(proof: Proof): string {
     <table class="probe-grid"><thead><tr><th></th>${ACTIONS.map((a) => `<th>${tenant && a === "insert" ? "insert into org A" : ACTION_LABEL[a]}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table>
     ${escalations.length ? `<p class="probe-what">${tenant ? "Plain member editing role or billing columns" : "Owner editing paid columns on their own row"}: ${escalations.join(", ")}.</p>` : ""}
     ${membership.length ? `<p class="probe-what">Membership: ${membership.join("; ")}.</p>` : ""}
+    ${proof.access.length ? `<p class="probe-what">Positive check: ${esc(accessText(proof.access, Boolean(tenant)))}.${proof.verdict === "leak" ? "" : ` Verdict: <b>${VERDICT_WORDS[proof.verdict]}</b>.`}</p>` : ""}
     ${verdict}
   </section>`;
+}
+
+/** The positive read: green when user A (or the plain member) reads their own rows, grey when locked. */
+function ownReadCell(p: Proof): string {
+  const read = p.access.find((a) => a.who === "owner" && a.action === "select");
+  if (!read || p.verdict === "shared") return `<td class="pc pc-na">–</td>`;
+  if (read.inconclusive || read.of === 0)
+    return `<td class="pc pc-unknown" title="${esc(read.inconclusive ?? "no rows to try")}">?</td>`;
+  if (read.rows === 0) return `<td class="pc pc-unknown" title="${esc(read.refused ?? "0 rows")}">locked</td>`;
+  return `<td class="pc pc-ok">${read.rows}/${read.of}</td>`;
 }
 
 /** Every table the probe tried, one line each: the access matrix for the summary. */
@@ -187,12 +244,17 @@ function matrixHtml(matrix: Proof[]): string {
       };
       const own = p.leaks.filter((c) => c.actor === "owner").map((c) => c.column ?? "");
       const ownText = own.length > 1 ? `${own[0]} +${own.length - 1}` : (own[0] ?? "");
-      return `<tr><td><code>${esc(p.table.replace(/^public\./, ""))}</code>${p.kind === "view" ? ' <span class="kind">view</span>' : ""}</td>${readCell("anon")}${writeCell("anon")}${readCell("other-user")}${writeCell("other-user")}${tenancy ? readCell("non-member") : ""}<td class="pc ${own.length ? "pc-leak" : "pc-ok"}">${own.length ? esc(ownText) : "none"}</td></tr>`;
+      return `<tr><td><code>${esc(p.table.replace(/^public\./, ""))}</code>${p.kind === "view" ? ' <span class="kind">view</span>' : ""}</td>${readCell("anon")}${writeCell("anon")}${readCell("other-user")}${writeCell("other-user")}${tenancy ? readCell("non-member") : ""}<td class="pc ${own.length ? "pc-leak" : "pc-ok"}">${own.length ? esc(ownText) : "none"}</td>${ownReadCell(p)}</tr>`;
     })
     .join("");
+  const tally = (["protected", "locked", "untested"] as const)
+    .map((v) => [v, matrix.filter((p) => p.verdict === v).length] as const)
+    .filter(([, n]) => n > 0)
+    .map(([v, n]) => `${n} ${VERDICT_WORDS[v]}`);
+  const verdictLine = `<p class="probe-what">A table counts as protected only when nobody else got through <em>and</em> user A could still read their own rows in the same harness. When user A cannot read their own rows either, the table is marked "owner can't read it either": no leak, but no proof the policies work for the people they are for. The table may be used only from the server, access may go through a role the probe did not hold (staff, doctor), or a policy is too tight.${tally.length ? ` In this run: ${tally.join(", ")}.` : ""}</p>`;
   return `<h4>Who can reach user A's rows</h4>
     <p class="probe-what">The RLS probe ran your migrations in a local Postgres, gave user A one row per table and tried every action as a visitor without an account and as a second user. Red cells got through: "1/1" means one of user A's one rows. "Self-upgrade" is user A changing a plan or billing column on their own row. A table with no owner column of its own belongs to the owner of the row its foreign key points at; shared tables with no owner at all (price lists) count only writes. "?" is a try that failed for another reason and proves nothing.</p>
-    <table class="matrix"><thead><tr><th>Table</th><th>Visitor read</th><th>Visitor write</th><th>User B read</th><th>User B write</th>${tenancy ? "<th>No-org read</th>" : ""}<th>Self-upgrade</th></tr></thead><tbody>${rows}</tbody></table>${
+    <table class="matrix"><thead><tr><th>Table</th><th>Visitor read</th><th>Visitor write</th><th>User B read</th><th>User B write</th>${tenancy ? "<th>No-org read</th>" : ""}<th>Self-upgrade</th><th>A reads own</th></tr></thead><tbody>${rows}</tbody></table>${verdictLine}${
       tenancy
         ? `<p class="probe-what">The schema has an organization model (<code>${esc(tenancy.tenant)}</code>, members in <code>${esc(tenancy.members.table)}</code>). For the tables that belong to an organization, "user A's rows" means organization A's rows: user A is a plain member of organization A, user B is an admin of organization B, and "No-org read" is a signed-in user who belongs to no organization. On those tables "Self-upgrade" also covers a plain member changing their own role and moving their membership to another organization.</p>`
         : ""
@@ -322,6 +384,8 @@ function phiHtml(phi: PhiResult): string {
   const readCell = (t: PhiResult["tables"][number]): string => {
     if (!t.readBy)
       return `<td class="pc pc-unknown">${t.untested === "no rows to test" ? "no rows to test" : "not tried"}</td>`;
+    if (!t.readBy.length && t.locked)
+      return `<td class="pc pc-unknown" title="user A cannot read their own rows either">nobody, owner included</td>`;
     if (!t.readBy.length) return `<td class="pc pc-ok">nobody</td>`;
     const who = t.readBy.map((a) => (a === "anon" ? "visitor" : "user B")).join(", ");
     return `<td class="pc pc-leak">${esc(who)}</td>`;

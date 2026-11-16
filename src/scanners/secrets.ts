@@ -121,6 +121,12 @@ const SKIP_FILES =
   /(?:^|\/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$|\.(?:png|jpe?g|gif|webp|ico|pdf|zip|woff2?|ttf|mp4)$|(?:^|\/)(?:node_modules|bower_components|\.yarn\/cache)\//i;
 const MAX_BYTES = 1024 * 1024;
 
+/**
+ * Test-data folders: keys there sign test vectors (a JWS chain under testdata/jws), not production calls.
+ * They are reported as low like a Stripe test key, with the path in the message so a person can confirm.
+ */
+const TEST_DATA = /(?:^|\/)(?:testdata|test-data|test_data|__fixtures__|fixtures)\//i;
+
 async function scanTree(repo: string, git: boolean): Promise<{ findings: RawFinding[]; values: Set<string> }> {
   const findings: RawFinding[] = [];
   const values = new Set<string>();
@@ -129,13 +135,14 @@ async function scanTree(repo: string, git: boolean): Promise<{ findings: RawFind
     const path = join(repo, file);
     const info = await stat(path).catch(() => undefined);
     if (!info?.isFile() || info.size > MAX_BYTES) continue;
+    const testData = TEST_DATA.test(file);
     for (const hit of findSecrets(await readFile(path, "utf8"))) {
       values.add(hit.value);
       findings.push({
         source: "secret-scan",
         rule: "secret-in-tree",
-        toolSeverity: hit.grade,
-        message: `${hit.label} (${mask(hit.value)}) in ${file}.`,
+        toolSeverity: testData ? "test" : hit.grade,
+        message: `${hit.label} (${mask(hit.value)}) in ${file}.${testData ? " The file is in a test-data folder, so it reads as a test vector; confirm the key is not used anywhere else." : ""}`,
         location: { kind: "file", file, line: hit.line },
         subject: `secret:${hit.value}`,
       });

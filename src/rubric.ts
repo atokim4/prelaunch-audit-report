@@ -260,6 +260,19 @@ const PROJECT_CONFIG: Record<string, RuleInfo> = {
   },
 };
 
+/** Probe findings about the schema as a whole, not about one table's rows. */
+const PROBE_RULES: Record<string, RuleInfo> = {
+  "tenant-global-admin": {
+    title: "Admins are app-wide, not per organization",
+    severity: fixed("medium"),
+    cwe: CWE.accessControl,
+    whyItMatters:
+      "The schema checks the admin role without the organization column, so an admin of any organization (clinic, team, workspace) is an admin of all of them. In an app run by one company, such as a hospital with departments, that is usually the plan. In an app that sells to many companies it means one customer's admin can read and change every other customer's data. The probe tested other organizations as a plain member, so it cannot tell which of the two this app is.",
+    fix: "If each organization is a separate customer, check the admin role together with the row's organization (a helper such as `has_org_role(org_id, 'admin')`). If admins are staff of one company, keep it and note it in the security docs.",
+    effort: "1-4 hours",
+  },
+};
+
 /** The read-only probe of the live project, for leaks the repo does not explain. */
 const LIVE: Record<string, RuleInfo> = {
   "live-rls-leak": {
@@ -369,12 +382,12 @@ const PROBE_CLASS: Record<string, { title: string; why: string; fix: string }> =
   },
   "tenant-join": {
     title: "Any signed-in user can join another organization",
-    why: "The probe signed in as an admin of organization B and added themselves to organization A, or moved their own membership row there. Every policy that trusts membership then lets them read and change that organization's data, so one sign-up gets into every customer's workspace.",
+    why: "The probe signed in as user B of organization B (its admin, unless admins are app-wide) and added themselves to organization A, or moved their own membership row there. Every policy that trusts membership then lets them read and change that organization's data, so one sign-up gets into every customer's workspace.",
     fix: "Allow inserts and updates of the membership table only for admins of the target organization (or only from the server through an invite flow), and stop members from changing the organization column of their own row.",
   },
   "cross-tenant": {
     title: "One organization can reach another organization's rows",
-    why: "The table belongs to organizations and has Row Level Security, but the probe, signed in as an admin of organization B or as a user in no organization, still read or changed rows of organization A. The policy checks that the caller is signed in or is a member of some organization, not of this row's organization.",
+    why: "The table belongs to organizations and has Row Level Security, but the probe, signed in as user B of organization B (its admin, unless admins are app-wide) or as a user in no organization, still read or changed rows of organization A. The policy checks that the caller is signed in or is a member of some organization, not of this row's organization.",
     fix: "Compare the row's organization with the caller's memberships in every policy, through a SECURITY DEFINER helper such as `is_org_member(org_id)` so the membership table's own policies do not recurse.",
   },
   "member-escalation": {
@@ -492,6 +505,10 @@ export function severityOf(raw: RawFinding, info: RuleInfo): Severity {
     !proof.checks.some((c) => c.inconclusive) &&
     !liveSeverity(raw.live);
   if (sharedRead) return "low";
+  // Organization rows visitors only read through an explicit public policy, with no personal columns.
+  if (proof.publicListing && contextNote(raw) && !raw.adminGate) return "low";
+  // Anonymous inserts the schema grants column by column, into a table nobody owns: a spam risk, not a leak.
+  if (proof.anonInsertByDesign && contextNote(raw) && !raw.adminGate) return "medium";
   const measured = max(base, proofSeverity(proof));
   return raw.phi?.length && readByOthers(raw) ? "critical" : measured;
 }
@@ -590,7 +607,7 @@ export function ruleInfo(raw: RawFinding): RuleInfo | undefined {
 function staticRuleInfo(raw: RawFinding): RuleInfo | undefined {
   switch (raw.source) {
     case "rls-probe":
-      return probeInfo(raw);
+      return PROBE_RULES[raw.rule] ?? probeInfo(raw);
     case "project-config":
       return PROJECT_CONFIG[raw.rule];
     case "npm-audit":
@@ -614,6 +631,7 @@ export function repoRuleTable(): { source: string; rule: string; title: string; 
     ...Object.entries(PREFLIGHT).map(([rule, info]) => ({ source: "vibe-preflight", rule, ...info })),
     ...Object.entries(SECRETS).map(([rule, info]) => ({ source: "secret-scan", rule, ...info })),
     ...Object.entries(PROJECT_CONFIG).map(([rule, info]) => ({ source: "project-config", rule, ...info })),
+    ...Object.entries(PROBE_RULES).map(([rule, info]) => ({ source: "rls-probe", rule, ...info })),
     ...Object.entries(LIVE).map(([rule, info]) => ({ source: "live-probe", rule, ...info })),
     ...Object.entries(PHI).map(([rule, info]) => ({ source: "phi-scan (--phi)", rule, ...info })),
     ...Object.entries(PROBE_CLASS).map(([kind, text]) => ({
@@ -628,6 +646,8 @@ export function repoRuleTable(): { source: string; rule: string; title: string; 
 /** One sentence for the executive summary, written for someone who does not read code. */
 const PLAIN_RISK: Record<string, string> = {
   "rls-disabled": "Anyone who opens your site can read and change a whole database table.",
+  "tenant-global-admin":
+    "An admin of one organization is an admin of every organization: fine for one company, a leak if you sell to many.",
   "rls-permissive-policy": "A database rule lets every visitor through, so private rows can be read by strangers.",
   "rls-no-policy": "A table is locked to the app, so a screen that reads it may come back empty.",
   "rls-update-privileged-column": "A signed-in user can switch their own account to the paid plan without paying.",

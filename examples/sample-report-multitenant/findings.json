@@ -35,7 +35,7 @@
       },
       "evidence": "Policy \"Users can update their membership\" lets users update their row in `public.organization_members`, including `role`. No column privilege or trigger stops them. RLS probe on `public.organization_members`: a plain member changed `role`; an admin of another organization added themselves to organization A.",
       "snippet": "  29 | create policy \"Users can update their membership\"\n  30 |   on public.organization_members for update\n  31 |   to authenticated\n  32 |   using (user_id = (select auth.uid()));",
-      "whyItMatters": "The probe signed in as an admin of organization B and added themselves to organization A, or moved their own membership row there. Every policy that trusts membership then lets them read and change that organization's data, so one sign-up gets into every customer's workspace.",
+      "whyItMatters": "The probe signed in as user B of organization B (its admin, unless admins are app-wide) and added themselves to organization A, or moved their own membership row there. Every policy that trusts membership then lets them read and change that organization's data, so one sign-up gets into every customer's workspace.",
       "fix": "Allow inserts and updates of the membership table only for admins of the target organization (or only from the server through an invite flow), and stop members from changing the organization column of their own row.",
       "effort": "1-4 hours",
       "subject": "public.organization_members",
@@ -154,6 +154,27 @@
             "of": 1
           }
         ],
+        "access": [
+          {
+            "who": "owner",
+            "action": "select",
+            "rows": 2,
+            "of": 2
+          },
+          {
+            "who": "owner",
+            "action": "update",
+            "rows": 1,
+            "of": 2
+          },
+          {
+            "who": "org-admin",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "verdict": "leak",
         "policies": [
           {
             "name": "Members can view their team",
@@ -188,7 +209,35 @@
             "using": "(user_id = ( SELECT auth.uid() AS uid))"
           }
         ],
-        "afterPatches": []
+        "afterPatches": [],
+        "afterAccess": [
+          {
+            "who": "owner",
+            "action": "select",
+            "rows": 2,
+            "of": 2
+          },
+          {
+            "who": "owner",
+            "action": "update",
+            "rows": 0,
+            "of": 2
+          },
+          {
+            "who": "org-admin",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "writesLost": [
+          {
+            "who": "owner",
+            "action": "update",
+            "rows": 0,
+            "of": 2
+          }
+        ]
       },
       "alsoFlaggedBy": [],
       "patch": {
@@ -286,8 +335,25 @@
             "of": 1
           }
         ],
+        "access": [
+          {
+            "who": "owner",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "verdict": "leak",
         "policies": [],
-        "afterPatches": []
+        "afterPatches": [],
+        "afterAccess": [
+          {
+            "who": "owner",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          }
+        ]
       },
       "alsoFlaggedBy": [],
       "patch": {
@@ -426,6 +492,27 @@
             "of": 1
           }
         ],
+        "access": [
+          {
+            "who": "owner",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "who": "owner",
+            "action": "update",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "who": "org-admin",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "verdict": "leak",
         "policies": [
           {
             "name": "Members can update their organization",
@@ -452,7 +539,35 @@
             "withCheck": "(( SELECT auth.uid() AS uid) IS NOT NULL)"
           }
         ],
-        "afterPatches": []
+        "afterPatches": [],
+        "afterAccess": [
+          {
+            "who": "owner",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "who": "owner",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "who": "org-admin",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "writesLost": [
+          {
+            "who": "owner",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          }
+        ]
       },
       "alsoFlaggedBy": [],
       "patch": {
@@ -482,7 +597,7 @@
       },
       "evidence": "RLS probe on `public.projects`: an admin of another organization could select 1 of 1 of organization A's rows; an admin of another organization inserted a row into organization A; an admin of another organization could update 1 of 1 of organization A's rows; an admin of another organization could delete 1 of 1 of organization A's rows. Let through by policy \"Members can manage projects\" (all, `using (EXISTS ( SELECT 1\n   FROM organization_members m\n  WHERE (m.user_id = ( SELECT auth.uid() AS uid))))`).",
       "snippet": "  11 | create policy \"Members can manage projects\"\n  12 |   on public.projects for all\n  13 |   to authenticated\n  14 |   using (exists (select 1 from public.organization_members m where m.user_id = (select auth.uid())));",
-      "whyItMatters": "The table belongs to organizations and has Row Level Security, but the probe, signed in as an admin of organization B or as a user in no organization, still read or changed rows of organization A. The policy checks that the caller is signed in or is a member of some organization, not of this row's organization.",
+      "whyItMatters": "The table belongs to organizations and has Row Level Security, but the probe, signed in as user B of organization B (its admin, unless admins are app-wide) or as a user in no organization, still read or changed rows of organization A. The policy checks that the caller is signed in or is a member of some organization, not of this row's organization.",
       "fix": "Compare the row's organization with the caller's memberships in every policy, through a SECURITY DEFINER helper such as `is_org_member(org_id)` so the membership table's own policies do not recurse.",
       "effort": "under 1 hour",
       "subject": "public.projects",
@@ -595,6 +710,21 @@
             "of": 1
           }
         ],
+        "access": [
+          {
+            "who": "owner",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "who": "owner",
+            "action": "update",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "verdict": "leak",
         "policies": [
           {
             "name": "Members can manage projects",
@@ -605,7 +735,21 @@
             "using": "(EXISTS ( SELECT 1\n   FROM organization_members m\n  WHERE (m.user_id = ( SELECT auth.uid() AS uid))))"
           }
         ],
-        "afterPatches": []
+        "afterPatches": [],
+        "afterAccess": [
+          {
+            "who": "owner",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "who": "owner",
+            "action": "update",
+            "rows": 1,
+            "of": 1
+          }
+        ]
       },
       "alsoFlaggedBy": [],
       "patch": {
@@ -636,7 +780,7 @@
       },
       "evidence": "Policy \"Invites are readable by signed-in users\" on `public.invitations` (select) lets any signed-in user read every row. RLS probe on `public.invitations`: an admin of another organization could select 1 of 1 of organization A's rows; a signed-in user in no organization could select 1 of 1 of organization A's rows.",
       "snippet": "  14 | create policy \"Invites are readable by signed-in users\"\n  15 |   on public.invitations for select\n  16 |   to authenticated\n  17 |   using (true);",
-      "whyItMatters": "The table belongs to organizations and has Row Level Security, but the probe, signed in as an admin of organization B or as a user in no organization, still read or changed rows of organization A. The policy checks that the caller is signed in or is a member of some organization, not of this row's organization.",
+      "whyItMatters": "The table belongs to organizations and has Row Level Security, but the probe, signed in as user B of organization B (its admin, unless admins are app-wide) or as a user in no organization, still read or changed rows of organization A. The policy checks that the caller is signed in or is a member of some organization, not of this row's organization.",
       "fix": "Compare the row's organization with the caller's memberships in every policy, through a SECURITY DEFINER helper such as `is_org_member(org_id)` so the membership table's own policies do not recurse.",
       "effort": "under 1 hour",
       "subject": "public.invitations",
@@ -745,6 +889,21 @@
             "of": 1
           }
         ],
+        "access": [
+          {
+            "who": "owner",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "who": "owner",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          }
+        ],
+        "verdict": "leak",
         "policies": [
           {
             "name": "Invites are readable by signed-in users",
@@ -763,7 +922,21 @@
             "withCheck": "is_member(organization_id)"
           }
         ],
-        "afterPatches": []
+        "afterPatches": [],
+        "afterAccess": [
+          {
+            "who": "owner",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "who": "owner",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          }
+        ]
       },
       "alsoFlaggedBy": [],
       "patch": {
@@ -793,7 +966,7 @@
     },
     {
       "name": "rls-probe",
-      "version": "1.3.0",
+      "version": "1.4.0",
       "command": "prelaunch-audit rls-probe (PGlite + Supabase shim, rolled-back tries as anon and a second user)",
       "status": "ok",
       "note": "7 tables and views tried as anon and as a second user."
@@ -885,6 +1058,21 @@
         }
       ],
       "leaks": [],
+      "access": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        }
+      ],
+      "verdict": "protected",
       "policies": [
         {
           "name": "Members can read their audit trail",
@@ -903,7 +1091,21 @@
           "withCheck": "(is_member(organization_id) AND (actor_id = ( SELECT auth.uid() AS uid)))"
         }
       ],
-      "afterPatches": []
+      "afterPatches": [],
+      "afterAccess": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        }
+      ]
     },
     {
       "table": "public.invitations",
@@ -1010,6 +1212,21 @@
           "of": 1
         }
       ],
+      "access": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        }
+      ],
+      "verdict": "leak",
       "policies": [
         {
           "name": "Invites are readable by signed-in users",
@@ -1028,7 +1245,21 @@
           "withCheck": "is_member(organization_id)"
         }
       ],
-      "afterPatches": []
+      "afterPatches": [],
+      "afterAccess": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        }
+      ]
     },
     {
       "table": "public.org_usage",
@@ -1094,8 +1325,25 @@
           "of": 1
         }
       ],
+      "access": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "verdict": "leak",
       "policies": [],
-      "afterPatches": []
+      "afterPatches": [],
+      "afterAccess": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        }
+      ]
     },
     {
       "table": "public.organization_members",
@@ -1212,6 +1460,27 @@
           "of": 1
         }
       ],
+      "access": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 2,
+          "of": 2
+        },
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 1,
+          "of": 2
+        },
+        {
+          "who": "org-admin",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "verdict": "leak",
       "policies": [
         {
           "name": "Members can view their team",
@@ -1246,7 +1515,35 @@
           "using": "(user_id = ( SELECT auth.uid() AS uid))"
         }
       ],
-      "afterPatches": []
+      "afterPatches": [],
+      "afterAccess": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 2,
+          "of": 2
+        },
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 0,
+          "of": 2
+        },
+        {
+          "who": "org-admin",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "writesLost": [
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 0,
+          "of": 2
+        }
+      ]
     },
     {
       "table": "public.organizations",
@@ -1354,6 +1651,27 @@
           "of": 1
         }
       ],
+      "access": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "who": "org-admin",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "verdict": "leak",
       "policies": [
         {
           "name": "Members can update their organization",
@@ -1380,7 +1698,35 @@
           "withCheck": "(( SELECT auth.uid() AS uid) IS NOT NULL)"
         }
       ],
-      "afterPatches": []
+      "afterPatches": [],
+      "afterAccess": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "who": "org-admin",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "writesLost": [
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        }
+      ]
     },
     {
       "table": "public.projects",
@@ -1491,6 +1837,21 @@
           "of": 1
         }
       ],
+      "access": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "verdict": "leak",
       "policies": [
         {
           "name": "Members can manage projects",
@@ -1501,7 +1862,21 @@
           "using": "(EXISTS ( SELECT 1\n   FROM organization_members m\n  WHERE (m.user_id = ( SELECT auth.uid() AS uid))))"
         }
       ],
-      "afterPatches": []
+      "afterPatches": [],
+      "afterAccess": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 1,
+          "of": 1
+        }
+      ]
     },
     {
       "table": "public.tasks",
@@ -1589,6 +1964,21 @@
         }
       ],
       "leaks": [],
+      "access": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "verdict": "protected",
       "policies": [
         {
           "name": "Members can manage tasks",
@@ -1600,7 +1990,21 @@
           "withCheck": "(EXISTS ( SELECT 1\n   FROM projects p\n  WHERE ((p.id = tasks.project_id) AND is_member(p.organization_id))))"
         }
       ],
-      "afterPatches": []
+      "afterPatches": [],
+      "afterAccess": [
+        {
+          "who": "owner",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "who": "owner",
+          "action": "update",
+          "rows": 1,
+          "of": 1
+        }
+      ]
     }
   ],
   "notChecked": [

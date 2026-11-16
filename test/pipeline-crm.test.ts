@@ -115,6 +115,19 @@ describe("audit of the Lovable-shaped bench app", () => {
     ]);
     expect((result.probe ?? []).filter((p) => p.afterPatches?.length).map((p) => p.table)).toEqual([]);
   });
+
+  it("keeps user A reading their own rows on every patched table (positive check)", () => {
+    const probe = result.probe ?? [];
+    expect(probe.filter((p) => p.lockedOut).map((p) => p.table)).toEqual([]);
+    const owned = probe.filter((p) => p.verdict !== "shared");
+    expect(owned.length).toBeGreaterThan(0);
+    for (const p of owned) {
+      const own = p.afterAccess?.find((a) => a.who === "owner" && a.action === "select");
+      expect(own?.rows, p.table).toBeGreaterThan(0);
+    }
+    // invoices had RLS off: the patch turns it on and adds a read policy for the owner, writes go server-side
+    expect(probe.find((p) => p.table === "public.invoices")?.writesLost?.map((a) => a.action)).toEqual(["update"]);
+  });
 });
 
 /** The profiles file holds hole H03 and control C06; a finding about H03 is not a false positive on C06. */
@@ -128,8 +141,7 @@ describe("the Lovable-shaped app after applying every patch with git apply", () 
     expect(findings.map((f) => [f.rule, f.subject])).toEqual([
       // PA-01 is marked partial: the key left the bundle, the Stripe call still lives in browser code.
       ["server-secret-in-client", "STRIPE_SECRET_KEY"],
-      // invoices now has RLS on and no policies: deny-all for the API, the safe state (Low).
-      ["rls-no-policy", "public.invoices"],
+      // invoices now has RLS on and an owner read policy (no "rls-no-policy" left there).
       ["rls-permissive-policy", "public.plans"],
     ]);
     const pa01 = result.findings.find((f) => f.subject === "VITE_STRIPE_SECRET_KEY");

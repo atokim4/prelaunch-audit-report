@@ -1,7 +1,17 @@
-import { leaks, probeRls, PROBE_VERSION, type ProbeResult, type TableProbe } from "../probe/rls-probe.ts";
+import {
+  accessVerdict,
+  isOwned,
+  leaks,
+  probeRls,
+  PROBE_VERSION,
+  type ProbeResult,
+  type TableProbe,
+} from "../probe/rls-probe.ts";
 import { weakPolicies } from "../patches/fixers.ts";
 import type { SqlFile } from "../patches/sql.ts";
+import { phiKind } from "../phi/columns.ts";
 import type { Actor, Location, Proof, RawFinding, ToolRun } from "../types.ts";
+import { PERSONAL_COLUMN } from "./static-context.ts";
 
 /** Static rules about one table or view; the probe's proof is attached to these instead of a new finding. */
 export const TABLE_RULES = new Set([
@@ -22,8 +32,39 @@ export function toProof(table: TableProbe): Proof {
     ...(table.tenant ? { tenant: table.tenant } : {}),
     checks: table.checks,
     leaks: leaks(table),
+    access: table.access,
+    verdict: accessVerdict(table),
+    ...publicListingOf(table),
+    ...anonInsertOf(table),
     policies: table.policies,
   };
+}
+
+/**
+ * A policy name that says the read is for everyone on purpose. Supabase's dashboard template "Enable read
+ * access for all users" is left out: it is the one most often pasted onto private tables.
+ */
+const PUBLIC_POLICY_NAME = /^(public|anyone|everyone|visitors?|guests?|anon\w*)\b/i;
+
+/** See Proof.publicListing. Any write, membership trick or personal column keeps the full rating. */
+function publicListingOf(table: TableProbe): Pick<Proof, "publicListing"> {
+  const found = leaks(table);
+  if (!table.tenant || !found.length) return {};
+  if (found.some((c) => c.action !== "select" || c.column || c.scenario)) return {};
+  if (table.columns.some((c) => PERSONAL_COLUMN.test(c) || phiKind(table.name, c))) return {};
+  const open = table.policies.find(
+    (p) =>
+      (p.command === "select" || p.command === "all") &&
+      (p.roles.includes("anon") || (p.roles.includes("public") && PUBLIC_POLICY_NAME.test(p.name))),
+  );
+  return open ? { publicListing: open.name } : {};
+}
+
+/** See Proof.anonInsertByDesign. */
+function anonInsertOf(table: TableProbe): Pick<Proof, "anonInsertByDesign"> {
+  const found = leaks(table);
+  if (!table.anonColumnInsert || isOwned(table) || !found.length) return {};
+  return found.every((c) => c.action === "insert") ? { anonInsertByDesign: true } : {};
 }
 
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -73,7 +114,11 @@ const TENANT_WORD: Record<Actor, string> = {
 
 /** One line of evidence: what got through, in counts. */
 export function describeLeaks(proof: Proof): string {
-  const word = proof.tenant ? TENANT_WORD : ACTOR_WORD;
+  const word = !proof.tenant
+    ? ACTOR_WORD
+    : proof.tenant.members.globalAdmin
+      ? { ...TENANT_WORD, "other-user": "a member of another organization" }
+      : TENANT_WORD;
   const whose = proof.tenant ? "organization A's" : "user A's";
   const parts = proof.leaks.map((c) =>
     c.scenario === "self-join"
@@ -97,6 +142,35 @@ export function describeLeaks(proof: Proof): string {
  */
 export function mergeProbe(raws: RawFinding[], result: ProbeResult, migrations: SqlFile[]): RawFinding[] {
   const out: RawFinding[] = [];
+  const members = result.tables.find((t) => t.tenant?.members.globalAdmin)?.tenant?.members;
+  if (members?.globalAdmin) {
+    const fn = members.globalAdmin.match(/^([\w$]+)\(\)$/)?.[1];
+    const at = fn
+      ? findIn(
+          migrations,
+          new RegExp(
+            String.raw`create\s+(?:or\s+replace\s+)?function\s+(?:"?\w+"?\.)?"?${escapeRegExp(fn)}"?\s*\(`,
+            "i",
+          ),
+          true,
+        )
+      : findIn(
+          migrations,
+          new RegExp(
+            String.raw`create\s+policy\s+"${escapeRegExp(members.globalAdmin.replace(/^policy "|"$/g, ""))}"`,
+            "i",
+          ),
+          true,
+        );
+    out.push({
+      source: "rls-probe",
+      rule: "tenant-global-admin",
+      toolSeverity: "info",
+      message: `${members.globalAdmin} decides admin access from \`${members.table}.${members.roleColumn ?? "role"}\` without \`${members.tenantColumn}\`, so an admin of one organization is an admin of all. The probe tested other organizations as a plain member of organization B, not as its admin.`,
+      location: at ?? { kind: "file", file: migrations[0]?.path ?? "supabase/migrations", line: 1 },
+      subject: members.table,
+    });
+  }
   for (const table of result.tables) {
     if (table.skipped) continue;
     const proof = toProof(table);

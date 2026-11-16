@@ -2,7 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { isGitRepo, listFiles } from "./files.ts";
 import { countBySeverity, normalize } from "./normalize.ts";
-import { leaks, probeRls, type ProbeResult } from "./probe/rls-probe.ts";
+import { leaks, lostAccess, probeRls, type ProbeResult } from "./probe/rls-probe.ts";
 import { ARCHIVED_SQL, attachPatches, fixContext, patchedMigrations } from "./patches/index.ts";
 import { runLaunchAudit } from "./scanners/launch-audit.ts";
 import { mergeLive, runLiveProbe, type LiveOptions } from "./scanners/live-probe.ts";
@@ -229,13 +229,29 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
       }),
     );
     const afterByTable = new Map(after.tables.map((t) => [t.table, t]));
+    const offApi = new Set(findings.flatMap((f) => (f.patch?.verified && f.patch.offApi ? [f.patch.offApi] : [])));
     matrix = probe.result.tables.filter((t) => !t.skipped).map(toProof);
     if (after.error) {
       probe.tool.note = `${probe.tool.note ?? ""} The re-run with the patches applied failed: ${after.error}`.trim();
     } else {
       for (const proof of [...matrix, ...findings.flatMap((f) => (f.proof ? [f.proof] : []))]) {
         const table = afterByTable.get(proof.table);
-        proof.afterPatches = table && !table.skipped ? leaks(table) : [];
+        // A table the patched run could not seed proves nothing: no "0 leaks" claim for it.
+        if (!table || table.skipped) continue;
+        proof.afterPatches = leaks(table);
+        proof.afterAccess = table.access;
+        const lost = lostAccess(proof.access, table.access);
+        const reads = lost.filter((a) => a.action === "select");
+        const writes = lost.filter((a) => a.action === "update");
+        if (offApi.has(proof.table)) proof.offApi = true;
+        else if (reads.length) proof.lockedOut = reads;
+        if (writes.length) proof.writesLost = writes;
+      }
+      const locked = [...new Set(matrix.filter((p) => p.lockedOut).map((p) => p.table))];
+      if (locked.length) {
+        probe.tool.status = "failed";
+        probe.tool.note =
+          `${probe.tool.note ?? ""} With the patches applied the legitimate user lost access to their own rows in ${locked.join(", ")}: those patches are wrong as written.`.trim();
       }
     }
   }

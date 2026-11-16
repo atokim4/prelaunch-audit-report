@@ -4,7 +4,7 @@ import { PGlite, type Extensions, type Transaction } from "@electric-sql/pglite"
 import { statements, type SqlFile } from "../patches/sql.ts";
 import { isStrict, loadOrder } from "./sources.ts";
 import { detectTenancy, type Tenancy } from "./tenancy.ts";
-import type { Actor, OwnedVia, ProbeCheck, ProbePolicy, TenantLink } from "../types.ts";
+import type { AccessCheck, AccessVerdict, Actor, OwnedVia, ProbeCheck, ProbePolicy, TenantLink } from "../types.ts";
 
 /**
  * Behavioural Row Level Security check. Loads the repo's migrations into PGlite (Postgres in
@@ -15,7 +15,7 @@ import type { Actor, OwnedVia, ProbeCheck, ProbePolicy, TenantLink } from "../ty
  * values break) is recorded as inconclusive, never as "blocked".
  */
 
-export const PROBE_VERSION = "1.3.0";
+export const PROBE_VERSION = "1.4.0";
 export const SHIM_PATH = new URL("./supabase-shim.sql", import.meta.url);
 
 export const USER_A = "00000000-0000-4000-8000-00000000000a";
@@ -40,7 +40,14 @@ export interface TableProbe {
   /** Rows belong to an organization (team, workspace) through this link. */
   tenant?: TenantLink;
   checks: ProbeCheck[];
+  /** Positive checks: user A (and an org admin) on their own rows. */
+  access: AccessCheck[];
   policies: ProbePolicy[];
+  /**
+   * Visitors may insert only listed columns (`grant insert (install_id, page) on t to anon`), with no
+   * table-wide insert: an anonymous write the schema author chose column by column.
+   */
+  anonColumnInsert?: boolean;
   /** Set when the table could not be seeded or probed; no checks then. */
   skipped?: string;
 }
@@ -78,6 +85,31 @@ export function leaks(probe: Pick<TableProbe, "checks" | "ownerColumns" | "owned
     if (check.actor === "owner") return true; // escalation checks only run on privileged columns
     if (!isOwned(probe)) return check.action !== "select"; // shared data is often public on purpose
     return true;
+  });
+}
+
+/**
+ * The table's verdict. "protected" needs a positive check: rows were tried (of > 0) and the legitimate user
+ * read at least one of their own. Without it a table nobody can read would pass as safe.
+ */
+export function accessVerdict(
+  probe: Pick<TableProbe, "checks" | "access" | "ownerColumns" | "ownedVia" | "tenant">,
+): AccessVerdict {
+  if (leaks(probe).length) return "leak";
+  if (!isOwned(probe)) return "shared";
+  const reads = probe.access.filter((a) => a.action === "select");
+  const owner = reads.find((a) => a.who === "owner");
+  if (!owner || owner.of === 0 || owner.inconclusive) return "untested";
+  if (reads.some((a) => a.rows === 0 && !a.inconclusive)) return "locked";
+  return "protected";
+}
+
+/** Positive checks that passed in `before` and fail in `after`: what a patch took away from the legitimate user. */
+export function lostAccess(before: AccessCheck[], after: AccessCheck[]): AccessCheck[] {
+  return after.filter((a) => {
+    if (a.inconclusive || a.rows > 0) return false;
+    const was = before.find((b) => b.who === a.who && b.action === a.action);
+    return was !== undefined && was.rows > 0;
   });
 }
 
@@ -161,12 +193,19 @@ async function columnsOf(db: PGlite, oid: number): Promise<ColumnInfo[]> {
  */
 export function allowedValues(checks: string[]): string[] | undefined {
   for (const def of checks) {
+    // check (role = 'owner'): one allowed value.
+    const single = def.match(/^CHECK\s*\(+\s*"?[\w$]+"?\s*=\s*'((?:[^']|'')*)'::[\w ]+\)+$/i);
+    if (single?.[1] !== undefined) return [single[1].replaceAll("''", "'")];
     if (!/=\s*ANY\s*\(\s*\(?\s*ARRAY\[/i.test(def) || /\b(AND|OR|NOT)\b/.test(def)) continue;
     const values = [...def.matchAll(/'((?:[^']|'')*)'::/g)].map((m) => (m[1] ?? "").replaceAll("''", "'"));
     if (values.length) return values;
   }
   return undefined;
 }
+
+/** `n` random lowercase letters, for unique text seeds. */
+const letters = (n: number): string =>
+  Array.from({ length: n }, () => String.fromCharCode(97 + Math.floor(Math.random() * 26))).join("");
 
 const baseType = (column: ColumnInfo): string => column.type.replace(/\(.*\)/, "").trim();
 const isText = (type: string): boolean => /^(text|character varying|character|citext|name)$/.test(type);
@@ -190,12 +229,18 @@ function sampleValue(column: ColumnInfo): string | undefined {
   // Unique columns need a fresh value per insert, or a second insert fails on the index, not on RLS.
   // Email columns often carry a format CHECK; a valid address passes it.
   if (isText(type) && /e_?mail/i.test(column.name)) return `probe-${randomUUID().slice(0, 8)}@example.com`;
-  if (isText(type)) return column.unique ? `probe-${randomUUID().slice(0, 8)}` : "probe";
+  // Phone columns often carry a length or digits CHECK; a reserved 555 number passes most.
+  if (isText(type) && /phone|mobile|tel$/i.test(column.name))
+    return column.unique ? `+1555${String(1_000_000 + Math.floor(Math.random() * 8_999_999))}` : "+15555550100";
+  // Letters only: slug and name CHECKs (`page ~ '^[a-zA-Z]{1,30}$'`) reject digits and dashes.
+  if (isText(type)) return column.unique ? `probe${letters(8)}` : "probe";
   if (type === "uuid") return randomUUID();
   if (isNumber(type)) return column.unique ? String(10_000 + Math.floor(Math.random() * 1_000_000)) : "1";
   if (type === "boolean") return "false";
   if (type === "date") return "2026-01-01";
   if (/^timestamp/.test(type)) return "2026-01-01T00:00:00Z";
+  if (/^time( with(out)? time zone)?$/.test(type)) return "09:00:00";
+  if (type === "interval") return "1 hour";
   if (/^jsonb?$/.test(type)) return "{}";
   if (type === "inet") return "127.0.0.1";
   return undefined;
@@ -487,11 +532,19 @@ function insertSql(info: TableInfo, row: { columns: string[]; casts: string[] })
   return `insert into ${rel(info.name)} (${row.columns.join(", ")}) values (${placeholders.join(", ")})`;
 }
 
+/**
+ * Signed-in test users have finished MFA (`aal2`): restrictive "require MFA" policies then don't decide the
+ * result. Anyone can enroll MFA on their own account, so a leak behind such a policy is still a leak, and
+ * the owner's positive check isn't failed by a factor the real owner has.
+ */
+const signedIn = (sub: string, extra: Record<string, unknown> = {}): string =>
+  JSON.stringify({ sub, role: "authenticated", aal: "aal2", ...extra });
+
 const CLAIMS: Record<Actor, { role: string; claims: string }> = {
   anon: { role: "anon", claims: JSON.stringify({ role: "anon" }) },
-  "other-user": { role: "authenticated", claims: JSON.stringify({ sub: USER_B, role: "authenticated" }) },
-  owner: { role: "authenticated", claims: JSON.stringify({ sub: USER_A, role: "authenticated" }) },
-  "non-member": { role: "authenticated", claims: JSON.stringify({ sub: USER_C, role: "authenticated" }) },
+  "other-user": { role: "authenticated", claims: signedIn(USER_B) },
+  owner: { role: "authenticated", claims: signedIn(USER_A) },
+  "non-member": { role: "authenticated", claims: signedIn(USER_C) },
 };
 
 /**
@@ -518,17 +571,56 @@ async function tokenKeys(db: PGlite): Promise<{ org: string[]; role: string[] }>
   };
 }
 
+/** User B's role in organization B: an admin, unless admins are app-wide (then a plain member). */
+const roleOfB = (m: Tenancy["members"]): string | undefined =>
+  m.globalAdmin ? m.memberRole : (m.adminRoles[0] ?? m.memberRole);
+
+const word = (name: string): RegExp =>
+  new RegExp(String.raw`(^|[^\w])"?${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"?($|[^\w])`, "i");
+
+/**
+ * The function or policy that makes admins app-wide: it reads the role column of the membership table
+ * without the organization column, and a policy compares it with an admin value. Undefined when every
+ * admin check is scoped to an organization (or the schema has no role column).
+ */
+async function globalAdminCheck(db: PGlite, tenancy: Tenancy): Promise<string | undefined> {
+  const m = tenancy.members;
+  if (!m.roleColumn || !m.adminRoles.length) return undefined;
+  const table = word(m.table.replace(/^public\./, ""));
+  const role = word(m.roleColumn);
+  const org = word(m.tenantColumn);
+  const admin = new RegExp(`'(${m.adminRoles.map((r) => r.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})'`, "i");
+  const unscoped = (text: string) => table.test(text) && role.test(text) && !org.test(text);
+  const { rows: policies } = await db.query<{ name: string; expr: string }>(
+    `select policyname::text as name, coalesce(qual, '') || ' ' || coalesce(with_check, '') as expr
+       from pg_policies where schemaname = 'public'`,
+  );
+  const inline = policies.find((p) => unscoped(p.expr) && admin.test(p.expr));
+  if (inline) return `policy "${inline.name}"`;
+  const { rows: functions } = await db.query<{ name: string; body: string }>(
+    `select p.proname::text as name, p.prosrc as body from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname not in ('pg_catalog', 'information_schema', 'auth', 'storage', 'extensions')`,
+  );
+  for (const fn of functions.filter((f) => unscoped(f.body))) {
+    const call = word(fn.name);
+    const used = policies.find((p) => call.test(p.expr) && admin.test(p.expr));
+    // An is_admin()-style helper names the admin value in its own body.
+    const named = admin.test(fn.body) && policies.find((p) => call.test(p.expr));
+    if (used || named) return `${fn.name}()`;
+  }
+  return undefined;
+}
+
 async function tenantClaims(db: PGlite, orgs: TenantSeed): Promise<void> {
   const keys = await tokenKeys(db);
   if (!keys.org.length || !orgs.orgA || !orgs.orgB) return;
   const m = orgs.tenancy.members;
   const meta = (org: string, role: string | undefined) =>
     Object.fromEntries([...keys.org.map((k) => [k, org]), ...keys.role.map((k) => [k, role ?? "member"])]);
-  const token = (sub: string, appMetadata: Record<string, string>) =>
-    JSON.stringify({ sub, role: "authenticated", app_metadata: appMetadata });
+  const token = (sub: string, appMetadata: Record<string, string>) => signedIn(sub, { app_metadata: appMetadata });
   JWT_EXTRA.set(db, {
     owner: token(USER_A, meta(orgs.orgA, m.memberRole)),
-    "other-user": token(USER_B, meta(orgs.orgB, m.adminRoles[0] ?? m.memberRole)),
+    "other-user": token(USER_B, meta(orgs.orgB, roleOfB(m))),
     "non-member": token(USER_C, {}),
   });
 }
@@ -663,7 +755,7 @@ async function seedMembers(
   if (!orgs.orgA || !orgs.orgB) return "no organization rows to add members to";
   const tries: [string, string, string | undefined][] = [
     [orgs.orgA, USER_A, m.memberRole],
-    [orgs.orgB, USER_B, m.adminRoles[0] ?? m.memberRole],
+    [orgs.orgB, USER_B, roleOfB(m)],
   ];
   for (const [org, user, role] of tries) {
     const pinned: Record<string, string> = { [m.tenantColumn]: org, [m.userColumn]: user };
@@ -774,12 +866,54 @@ async function membershipChecks(
   ];
 }
 
+/**
+ * The legitimate side: user A reads their own rows and makes a no-op update on them (a plain member on
+ * organization A's rows); on the organization and membership tables, user B, admin of organization B, reads
+ * organization B's own row. Every try is rolled back like the others.
+ */
+async function accessChecks(db: PGlite, info: TableInfo, of: number, orgs?: TenantSeed): Promise<AccessCheck[]> {
+  if (!isOwned(info)) return [];
+  const target = rel(info.name);
+  const out: AccessCheck[] = [];
+  const as = (who: AccessCheck["who"], action: AccessCheck["action"], n: number, o: Outcome): AccessCheck => ({
+    who,
+    action,
+    rows: o.rows,
+    of: n,
+    ...(o.refused ? { refused: o.refused } : {}),
+    ...(o.inconclusive ? { inconclusive: o.inconclusive } : {}),
+  });
+  const read = await tryAs(db, "owner", `select count(*)::int as n from ${target} where ${info.mine}`);
+  out.push(as("owner", "select", of, read));
+  const touch = touchColumn(info);
+  if (info.kind === "table" && touch) {
+    const update = await tryAs(
+      db,
+      "owner",
+      `with u as (update ${target} set ${quote(touch)} = ${quote(touch)} where ${info.mine} returning 1) select count(*)::int as n from u`,
+    );
+    out.push(as("owner", "update", of, update));
+  }
+  const via = info.tenant?.via.kind;
+  if (orgs?.orgB && info.tenant && (via === "tenant" || via === "members")) {
+    const column = via === "tenant" ? info.tenant.tenantKey : info.tenant.members.tenantColumn;
+    const theirs = `${quote(column)}::text = ${lit(orgs.orgB)}`;
+    const { rows } = await db.query<{ n: number }>(`select count(*)::int as n from ${target} where ${theirs}`);
+    const n = rows[0]?.n ?? 0;
+    if (n > 0) {
+      const admin = await tryAs(db, "other-user", `select count(*)::int as n from ${target} where ${theirs}`);
+      out.push(as("org-admin", "select", n, admin));
+    }
+  }
+  return out;
+}
+
 async function probeTable(
   db: PGlite,
   info: TableInfo,
   byName: Map<string, TableInfo>,
   orgs?: TenantSeed,
-): Promise<ProbeCheck[]> {
+): Promise<{ checks: ProbeCheck[]; access: AccessCheck[] }> {
   const target = rel(info.name);
   const where = info.mine;
   const { rows } = await db.query<{ n: number }>(`select count(*)::int as n from ${target} where ${where}`);
@@ -844,7 +978,7 @@ async function probeTable(
     for (const column of privileged) checks.push(await escalation(db, info, column, of, own));
     if (via === "members" && orgs) checks.push(...(await membershipChecks(db, info, byName, orgs, own)));
   }
-  return checks;
+  return { checks, access: await accessChecks(db, info, of, orgs) };
 }
 
 async function policiesOf(db: PGlite, name: string): Promise<ProbePolicy[]> {
@@ -1046,6 +1180,10 @@ export async function probeRls(migrations: SqlFile[], tolerant = false): Promise
     linkOwnership(ordering);
     // An organization model decides who owns the rows it reaches, ahead of a creator column or a parent.
     const tenancy = detectTenancy(tables);
+    if (tenancy) {
+      const global = await globalAdminCheck(db, tenancy);
+      if (global) tenancy.members.globalAdmin = global;
+    }
     const orgs: TenantSeed | undefined = tenancy ? { tenancy } : undefined;
     if (tenancy) {
       for (const info of tables) {
@@ -1101,11 +1239,16 @@ export async function probeRls(migrations: SqlFile[], tolerant = false): Promise
         ...(info.tenant ? { tenant: info.tenant } : {}),
         policies: info.kind === "table" ? await policiesOf(db, info.name) : [],
       };
+      const { rows: grant } = await db.query<{ only: boolean }>(
+        `select has_any_column_privilege('anon', $1::oid, 'INSERT') and not has_table_privilege('anon', $1::oid, 'INSERT') as only`,
+        [info.oid],
+      );
+      if (grant[0]?.only) Object.assign(base, { anonColumnInsert: true });
       const reason = skipped.get(info.name);
       out.push(
         reason
-          ? { ...base, checks: [], skipped: reason }
-          : { ...base, checks: await probeTable(db, info, byName, orgs) },
+          ? { ...base, checks: [], access: [], skipped: reason }
+          : { ...base, ...(await probeTable(db, info, byName, orgs)) },
       );
     }
     return {

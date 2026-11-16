@@ -153,7 +153,19 @@ async function main(): Promise<void> {
 
   const counts = SEVERITIES.map((s) => `${result.counts[s]} ${s}`).join(", ");
   const patched = result.findings.filter((f) => f.patch?.verified).length;
-  process.stdout.write(`${result.app.name}: ${counts}. ${patched} verified patches.\nWrote ${out}\n`);
+  process.stdout.write(`${result.app.name}: ${counts}. ${patched} verified patches.\n`);
+  if (result.probe) {
+    const verdicts = ["leak", "protected", "locked", "shared", "untested"] as const;
+    const tally = verdicts.map((v) => `${result.probe?.filter((p) => p.verdict === v).length ?? 0} ${v}`);
+    process.stdout.write(`RLS probe: ${tally.join(", ")}.\n`);
+  }
+  process.stdout.write(`Wrote ${out}\n`);
+  const lockedOut = (result.probe ?? []).filter((p) => p.lockedOut?.length).map((p) => p.table);
+  if (lockedOut.length) {
+    // A patch that keeps the owner out of their own rows is a broken patch, not a fix: fail the run.
+    process.stderr.write(`prelaunch-audit: patches lock the legitimate user out of ${lockedOut.join(", ")}\n`);
+    process.exitCode = 3;
+  }
 }
 
 main().catch((error: unknown) => {

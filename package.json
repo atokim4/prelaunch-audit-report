@@ -1,6 +1,6 @@
 {
   "name": "prelaunch-audit-report",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Turns repo scanners, a Row Level Security probe in PGlite (users and organizations), an optional read-only probe of the live Supabase project and live-URL checks into a severity-rated pre-launch audit report (JSON, HTML, PDF) with verified patch diffs, for Next.js or Vite/React + Supabase + Stripe apps. Personal project.",
   "private": true,
   "type": "module",

@@ -134,6 +134,9 @@ describe("CHECK lists as seed values", () => {
   it("reads the values of a one-column IN list and ignores other checks", () => {
     expect(allowedValues(["CHECK ((role = ANY (ARRAY['admin'::text, 'member'::text])))"])).toEqual(["admin", "member"]);
     expect(allowedValues(["CHECK ((char_length(name) > 2))"])).toBeUndefined();
+    // run 9: a single allowed value; a comparison inside a larger expression is not a value list (control)
+    expect(allowedValues(["CHECK ((role = 'owner'::text))"])).toEqual(["owner"]);
+    expect(allowedValues(["CHECK (((role = 'owner'::text) OR (role = 'admin'::text)))"])).toBeUndefined();
     expect(allowedValues(["CHECK (((kind = ANY (ARRAY['a'::text])) OR (x > 1)))"])).toBeUndefined();
   });
 
@@ -412,6 +415,19 @@ describe("audit of the B2B team workspace fixture", () => {
       "public.projects",
     ]);
     expect((result.probe ?? []).filter((p) => p.afterPatches?.length).map((p) => p.table)).toEqual([]);
+  });
+
+  it("keeps the plain member and the org admin reading their own organization after the patches", () => {
+    const probe = result.probe ?? [];
+    expect(probe.filter((p) => p.lockedOut).map((p) => p.table)).toEqual([]);
+    for (const p of probe) {
+      for (const a of p.afterAccess?.filter((x) => x.action === "select") ?? [])
+        expect(a.rows, `${p.table} ${a.who}`).toBeGreaterThan(0);
+    }
+    const admin = probe
+      .find((p) => p.table === "public.organizations")
+      ?.afterAccess?.find((a) => a.who === "org-admin");
+    expect(admin).toMatchObject({ rows: 1, of: 1 });
   });
 
   it("leaks nothing when probed again from the git-applied files", async () => {

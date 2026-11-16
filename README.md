@@ -117,6 +117,30 @@ again with that file first. Role columns of user A start at a plain value (`rece
 Only a permission error or an RLS violation counts as "blocked". A try that fails for another reason (a check
 constraint or trigger rejecting the test values) is shown as "?" and proves nothing either way.
 
+"Nobody else got in" is only half the answer, so the probe also checks the other side on every table it tries:
+user A reads their own rows and makes a no-op update on them (with an organization model, user A is a plain
+member reading organization A's rows), and user B, an admin of organization B, reads organization B's own row and
+membership. Each table then gets one verdict:
+
+| verdict                    | meaning                                                                                                                                                                                            |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| leak                       | someone other than the owner read or changed the rows                                                                                                                                              |
+| protected                  | nobody else got through, rows were tried, and the owner still reads their own                                                                                                                      |
+| owner can't read it either | nobody else got through, but the owner can't read their own rows either: a server-only table, access through a role the probe didn't hold (staff, doctor), an over-tight policy or a missing grant |
+| shared data                | no owner column (price lists, settings): only writes count                                                                                                                                         |
+| not proven                 | user A had no row to try (a view's filter), or the owner's try failed for another reason                                                                                                           |
+
+A table with zero leaks is only called protected when rows were tried and the owner's read passed. "Owner can't
+read it either" isn't a leak, but it's no proof the policies work for the people they're for, so a person has to
+look at which of the reasons above it is. Signed-in test users carry `aal: aal2` (MFA done), so a restrictive
+"require MFA" policy doesn't decide the result either way: anyone can turn on MFA for their own account.
+
+The same positive checks run again with the report's patches applied. If a patch takes away a read the owner
+had before, the run fails (exit code 3) and the report says not to apply it. The one exception is a patch that
+takes a relation off the API on purpose (a view over `auth.users`), and the report says that too. An update
+the owner loses is reported but doesn't fail the run, because that's often the point of the patch: a member
+shouldn't edit the organization row, and an audit log should be append-only.
+
 What gets through decides the severity. A visitor reaching user rows is Critical. User B reaching A's rows, or
 A upgrading their own plan, is High. A raising their own role is Critical when that column decides admin access:
 a helper such as `is_admin()` or `current_role()` reads it and a policy calls the helper, or a policy checks it in
@@ -162,6 +186,18 @@ organization_members"). On the membership table only admins write and nobody can
 column of a row; on the organization table plan and billing columns can only change from the server. Inviting
 and onboarding flows that insert membership rows from the browser have to move into a SECURITY DEFINER function
 or an edge function, and the caveat under each patch says so.
+
+Some apps call their departments organizations without selling to them: a hospital whose staff table names a
+clinic, with one admin role for the whole hospital. When the schema's admin check reads the role without the
+organization column (a helper like `get_current_staff_role()` used as `= 'ADMIN'` in policies), user B joins
+organization B as a plain member instead, and the report adds one Medium finding: admins are app-wide, which is
+fine for one company and a cross-customer leak for a SaaS, so a person has to say which. Before v0.7.0 the probe
+used B as an admin there and reported a hospital admin editing the website as seven Criticals.
+
+Organization rows that visitors only read, through a select policy written for them (`to anon`, or a name that
+starts with Public, Anyone or Everyone), on a table with no personal or health columns, are rated Low with
+"confirm it is a public listing" (clinic hours, a store's products). A write, a personal column or Supabase's
+default policy name "Enable read access for all users" keeps the full rating.
 
 If a migration still does not load in PGlite (`vector` or `postgis`, which this PGlite build doesn't have, for
 example), the report says so and only the static checks run.
@@ -350,6 +386,13 @@ the code rules. Each patch is a unified diff that applies with `git apply` from 
   vendors and the BAA findings get no patch, because the fix there is a decision (remove the script, sign a BAA,
   or stop sending the fields), and the report says so under the finding.
 - `stripe-webhook-jwt-gate`: sets `verify_jwt = false` for that function in `supabase/config.toml`.
+- A SECURITY DEFINER function visitors can call: execute is revoked from `public`, `anon` and `authenticated`,
+  unless the app's own policies call it (`is_admin()`, `get_current_role()`). Those run as the signed-in user, so
+  the patch keeps `authenticated` and only takes it from visitors. v0.6.0 revoked it from everyone, and the
+  positive check on a real hospital repo showed that patch locking every staff member out of their own profile.
+- Row Level Security turned off on a table with an owner column: RLS on, plus a policy that lets a signed-in user
+  read their own rows. Writes from the browser stop until a policy for them is added. Without the read policy the
+  owner would lose their own rows as well, and the positive check would fail the run.
 - A secret behind `VITE_` or `NEXT_PUBLIC_` in browser code: renamed everywhere so the next build no longer ships
   it. That patch is marked **partial** in the report, because the code that used the key still runs in the
   browser and has to move to an edge function or server route. A mechanical move would keep trusting whatever
@@ -376,7 +419,9 @@ done right and must not be flagged at Medium or above.
   flagged at Medium or above.
 - All 9 Critical and High findings have a verified patch; one of them is partial (the Vite secret). With the
   patches applied the probe finds 0 leaks in all 9 tables and views, checked once inside the audit and once more by
-  the test suite from the patched files.
+  the test suite from the patched files. In the same patched run user A still reads their own rows in every owned
+  table. Before v0.7.0 the `invoices` patch only turned RLS on, so the owner lost their own invoices too; the
+  positive check caught it and the patch now adds an owner read policy.
 
 **broken-notes-app** (Next.js App Router, 13 migrations): 12 holes, 7 controls, originally written for an earlier
 benchmark of mine.
@@ -388,6 +433,8 @@ benchmark of mine.
   copy, re-runs all migrations and checks behaviour: anon gets no rows from `audit_log`, a third user cannot read a
   conversation, a user cannot set their own `plan` but can change `display_name`, the admin RPC and user
   directory are closed to the API roles, the view runs as the caller, the invoices bucket is private.
+  With the patches the owner still reads their own `audit_log` rows but can't rewrite them (the v0.6.0 patch
+  locked them out, which the positive check now catches); `user_directory` is taken off the API on purpose.
 - `scripts/typecheck-patched-app.sh` installs that app's real dependencies (Next.js 15.5, Stripe 19.1,
   supabase-js 2.58) and type-checks the patched code. It needs network, so it is not part of `npm test`.
 
@@ -422,7 +469,8 @@ tasks, Stripe per organization): 6 holes, 5 controls. RLS is on for every table 
   fine to a policy linter and need the probe.
 - No control is flagged at Medium or above: tasks scoped through the parent project, an append-only audit
   table, the membership helper and the trigger that makes the creator the owner.
-- All 5 patches apply with `git apply`, and the probe re-run on the patched files finds 0 leaks. A separate test
+- All 5 patches apply with `git apply`, and the probe re-run on the patched files finds 0 leaks, with the plain
+  member and the other organization's admin still reading their own organization's rows. A separate test
   loads the patched migrations and checks the app still works for the people it is for: the founder creates an
   organization and becomes owner through the trigger, adds a member, the member creates and reads a project, an
   outsider sees nothing and cannot join, the member cannot promote themselves or change the plan, and the owner
@@ -559,9 +607,7 @@ outright. That also means zero on such a repo says less than it seems, which is 
 
 What it still misses here:
 
-- It checks that outsiders get nothing, not that members get what they need. A schema where members cannot read
-  their own organization's rows shows as 0 leaks. The fixture test checks member access after the patches, but
-  real repos do not get that check.
+- (Closed in v0.7.0: every probed table now gets a positive check, see "Row Level Security, by behaviour".)
 - Membership tables with names outside member, membership, seat, staff or users (say `org_people`), and roles
   kept in a separate table (`role_id`), are not understood.
 - Organization claims in the token are filled by key name (org, tenant, team, workspace, account, company, unit,

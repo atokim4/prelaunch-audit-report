@@ -20,6 +20,7 @@ export interface TenantDraft {
   summary: string;
   caveats: string[];
   partial?: string;
+  offApi?: string;
 }
 
 const PRIVILEGED =

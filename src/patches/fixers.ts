@@ -9,6 +9,7 @@ import {
   policies,
   publicRel,
   qualify,
+  statements,
   tableColumns,
   type SqlFile,
 } from "./sql.ts";
@@ -36,6 +37,8 @@ export interface PatchDraft {
   caveats: string[];
   /** What the patch leaves for a person, when it only closes the exposure. */
   partial?: string;
+  /** The patch takes this relation off the public API on purpose: losing access to it is the fix. */
+  offApi?: string;
 }
 
 type Fixer = (finding: Finding, ctx: FixContext) => Promise<PatchDraft | undefined>;
@@ -63,14 +66,33 @@ const rlsDisabled: Fixer = async (finding, ctx) => {
   const name = subject(finding);
   if (!name) return undefined;
   const table = qualify(name);
+  // Switching RLS on with no policy also locks the owner out of their own rows (the probe's positive check
+  // catches that), so a table with an owner gets a read policy for exactly those rows. Writes stay server-side.
+  const owner = finding.proof && !finding.proof.tenant ? ownerCondition(finding.proof) : undefined;
+  const read = owner
+    ? [
+        "",
+        `create policy ${identPart(`${slugOf(table)}_select_own`)}`,
+        `  on ${ident(table)} for select`,
+        "  to authenticated",
+        `  using (${owner});`,
+      ]
+    : [];
   return {
     edits: [
       migration(ctx, `enable_rls_${slugOf(table)}`, `${finding.id}: turn on Row Level Security for ${table}.`, [
         `alter table ${ident(table)} enable row level security;`,
+        ...read,
       ]),
     ],
-    summary: `Turns on Row Level Security for ${table}. With no policies the public API gets nothing; server code using the service role key keeps working.`,
-    caveats: ["If the browser needs to read or write this table, add policies for exactly those rows."],
+    summary: owner
+      ? `Turns on Row Level Security for ${table} and lets a signed-in user read only their own rows. The public API can no longer write it; server code using the service role key keeps working.`
+      : `Turns on Row Level Security for ${table}. With no policies the public API gets nothing; server code using the service role key keeps working.`,
+    caveats: [
+      owner
+        ? "If the browser also inserts, updates or deletes rows here, add a policy per command with the same owner check."
+        : "If the browser needs to read or write this table, add policies for exactly those rows.",
+    ],
   };
 };
 
@@ -100,6 +122,7 @@ const authUsersExposed: Fixer = async (finding, ctx) => {
       ]),
     ],
     summary: `Revokes API access to ${view}, so the account list is no longer readable through /rest/v1/.`,
+    offApi: qualify(name),
     caveats: [
       "The feature that used this view stops working. Replace it with a function that checks the caller and returns only what it needs (for example the id for one exact email).",
     ],
@@ -112,6 +135,23 @@ const definerFunctionAnon: Fixer = async (finding, ctx) => {
   const fn = qualify(name);
   const args = functionArgs(ctx.migrations, fn);
   if (args === undefined) return undefined;
+  // A helper the app's own policies call (is_admin(), get_current_role()) runs as the signed-in user: taking
+  // execute away from authenticated would make every one of those policies fail with "permission denied".
+  const callers = policiesCalling(ctx.schemaSql, fn);
+  if (callers.length) {
+    return {
+      edits: [
+        migration(ctx, `revoke_${slugOf(fn)}`, `${finding.id}: stop visitors from calling ${fn}().`, [
+          `revoke execute on function ${ident(fn)}(${args}) from public, anon;`,
+          `grant execute on function ${ident(fn)}(${args}) to authenticated;`,
+        ]),
+      ],
+      summary: `Revokes execute on ${fn}() from public and anon. Signed-in users keep it because ${callers.length === 1 ? `policy "${callers[0]}" calls` : `${callers.length} policies call`} it.`,
+      caveats: [
+        "Signed-in users can still call it over /rest/v1/rpc/. Make sure it only answers about the caller (it reads auth.uid()), never about an id passed in.",
+      ],
+    };
+  }
   return {
     edits: [
       migration(ctx, `revoke_${slugOf(fn)}`, `${finding.id}: stop the API roles from calling ${fn}().`, [
@@ -124,6 +164,20 @@ const definerFunctionAnon: Fixer = async (finding, ctx) => {
     ],
   };
 };
+
+/** Names of the policies (on any table) whose expressions call `fn`. */
+function policiesCalling(files: SqlFile[], fn: string): string[] {
+  const bare = fn.replace(/^public\./, "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const call = new RegExp(String.raw`(^|[^\w$])(?:"?public"?\.)?"?${bare}"?\s*\(`, "i");
+  const names = new Set<string>();
+  for (const file of files) {
+    for (const stmt of statements(file.text)) {
+      const head = stmt.match(/^\s*create\s+policy\s+("(?:[^"]|"")+"|\w+)\s+on\s+[\s\S]*?\b(using|with\s+check)\b/i);
+      if (head?.[1] && call.test(stmt.slice(head.index ?? 0))) names.add(head[1].replace(/^"|"$/g, ""));
+    }
+  }
+  return [...names].sort();
+}
 
 const storagePublicBucket: Fixer = async (finding, ctx) => {
   const bucket = subject(finding);

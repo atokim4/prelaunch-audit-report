@@ -85,6 +85,7 @@ describe("generated types", () => {
       columns: ["id", "owner_id"],
       ownerColumns: ["owner_id"],
       checks: [],
+      access: [],
       policies: [],
     } satisfies TableProbe;
     const targets = liveTargets([local], {

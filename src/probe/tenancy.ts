@@ -58,6 +58,9 @@ function candidates(tables: TenancyTable[]): Candidate[] {
       if (!tenant || tenant === members || tenant.kind !== "table") continue;
       const userColumn = members.ownerColumns.find((c) => c !== column.name);
       if (!userColumn) continue;
+      // staff.default_chair -> chairs is a setting, not an organization: a table with another name only counts
+      // when the link table really is a membership (members, memberships, seats).
+      if (!TENANT_NAME.test(tenant.name) && !/member|seat/i.test(members.name)) continue;
       out.push({ members, tenant, tenantColumn: column, userColumn });
     }
   }

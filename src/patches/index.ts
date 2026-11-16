@@ -93,7 +93,14 @@ export async function attachPatches(findings: Finding[], ctx: FixContext, repo: 
     if (!draft) continue;
     const diff = await unifiedDiff(draft.edits);
     const ok = await applies(repo, draft.edits, diff);
-    finding.patch = { diff, summary: draft.summary, caveats: draft.caveats, verified: ok, partial: draft.partial };
+    finding.patch = {
+      diff,
+      summary: draft.summary,
+      caveats: draft.caveats,
+      verified: ok,
+      partial: draft.partial,
+      ...(draft.offApi ? { offApi: draft.offApi } : {}),
+    };
     if (table) tenantPatches.set(table, { id: finding.id, patch: finding.patch });
     if (ok) verified.push(...draft.edits);
   }

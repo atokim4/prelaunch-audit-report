@@ -85,12 +85,10 @@ describe("the bench app after applying every patch", () => {
   it("passes vibe-preflight with no errors left", async () => {
     const { findings } = await runPreflight(patched);
     expect(findings.filter((f) => f.toolSeverity === "error")).toEqual([]);
-    // Left on purpose: feature_flags and the patched audit_log have RLS on and no policies, the safe
-    // deny-all state (Low). Policies there depend on what the browser should see, so no patch writes them.
-    expect(findings.map((f) => [f.rule, f.subject])).toEqual([
-      ["rls-no-policy", "public.audit_log"],
-      ["rls-no-policy", "public.feature_flags"],
-    ]);
+    // Left on purpose: feature_flags has RLS on and no policies, the safe deny-all state (Low). It has no
+    // owner, so what the browser should see there is a product decision. The patched audit_log gets an
+    // owner read policy (the probe's positive check failed without one).
+    expect(findings.map((f) => [f.rule, f.subject])).toEqual([["rls-no-policy", "public.feature_flags"]]);
   });
 
   describe("in Postgres (PGlite with a Supabase shim)", () => {
@@ -115,7 +113,7 @@ describe("the bench app after applying every patch", () => {
           ('00000000-0000-0000-0000-00000000000c', 'c@example.invalid');
         insert into public.messages (sender_id, recipient_id, body) values
           ('00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-00000000000b', 'private');
-        insert into public.audit_log (action) values ('sign-in');
+        insert into public.audit_log (user_id, action) values ('00000000-0000-0000-0000-00000000000a', 'sign-in');
       `);
     });
 
@@ -123,9 +121,23 @@ describe("the bench app after applying every patch", () => {
       await db?.close();
     });
 
-    it("hides audit_log from anon (RLS on, no policies)", async () => {
+    it("hides audit_log from anon and user B, and still shows user A their own entry", async () => {
       await db.exec("set role anon");
       expect(await one<{ n: number }>("select count(*)::int as n from public.audit_log")).toEqual({ n: 0 });
+      await db.exec("reset role");
+      await user("00000000-0000-0000-0000-00000000000b");
+      expect(await one<{ n: number }>("select count(*)::int as n from public.audit_log")).toEqual({ n: 0 });
+      await db.exec("reset role");
+      await user("00000000-0000-0000-0000-00000000000a");
+      expect(await one<{ n: number }>("select count(*)::int as n from public.audit_log")).toEqual({ n: 1 });
+      await db.exec("reset role");
+      // writes stay server-side: user A cannot rewrite their own history
+      await user("00000000-0000-0000-0000-00000000000a");
+      expect(
+        await one<{ n: number }>(
+          "with u as (update public.audit_log set action = 'edited' returning 1) select count(*)::int as n from u",
+        ),
+      ).toEqual({ n: 0 });
       await db.exec("reset role");
     });
 

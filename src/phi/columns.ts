@@ -31,7 +31,26 @@ const CLINICAL_TABLE =
   /(^|_)(patients?|appointments?|visits?|encounters?|consultations?|intake\w*|medical\w*|health\w*|prescriptions?|labs?|lab_\w+|charts?|treatments?|diagnos\w+|clinical\w*|therapy\w*|sessions?_notes?|referrals?|immuni\w+)($|_)/;
 
 /** Plain identifiers that are PHI on a clinical table (name, phone) but too common to search code for. */
-const PERSON = /^(full_name|first_name|last_name|name|email|phone|phone_number|address|zip|postal_code)$/;
+const PERSON =
+  /^(full_name|first_name|last_name|name|email|phone|phone_number|address|zip|postal_code|patient_(?:full_)?name|patient_(?:first|last)_name|patient_email|patient_phone)$/;
+
+/**
+ * A patient register: a row exists because the person is someone's patient, so the name and contact
+ * fields are PHI even with no clinical column (patients(patient_name, email, phone)).
+ */
+const PATIENT_TABLE = /(^|_)patients?$/;
+
+/** A column naming a file or stored object: on a patient's record, the file is the record (a lab report PDF). */
+const FILE_COLUMN =
+  /^(file_(path|url|name|key)|storage_(path|key|url)|object_(path|key)|pdf_(url|path)|document_(url|path)|report_(url|path|file)|attachments?(_\w+)?|scan_(url|path)|image_(url|path))$/;
+
+/** A column that names the patient a row is about (not a user account: a clinic's record of someone). */
+const PATIENT_REF = /^(patient_(id|uuid|name|external_id|number|ref)|mrn|medical_record_\w+)$/;
+
+/** Values of a kind/type column that say the row is a clinical document ('prescription', 'lab_report'). */
+const CLINICAL_VALUE =
+  /'(prescriptions?|lab[_ -]?(reports?|results?)|medical[_ -]?\w*|diagnos\w+|imaging|x-?rays?|radiology|discharge[_ -]?\w*|referrals?|vaccinations?|immuni[sz]ations?|clinical[_ -]?\w*)'/i;
+const KIND_COLUMN = /^(type|kind|category|doc_type|document_type|record_type)$/;
 
 /** Tables whose name alone says every row is a health record, whatever the columns are called. */
 const RECORD_TABLE =
@@ -41,13 +60,18 @@ const RECORD_TABLE =
 const PERSON_LINK = /^(user|patient|member|family_member|profile|person|owner|client|account)_?id$/;
 
 /** Bookkeeping columns: keys and timestamps carry no health data even on a health-record table. */
-const BOOKKEEPING = /^(id|uuid|\w+_id|created_at|updated_at|deleted_at|inserted_at)$/;
+const BOOKKEEPING =
+  /^(id|uuid|\w+_id|created_at|updated_at|deleted_at|inserted_at|(created|updated|deleted|uploaded)_by)$/;
 
 export const isClinicalTable = (table: string): boolean => CLINICAL_TABLE.test(table.replace(/^public\./, ""));
 
 /** The PHI kind of one column of `table`, or undefined when its name does not say it holds PHI. */
+/** A person's job, not their health: clinical_reviewer, medical_staff, health_coach_role. */
+const STAFF_ROLE = /_(reviewers?|approvers?|roles?|staff|leads?|admins?|managers?|team|coach(es)?)$/;
+
 export function phiKind(table: string, column: string): PhiKind | undefined {
   const name = column.toLowerCase();
+  if (STAFF_ROLE.test(name)) return undefined;
   if (HEALTH.some((re) => re.test(name))) return "health";
   if (IDENTIFIER.some((re) => re.test(name))) return "identifier";
   if (isClinicalTable(table) && CLINICAL_CONTEXT.some((re) => re.test(name))) return "health";
@@ -58,13 +82,32 @@ export function phiKind(table: string, column: string): PhiKind | undefined {
  * PHI columns of a table. A table holds PHI when it has a health column, or is a clinical table with an
  * identifier; on such a table the plain person fields (name, phone) are PHI too, and are listed last.
  */
-export function phiColumns(table: string, columns: string[]): PhiColumn[] {
+export function phiColumns(
+  table: string,
+  columns: string[],
+  /** Column definitions from the create table statement, when known: inline CHECK values say what a row is. */
+  definitions: Record<string, string> = {},
+): PhiColumn[] {
+  const bareName = table.replace(/^public\./, "").toLowerCase();
   const found = columns.flatMap((name): PhiColumn[] => {
     const kind = phiKind(table, name);
     return kind ? [{ name, kind }] : [];
   });
-  const aboutPerson = columns.some((c) => PERSON_LINK.test(c.toLowerCase()));
-  if (aboutPerson && RECORD_TABLE.test(table.replace(/^public\./, "").toLowerCase())) {
+  const lower = columns.map((c) => c.toLowerCase());
+  const aboutPerson = lower.some((c) => PERSON_LINK.test(c));
+  // documents(profile_id, type check (type in ('prescription', 'report'))): the allowed values name the record.
+  const clinicalKind = columns.some(
+    (c) => KIND_COLUMN.test(c.toLowerCase()) && CLINICAL_VALUE.test(definitions[c] ?? ""),
+  );
+  // A stored file about a named patient (reports(patient_name, file_path)) is a health record.
+  const aboutPatient = lower.some((c) => PATIENT_REF.test(c)) || PATIENT_TABLE.test(bareName);
+  if (aboutPatient || isClinicalTable(table)) {
+    for (const name of columns) {
+      if (FILE_COLUMN.test(name.toLowerCase()) && !found.some((c) => c.name === name))
+        found.push({ name, kind: "health" });
+    }
+  }
+  if (aboutPerson && (RECORD_TABLE.test(bareName) || clinicalKind)) {
     // medical_records(user_id, file_url, extracted_data…): the name says what the rows are. A list of
     // drugs with no link to a person (a medications catalogue) is not a record.
     for (const name of columns) {
@@ -79,15 +122,19 @@ export function phiColumns(table: string, columns: string[]): PhiColumn[] {
   }
   const health = found.some((c) => c.kind === "health");
   const identifier = found.some((c) => c.kind === "identifier");
-  if (!health && !(identifier && isClinicalTable(table))) {
+  const person = columns
+    .filter((c) => PERSON.test(c.toLowerCase()) && !found.some((f) => f.name === c))
+    .map((name) => ({ name, kind: "identifier" as const }));
+  const register = PATIENT_TABLE.test(bareName) && person.length > 0;
+  if (!health && !(identifier && isClinicalTable(table)) && !register) {
     // An identifier alone (a dob on a user profile) is personal data, not health data.
     return [];
   }
-  const person = columns
-    .filter((c) => PERSON.test(c.toLowerCase()))
-    .map((name) => ({ name, kind: "identifier" as const }));
   return [...found, ...person];
 }
+
+/** File columns of a table, for rows that hang off a PHI record (document_pages.storage_path). */
+export const fileColumns = (columns: string[]): string[] => columns.filter((c) => FILE_COLUMN.test(c.toLowerCase()));
 
 /** Columns worth searching code for: everything but the plain person fields, which every app has. */
 export const searchable = (columns: PhiColumn[]): string[] =>

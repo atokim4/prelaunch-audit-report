@@ -103,6 +103,33 @@ export interface ProbeCheck {
   scenario?: "self-join" | "move-tenant";
 }
 
+/**
+ * A positive check: a legitimate user reaching their own rows. Without one, "nobody else got in" could just
+ * mean nobody gets in at all. "owner" is user A on their own rows (a plain member on organization A's rows);
+ * "org-admin" is user B, an admin of organization B, on organization B's own row and membership.
+ */
+export interface AccessCheck {
+  who: "owner" | "org-admin";
+  action: "select" | "update";
+  /** Rows the user read or changed. */
+  rows: number;
+  /** Rows of theirs in the table. */
+  of: number;
+  refused?: string;
+  inconclusive?: string;
+}
+
+/**
+ * What the probe can say about one table:
+ * - leak: someone else got through;
+ * - protected: nobody else got through, rows were tried, and the legitimate user still reads their own;
+ * - locked: nobody else got through, but the legitimate user cannot read their own rows either (server-only
+ *   table, a role the probe did not hold, an over-tight policy, a missing grant), so "no leak" proves little;
+ * - shared: no owner column (price lists, settings), only writes count;
+ * - untested: no rows of the user to try, or the positive try failed for another reason.
+ */
+export type AccessVerdict = "leak" | "protected" | "locked" | "shared" | "untested";
+
 /** The membership table of an organization (team, workspace) model. */
 export interface Membership {
   /** `public.<name>`. */
@@ -114,6 +141,12 @@ export interface Membership {
   adminRoles: string[];
   /** The plain member value the probe gave user A. */
   memberRole?: string;
+  /**
+   * Set when the schema's admin check reads the role without the organization column (a hospital-wide
+   * admin): the function or policy that shows it. User B is then a plain member of organization B, since an
+   * app-wide admin reaching every organization is the design, not a leak.
+   */
+  globalAdmin?: string;
 }
 
 /** How one table's rows belong to an organization. */
@@ -160,8 +193,27 @@ export interface Proof {
   /** The checks that got through. */
   leaks: ProbeCheck[];
   policies: ProbePolicy[];
+  /** Positive checks: the legitimate user on their own rows. */
+  access: AccessCheck[];
+  /**
+   * Organization rows that visitors only read, through a select policy written for them (`to anon`, or a
+   * name such as "Public can view…"), on a table with no personal or health columns: the name of that
+   * policy. Reads as a public listing.
+   */
+  publicListing?: string;
+  /** No owner, and the only leak is visitors inserting through a column-limited grant (telemetry, a form). */
+  anonInsertByDesign?: boolean;
+  verdict: AccessVerdict;
   /** Leaks still there after every patch in the report was applied, in the same harness. */
   afterPatches?: ProbeCheck[];
+  /** The positive checks in the patched harness. */
+  afterAccess?: AccessCheck[];
+  /** Reads that passed before the patches and fail after: a patch locks the legitimate user out. */
+  lockedOut?: AccessCheck[];
+  /** Updates that passed before the patches and fail after: writes moved to the server (said, not failed). */
+  writesLost?: AccessCheck[];
+  /** A patch took this relation off the public API on purpose, so lost reads are the fix. */
+  offApi?: boolean;
 }
 
 export interface Patch {
@@ -175,6 +227,8 @@ export interface Patch {
   verified: boolean;
   /** Set when the patch closes the exposure but leaves work only a person can do; says what is left. */
   partial?: string;
+  /** The patch takes this relation off the public API on purpose. */
+  offApi?: string;
 }
 
 export interface Finding {
@@ -267,6 +321,8 @@ export interface PhiTable {
    * or a migration that failed in PGlite), or user A had no row to read (a view's filter).
    */
   untested?: "not in migrations" | "not probed" | "no rows to test";
+  /** Nobody else read it, but user A could not read their own rows either: no proof the policies work. */
+  locked?: boolean;
   /** A trigger in the migrations writes changes of this table to an audit table. */
   audited: boolean;
 }

@@ -1,7 +1,7 @@
 import { parseGeneratedTypes, TYPES_FILES } from "../live/targets.ts";
 import type { FixContext } from "../patches/fixers.ts";
 import { balanced, createdTables, statements, type SqlFile } from "../patches/sql.ts";
-import { phiColumns, searchable } from "../phi/columns.ts";
+import { fileColumns, phiColumns, searchable } from "../phi/columns.ts";
 import type { TableProbe } from "../probe/rls-probe.ts";
 import type {
   HipaaControl,
@@ -20,7 +20,7 @@ import type {
  * code that sends it to an AI, email or SMS vendor, logs, and public storage buckets. It reads files only.
  */
 
-export const PHI_SCAN_VERSION = "1.1.0";
+export const PHI_SCAN_VERSION = "1.2.0";
 /** The day the checklist below was copied from Supabase's docs. */
 export const HIPAA_DOCS_READ_ON = "2026-11-16";
 export const HIPAA_DOCS_URL = "https://supabase.com/docs/guides/deployment/shared-responsibility-model";
@@ -128,8 +128,10 @@ async function phiTables(ctx: FixContext, probed: TableProbe[]): Promise<{ table
   }
   // Tables the probe did not load (SQL outside supabase/migrations, or a migration PGlite rejected) are
   // still mapped from their create table statements.
+  const definitions = new Map<string, Record<string, string>>();
   for (const [table, columns] of createdTables(ctx.schemaSql)) {
     const name = bare(table);
+    definitions.set(name.toLowerCase(), Object.fromEntries(columns.map((c) => [c.name, c.definition])));
     // The probe keeps a quoted name's case ("Appointment"); the SQL reader lowers it.
     const seen = [...byName.keys()].some((k) => k.toLowerCase() === name.toLowerCase());
     if (!seen) {
@@ -158,8 +160,22 @@ async function phiTables(ctx: FixContext, probed: TableProbe[]): Promise<{ table
   const tables: PhiTable[] = [];
   for (const [name, t] of byName) {
     if (t.relation !== "table") continue;
-    const columns = phiColumns(name, t.columns);
+    const columns = phiColumns(name, t.columns, definitionsOf(definitions, name, t.columns));
     if (columns.length) tables.push(phiTable(name, "table", columns, t.foundIn, probed));
+  }
+  // Files that hang off a PHI record (document_pages.storage_path under documents) are part of it.
+  const records = new Set(tables.map((t) => bare(t.table).toLowerCase()));
+  for (const [name, t] of byName) {
+    if (t.relation !== "table" || records.has(name.toLowerCase())) continue;
+    const parent = t.columns.find((c) => {
+      const m = c.toLowerCase().match(/^(\w+)_id$/);
+      return m?.[1] !== undefined && [m[1], `${m[1]}s`, `${m[1]}es`].some((p) => records.has(p));
+    });
+    const files = fileColumns(t.columns);
+    if (parent && files.length) {
+      const columns = files.map((c) => ({ name: c, kind: "health" as const }));
+      tables.push(phiTable(name, "table", columns, t.foundIn, probed));
+    }
   }
   // A view over a PHI table shows the same data under the same column names.
   const known = new Map(tables.flatMap((t) => t.columns.map((c) => [c.name, c.kind] as const)));
@@ -179,6 +195,19 @@ async function phiTables(ctx: FixContext, probed: TableProbe[]): Promise<{ table
   return { tables, typesFile };
 }
 
+/** The create table definitions of `name` keyed by the probe's column names (the SQL reader lowers quoted names). */
+function definitionsOf(
+  all: Map<string, Record<string, string>>,
+  name: string,
+  columns: string[],
+): Record<string, string> {
+  const found = all.get(name.toLowerCase()) ?? {};
+  const lowered = new Map(Object.entries(found).map(([k, v]) => [k.toLowerCase(), v]));
+  return Object.fromEntries(
+    columns.flatMap((c) => (lowered.has(c.toLowerCase()) ? [[c, lowered.get(c.toLowerCase()) ?? ""]] : [])),
+  );
+}
+
 function phiTable(
   name: string,
   relation: "table" | "view",
@@ -188,12 +217,15 @@ function phiTable(
 ): PhiTable {
   const probe = probed.find((p) => p.name === name);
   const reads = probe?.checks.filter((c) => c.action === "select" && c.actor !== "owner") ?? [];
-  let access: Pick<PhiTable, "readBy" | "untested">;
+  let access: Pick<PhiTable, "readBy" | "untested" | "locked">;
   if (!probe || probe.skipped) access = { untested: foundIn.has("migrations") ? "not probed" : "not in migrations" };
   else if (reads.some((c) => c.rows > 0)) {
     access = { readBy: [...new Set(reads.filter((c) => c.rows > 0).map((c) => c.actor as "anon" | "other-user"))] };
-  } else if (reads.length && reads.every((c) => c.of > 0)) access = { readBy: [] };
-  else access = { untested: "no rows to test" };
+  } else if (reads.length && reads.every((c) => c.of > 0)) {
+    // "Nobody else reads it" only counts when user A still reads their own rows (positive check).
+    const own = probe.access.find((a) => a.who === "owner" && a.action === "select");
+    access = own && own.rows === 0 && !own.inconclusive ? { readBy: [], locked: true } : { readBy: [] };
+  } else access = { untested: "no rows to test" };
   return {
     table: `public.${name}`,
     relation,

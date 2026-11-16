@@ -5,7 +5,7 @@ import type { RawFinding } from "../types.ts";
 /** Columns that tie a row to one user. Audit columns (created_by, updated_by) are left out: they name an editor. */
 const OWNER_COLUMN = /^(user_id|owner_id|profile_id|patient_id|author_id|account_id|member_id|customer_id|uid)$/i;
 /** Columns about a person, beyond the PHI map: contact details and network identifiers. */
-const PERSONAL_COLUMN =
+export const PERSONAL_COLUMN =
   /^(full_name|first_name|last_name|email|e_?mail_address|phone|phone_number|mobile\w*|address|street\w*|ip_address|ip)$/i;
 
 /** Columns of a pricing table: a plan table with none of them is a care or diet plan, not a paid tier. */
@@ -59,6 +59,12 @@ export function addStaticContext(raws: RawFinding[], sql: SqlFile[]): void {
 
 /** Static context that lowers a finding's severity, with the sentence that says why in the report. */
 export function contextNote(raw: RawFinding): string | undefined {
+  if (raw.proof?.publicListing && !raw.phi?.length && raw.live?.verdict !== "leak") {
+    return `Visitors only read these organization rows, through policy "${raw.proof.publicListing}" written for visitors, and the table has no personal or health columns: it reads as a public listing (opening hours, services, a store's products). Confirm that, and that nothing private is added to it later.`;
+  }
+  if (raw.proof?.anonInsertByDesign && raw.live?.verdict !== "leak") {
+    return "The table has no owner column and visitors may insert only the columns a `grant insert (...) to anon` lists, so anonymous writes look intended (telemetry, a contact form). Nothing can be read or changed. Anyone can still fill it with junk: add a rate limit or a check on the values.";
+  }
   const c = raw.context;
   if (!c || proofTestsClaim(raw) || raw.proof?.leaks.length || raw.live?.verdict === "leak") return undefined;
   if (raw.rule === "rls-permissive-policy" && c.tableOwned === false && c.tablePersonal === false && !raw.phi?.length) {
