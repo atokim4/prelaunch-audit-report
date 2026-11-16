@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { plainRisk, repoRuleTable, RUBRIC } from "../rubric.ts";
+import { HIPAA_DOCS_URL } from "../scanners/phi.ts";
+import { PHI_RUBRIC, plainRisk, repoRuleTable, RUBRIC } from "../rubric.ts";
 import {
   SEVERITIES,
   type Action,
@@ -14,6 +15,7 @@ import {
   type LiveResult,
   type LiveTable,
   type LiveVerdict,
+  type PhiResult,
   type ProbeCheck,
   type Proof,
   type Severity,
@@ -278,6 +280,62 @@ function liveNote(f: Finding, live: LiveTable | LiveBucket, drift: LiveDrift[]):
   return `<p class="probe-after">Reads on the live project: ${label}. ${prose(live.summary)}${extra}</p>`;
 }
 
+/** High findings that have no patch because the fix is a decision, not a code change. */
+const NO_PATCH: Record<string, string> = {
+  "phi-vendor-egress":
+    "No patch: the fix is a decision only you can make (sign a BAA with the vendor, or stop sending these fields), so no diff is offered.",
+  "phi-table-unmanaged":
+    "No patch: the table's real policies live only in the database. Pull them into a migration first; the scan can then test and patch them.",
+  "phi-session-replay": "No patch for this vendor: remove the script from the pages that show health data.",
+};
+
+const STATUS_LABEL = { ok: "ok", gap: "gap", confirm: "confirm" } as const;
+
+function phiHtml(phi: PhiResult): string {
+  const readCell = (t: PhiResult["tables"][number]): string => {
+    if (!t.readBy)
+      return `<td class="pc pc-unknown">${t.untested === "no rows to test" ? "no rows to test" : "not tried"}</td>`;
+    if (!t.readBy.length) return `<td class="pc pc-ok">nobody</td>`;
+    const who = t.readBy.map((a) => (a === "anon" ? "visitor" : "user B")).join(", ");
+    return `<td class="pc pc-leak">${esc(who)}</td>`;
+  };
+  const rows = phi.tables
+    .map(
+      (t) =>
+        `<tr><td><code>${esc(t.table.replace(/^public\./, ""))}</code>${t.relation === "view" ? ' <span class="kind">view</span>' : ""}${t.foundIn.includes("migrations") ? "" : ' <span class="kind">types only</span>'}</td><td>${t.columns
+          .map((c) => `<code class="phi-${c.kind}">${esc(c.name)}</code>`)
+          .join(
+            " ",
+          )}</td>${readCell(t)}<td class="pc ${t.relation === "view" ? "pc-na" : t.audited ? "pc-ok" : "pc-leak"}">${t.relation === "view" ? "–" : t.audited ? "yes" : "no"}</td></tr>`,
+    )
+    .join("");
+  const trackers = phi.trackers.length
+    ? `<h4>Third-party scripts on pages with health data</h4><ul class="plain">${phi.trackers
+        .map(
+          (t) =>
+            `<li><b>${esc(t.vendor)}</b>${t.replay ? " (can record the screen)" : ""}, loaded in <code>${esc(`${t.file}:${t.line}`)}</code>, runs on ${t.pages.map((p) => `<code>${esc(p)}</code>`).join(", ")}.</li>`,
+        )
+        .join("")}</ul>`
+    : "";
+  const controls = phi.controls
+    .map(
+      (c) =>
+        `<tr><td>${esc(c.control)}</td><td>${c.where === "repo" ? "checked in the code" : "dashboard"}</td><td class="st st-${c.status}">${STATUS_LABEL[c.status]}</td><td>${esc(c.detail)}</td></tr>`,
+    )
+    .join("");
+  return `<section class="part phi">
+    <h2>Health data</h2>
+    <p>This run used the health-data mode. It finds protected health information (PHI) by column name, checks who could read it in the RLS probe, and follows it into scripts, vendor calls, logs and storage. It is a technical scan, not a HIPAA compliance assessment, and nothing in it is legal advice.</p>
+    <h4>Where health data lives</h4>
+    <p class="probe-what">Columns in <span class="phi-health">dark</span> hold clinical content; the others identify the patient. "Read by others" is what the local probe saw when it gave user A one row and read as a visitor and as user B. Check this map against your schema: a column the names do not give away is not in it.</p>
+    <table class="matrix phi-map"><thead><tr><th>Table</th><th>PHI columns</th><th>Read by others</th><th>Audit trigger</th></tr></thead><tbody>${rows}</tbody></table>
+    ${trackers}
+    <h4>Supabase HIPAA customer controls</h4>
+    <p class="probe-what">Supabase lists these as the customer's side of storing health data (<a href="${HIPAA_DOCS_URL}">shared responsibility model</a>, read ${esc(date(`${phi.docsReadOn}T00:00:00Z`))}), plus the two rows at the end that come from this scan. Most are dashboard settings the code cannot show; "confirm" means check it yourself before launch.</p>
+    <table class="controls"><thead><tr><th>Control</th><th>Where</th><th>Status</th><th>What the scan saw</th></tr></thead><tbody>${controls}</tbody></table>
+  </section>`;
+}
+
 function findingHtml(f: Finding, drift: LiveDrift[]): string {
   const patch = f.patch
     ? `<section class="patch">
@@ -288,7 +346,11 @@ function findingHtml(f: Finding, drift: LiveDrift[]): string {
         <p class="check">${f.patch.verified ? "Applies cleanly to the audited code (<code>git apply --check</code>)." : "Did not pass <code>git apply --check</code>: apply by hand."}</p>
         ${f.patch.caveats.length ? `<ul class="caveats">${f.patch.caveats.map((c) => `<li>${prose(c)}</li>`).join("")}</ul>` : ""}
       </section>`
-    : "";
+    : f.severity === "critical" || f.severity === "high"
+      ? NO_PATCH[f.rule]
+        ? `<p class="partial"><b>No patch.</b> ${prose(NO_PATCH[f.rule]?.replace(/^No patch[^:]*: /, "") ?? "")}</p>`
+        : ""
+      : "";
   return `<article class="finding" id="${f.id}">
     <aside class="apparatus">
       <p class="fid">${f.id}</p>
@@ -304,6 +366,7 @@ function findingHtml(f: Finding, drift: LiveDrift[]): string {
       <p class="where"><code>${esc(where(f))}</code></p>
       ${f.evidence ? `<p class="evidence">${prose(f.evidence)}</p>` : ""}
       ${f.snippet ? `<pre class="snippet"><code>${esc(f.snippet)}</code></pre>` : ""}
+      ${f.phi?.length ? `<p class="also">Health data involved: ${f.phi.map((c) => `<code>${esc(c)}</code>`).join(", ")}.</p>` : ""}
       ${f.alsoFlaggedBy.length ? `<p class="also">Also flagged by <code>${f.alsoFlaggedBy.map(esc).join("</code>, <code>")}</code> on the same object.</p>` : ""}
       <h4>Why it matters</h4>
       <p>${prose(f.whyItMatters)}</p>
@@ -445,6 +508,17 @@ h2{break-after:avoid}
 .partial{font-size:9.5pt;border-left:2px solid var(--high);padding-left:3mm}
 .partial b{color:var(--high)}
 .live-matrix th:first-child{width:24%}
+.phi-map td:nth-child(2) code{font-size:8pt;color:var(--ink-2);margin-right:1mm}
+.phi-map code.phi-health,.phi-health{color:var(--ink);font-weight:600}
+.controls{table-layout:fixed;width:100%}
+.controls td:first-child{white-space:normal;padding-right:3mm}
+.controls th:nth-child(1){width:38%}.controls th:nth-child(2){width:15%}.controls th:nth-child(3){width:11%}
+.controls td:nth-child(2){color:var(--ink-2);font-size:8.5pt}
+.st{font-weight:600;text-transform:uppercase;font-size:7.5pt;letter-spacing:.05em;white-space:nowrap}
+.st-gap{color:var(--critical)}
+.st-ok{color:var(--ink-2)}
+.st-confirm{color:var(--medium)}
+ul.plain{padding-left:4mm}
 .kind{font-size:7.5pt;color:var(--ink-2);text-transform:uppercase;letter-spacing:.05em}
 `;
 
@@ -469,7 +543,7 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
   const partial = findings.filter((f) => f.patch?.verified && f.patch.partial).length;
 
   const cover = `<section class="cover">
-    <div class="mast"><span>Automated scan with patches</span><span>${esc(date(result.generatedAt))}</span></div>
+    <div class="mast"><span>Automated scan with patches${result.phi ? " · health-data mode" : ""}</span><span>${esc(date(result.generatedAt))}</span></div>
     <h1>Pre-launch security audit</h1>
     <p class="app">${esc(result.app.name)}${result.app.url ? ` · <code>${esc(result.app.url)}</code>` : ""}</p>
     ${options.note ? `<p class="note">${esc(options.note)}</p>` : ""}
@@ -486,6 +560,7 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
         <li>Credentials in the files and in git history.</li>
         ${result.tools.some((t) => t.name === "npm audit" && t.status === "ok") ? "<li>Runtime dependencies against npm's advisory database.</li>" : ""}
         ${result.live ? `<li>The live Supabase project, read-only and with consent: ${result.live.tables.length} tables and views${result.live.buckets.length ? ` and ${result.live.buckets.length} storage bucket${result.live.buckets.length === 1 ? "" : "s"}` : ""} counted as a visitor and two test users.</li>` : ""}
+        ${result.phi ? `<li>Health data: ${result.phi.tables.length} tables and views with PHI by column name, scripts on the pages that show it, server calls to AI, email and SMS vendors, function logs, public buckets, audit triggers, and Supabase's HIPAA checklist.</li>` : ""}
         ${result.app.url ? "<li>The live site: HTTPS, security headers, cookies, exposed files, keys in JS bundles.</li>" : ""}
       </ul></div>
       <div><h4>What was not checked</h4><ul>${result.notChecked.map((n) => `<li>${prose(n)}</li>`).join("")}</ul></div>
@@ -519,7 +594,7 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
     ${result.probe?.length ? matrixHtml(result.probe) : ""}
   </section>`;
 
-  const liveSection = result.live ? liveHtml(result.live) : "";
+  const liveSection = (result.phi ? phiHtml(result.phi) : "") + (result.live ? liveHtml(result.live) : "");
   const details = `<section class="part"><h2>Findings</h2>${findings.map((f) => findingHtml(f, result.live?.drift ?? [])).join("")}</section>`;
 
   const appendix = `<section class="part appendix">
@@ -527,6 +602,7 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
     <h4>How severity is rated</h4>
     <p>Each rule is placed by the first line that fits. Live-site findings keep the severity apify-launch-audit gives them. When the RLS probe ran, the severity follows what it could really do: a visitor reading user rows is Critical even if the policy only looked suspicious, and an open read on a table with no owner column and no write leak is Low. Dependency advisories are one level below npm's rating, because the scan does not prove your code reaches the affected function.</p>
     <table><tbody>${RUBRIC.map((r) => `<tr><td>${tag(r.severity)}</td><td>${esc(r.rule)}</td></tr>`).join("")}</tbody></table>
+    ${result.phi ? `<p>With the health-data mode on, these come first:</p><table><tbody>${PHI_RUBRIC.map((r) => `<tr><td>${tag(r.severity)}</td><td>${esc(r.rule)}</td></tr>`).join("")}</tbody></table>` : ""}
     <h4>Tools</h4>
     <table><thead><tr><th>Tool</th><th>Version</th><th>What ran</th></tr></thead><tbody>${result.tools
       .map(

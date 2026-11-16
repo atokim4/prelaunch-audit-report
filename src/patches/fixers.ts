@@ -678,7 +678,102 @@ const liveStorageLeak: Fixer = async (finding, ctx) => {
   };
 };
 
+/**
+ * An append-only audit trail for the PHI tables: one row per insert, update and delete with the user id
+ * from auth.uid(), the operation and the row id. No row values are copied, so the log holds no PHI.
+ * The API roles cannot read, change or delete it; a guard trigger stops updates and deletes by anyone.
+ */
+const phiNoAuditLog: Fixer = async (finding, ctx) => {
+  const tables = [...finding.evidence.matchAll(/`([^`]+)`/g)].map((m) => qualify(m[1] ?? ""));
+  if (!tables.length) return undefined;
+  const body = [
+    "create table if not exists public.phi_audit_log (",
+    "  id bigint generated always as identity primary key,",
+    "  at timestamptz not null default now(),",
+    "  actor uuid,",
+    "  actor_role text not null,",
+    "  table_name text not null,",
+    "  op text not null check (op in ('INSERT', 'UPDATE', 'DELETE')),",
+    "  row_id text",
+    ");",
+    "",
+    "alter table public.phi_audit_log enable row level security;",
+    "revoke all on table public.phi_audit_log from public, anon, authenticated, service_role;",
+    "grant select on table public.phi_audit_log to service_role;",
+    "",
+    "create or replace function public.phi_audit_write() returns trigger",
+    "  language plpgsql security definer set search_path = '' as $$",
+    "begin",
+    "  insert into public.phi_audit_log (actor, actor_role, table_name, op, row_id)",
+    "  values (",
+    "    auth.uid(),",
+    "    coalesce(nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role', session_user),",
+    "    tg_table_schema || '.' || tg_table_name,",
+    "    tg_op,",
+    "    (case when tg_op = 'DELETE' then to_jsonb(old) else to_jsonb(new) end) ->> 'id'",
+    "  );",
+    "  return null;",
+    "end;",
+    "$$;",
+    "",
+    "create or replace function public.phi_audit_append_only() returns trigger",
+    "  language plpgsql set search_path = '' as $$",
+    "begin",
+    "  raise exception 'phi_audit_log is append-only' using errcode = '42501';",
+    "end;",
+    "$$;",
+    "",
+    "revoke execute on function public.phi_audit_write() from public, anon, authenticated;",
+    "revoke execute on function public.phi_audit_append_only() from public, anon, authenticated;",
+    "",
+    "drop trigger if exists phi_audit_append_only on public.phi_audit_log;",
+    "create trigger phi_audit_append_only before update or delete or truncate on public.phi_audit_log",
+    "  for each statement execute function public.phi_audit_append_only();",
+    ...tables.flatMap((table) => [
+      "",
+      `drop trigger if exists phi_audit on ${publicRel(table)};`,
+      `create trigger phi_audit after insert or update or delete on ${publicRel(table)}`,
+      "  for each row execute function public.phi_audit_write();",
+    ]),
+  ];
+  return {
+    edits: [
+      migration(ctx, "phi_audit_log", `${finding.id}: append-only audit trail for the tables with health data.`, body),
+    ],
+    summary: `Adds public.phi_audit_log and a trigger on ${tables.join(", ")} that records who inserted, changed or deleted which row, and when. The log keeps ids only, no health data, and nobody can update or delete it.`,
+    caveats: [
+      "Postgres cannot log reads with a trigger. If you must record who viewed a record, turn on the pgaudit extension or log reads in a server function.",
+      "Changes made with the service role key (edge functions, scripts) are logged with actor_role service_role and no user id: pass the user's JWT to the client in edge functions when you want the person recorded.",
+      "Reading the log needs the service role (or a dashboard SQL query). Add a policy for an admin role if staff must see it in the app.",
+    ],
+  };
+};
+
+/** PostHog records sessions unless the init turns it off; the other replay vendors need their script removed. */
+const phiSessionReplay: Fixer = async (finding, ctx) => {
+  if (finding.subject !== "PostHog" || finding.location.kind !== "file") return undefined;
+  const path = finding.location.file;
+  const before = await ctx.read(path);
+  const init = before && /\bposthog\.init\s*\(/.exec(before);
+  if (!before || !init) return undefined;
+  const open = before.indexOf("{", init.index);
+  const close = before.indexOf(")", init.index);
+  if (open < 0 || (close >= 0 && close < open)) return undefined; // no options object to add the flag to
+  const indent = /\n([ \t]*)\S/.exec(before.slice(open))?.[1] ?? "  ";
+  const after = `${before.slice(0, open + 1)}\n${indent}disable_session_recording: true,${before.slice(open + 1)}`;
+  return {
+    edits: [{ path, before, after }],
+    summary: "Turns session recording off in the PostHog init, whatever the project setting says.",
+    caveats: [
+      "PostHog still gets page views and autocaptured clicks, which can include text from the page. Set `autocapture: false` and stop capturing on the logged-in pages unless PostHog signs a BAA with you.",
+    ],
+  };
+};
+
 export const FIXERS: Record<string, Fixer> = {
+  "phi-session-replay": phiSessionReplay,
+  "phi-no-audit-log": phiNoAuditLog,
+  "phi-public-bucket": storagePublicBucket,
   "live-rls-leak": liveRlsLeak,
   "live-storage-leak": liveStorageLeak,
   "rls-probe-leak": probeLeak,

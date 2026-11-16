@@ -1,0 +1,107 @@
+{
+  "$comment": "Ground truth for clinic-intake-app, a Lovable-shaped clinic demo written for the --phi tests. All data and names are made up. Holes are seeded on purpose; controls are done right and must not get a --phi finding (C04 may keep its vibe-preflight Medium, it holds logos).",
+  "holes": [
+    {
+      "id": "H01",
+      "kind": "phi-read-by-other-user",
+      "rule": "rls-probe-leak",
+      "target": { "object": "public.patients", "file": "supabase/migrations/20261116080000_patients.sql" },
+      "summary": "Select policy using (auth.role() = 'authenticated'): any signed-in user reads every patient's diagnosis, date of birth, MRN and insurance id. Critical with --phi (High without)."
+    },
+    {
+      "id": "H02",
+      "kind": "phi-view-bypasses-rls",
+      "rule": "view-bypasses-rls",
+      "target": { "object": "public.todays_schedule", "file": "supabase/migrations/20261116080100_appointments.sql" },
+      "summary": "View over appointments + patients without security_invoker: today's visits with reason and date of birth for every caller."
+    },
+    {
+      "id": "H03",
+      "kind": "phi-public-bucket",
+      "rule": "phi-public-bucket",
+      "target": { "object": "lab-results", "file": "supabase/migrations/20261116080400_storage.sql" },
+      "summary": "Public bucket for lab PDFs; src/lib/labs.ts uploads patient files and links the public URL."
+    },
+    {
+      "id": "H04",
+      "kind": "phi-session-replay",
+      "rule": "phi-session-replay",
+      "target": { "object": "PostHog", "file": "src/main.tsx" },
+      "summary": "posthog.init on every page with session_recording on and input masking off; the patient pages show diagnosis, DOB, MRN."
+    },
+    {
+      "id": "H05",
+      "kind": "phi-analytics",
+      "rule": "phi-analytics",
+      "target": { "object": "Google Analytics", "file": "index.html" },
+      "summary": "gtag.js in index.html runs on the patient pages too."
+    },
+    {
+      "id": "H06",
+      "kind": "phi-vendor-egress",
+      "rule": "phi-vendor-egress",
+      "target": { "object": "OpenAI", "file": "supabase/functions/summarize-visit/index.ts" },
+      "summary": "Edge function sends the visit reason and clinical notes to the OpenAI API."
+    },
+    {
+      "id": "H07",
+      "kind": "phi-vendor-egress",
+      "rule": "phi-vendor-egress",
+      "target": { "object": "Resend", "file": "supabase/functions/send-reminder/index.ts" },
+      "summary": "Reminder email through Resend carries the visit reason."
+    },
+    {
+      "id": "H08",
+      "kind": "phi-in-logs",
+      "rule": "phi-in-logs",
+      "target": { "object": "logs", "file": "supabase/functions/send-reminder/index.ts" },
+      "summary": "console.log of the whole appointment row (with the patient embed) and console.error of the patient on failure."
+    },
+    {
+      "id": "H09",
+      "kind": "phi-no-audit-log",
+      "rule": "phi-no-audit-log",
+      "target": { "object": "phi-audit-log", "file": "supabase/migrations/20261116080100_appointments.sql" },
+      "summary": "No trigger records who changed patients, appointments or prescriptions."
+    },
+    {
+      "id": "H10",
+      "kind": "phi-table-unmanaged",
+      "rule": "phi-table-unmanaged",
+      "target": { "object": "public.intake_forms", "file": "src/integrations/supabase/types.ts" },
+      "summary": "intake_forms (symptoms, allergies) is in the generated types only: made in the dashboard, policies unknown."
+    }
+  ],
+  "controls": [
+    {
+      "id": "C01",
+      "kind": "phi-table-scoped-to-owner",
+      "target": { "object": "public.prescriptions", "file": "supabase/migrations/20261116080200_prescriptions.sql" },
+      "summary": "Policies go through the parent patient's clinician_id = auth.uid(); the probe must see no leak."
+    },
+    {
+      "id": "C02",
+      "kind": "public-reference-table",
+      "target": { "object": "public.clinic_locations", "file": "supabase/migrations/20261116080300_clinic_locations.sql" },
+      "summary": "Clinic addresses, public on purpose: Low at most."
+    },
+    {
+      "id": "C03",
+      "kind": "vendor-call-without-phi",
+      "target": { "object": "Anthropic", "file": "supabase/functions/clinic-blurb/index.ts" },
+      "summary": "Sends a clinic's public description to the Anthropic API and logs only the location id: no PHI egress, no PHI log."
+    },
+    {
+      "id": "C04",
+      "kind": "public-bucket-without-phi",
+      "target": { "object": "clinic-logos", "file": "supabase/migrations/20261116080400_storage.sql" },
+      "summary": "Public logos bucket: --phi must not raise it."
+    },
+    {
+      "id": "C05",
+      "kind": "page-without-phi",
+      "target": { "object": "src/pages/Locations.tsx", "file": "src/pages/Locations.tsx" },
+      "summary": "A page without health data: not listed among the pages trackers see PHI on."
+    }
+  ]
+}

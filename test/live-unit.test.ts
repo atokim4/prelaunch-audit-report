@@ -82,6 +82,7 @@ describe("generated types", () => {
       name: "deals",
       kind: "table",
       rls: true,
+      columns: ["id", "owner_id"],
       ownerColumns: ["owner_id"],
       checks: [],
       policies: [],

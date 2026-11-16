@@ -32,6 +32,25 @@ export const RUBRIC: { severity: Severity; rule: string }[] = [
   },
 ];
 
+/**
+ * Extra placement with --phi (health data). Health records count as the most private data there is, so a
+ * read of them by anyone but the people they belong to is Critical even when only a signed-in user gets it.
+ */
+export const PHI_RUBRIC: { severity: Severity; rule: string }[] = [
+  {
+    severity: "critical",
+    rule: "Someone other than the record's own account (a visitor, or any other signed-in user) can read health data, or health files sit in a public bucket.",
+  },
+  {
+    severity: "high",
+    rule: "Health data leaves for a vendor that must sign a Business Associate Agreement (BAA) first: session replay, AI, email or SMS APIs; or a table with health data whose access rules the repo does not show.",
+  },
+  {
+    severity: "medium",
+    rule: "Health data in function logs, page-view analytics on pages that show it, or no audit trail of who changed health records.",
+  },
+];
+
 const cwe = (id: number, name: string): Cwe => ({ id, name });
 
 const CWE = {
@@ -55,6 +74,9 @@ const CWE = {
   infoExposure: cwe(200, "Exposure of Sensitive Information to an Unauthorized Actor"),
   debugCode: cwe(489, "Active Debug Code"),
   sourceExposure: cwe(540, "Inclusion of Sensitive Information in Source Code"),
+  logFile: cwe(532, "Insertion of Sensitive Information into Log File"),
+  insufficientLogging: cwe(778, "Insufficient Logging"),
+  accessControl: cwe(284, "Improper Access Control"),
 } as const;
 
 export interface RuleInfo {
@@ -258,6 +280,73 @@ const LIVE: Record<string, RuleInfo> = {
   },
 };
 
+/** The --phi pass. None of these say the app is or is not HIPAA compliant: they name a gap to close. */
+const PHI: Record<string, RuleInfo> = {
+  "phi-session-replay": {
+    title: "Session replay records pages that show health data",
+    severity: fixed("high"),
+    cwe: CWE.privateInfo,
+    whyItMatters:
+      "A session replay script copies what is on the screen (text, form fields, clicks) to the vendor's servers so you can watch visits back. On these pages that is patients' health data. Under HIPAA the vendor then needs a signed Business Associate Agreement (BAA), and many analytics vendors do not sign one for every plan.",
+    fix: "Do not load the script on pages that show health data (or at all in the logged-in app). If you keep it, use a plan for which the vendor signs a BAA, sign it, and turn on masking of all text and inputs.",
+    effort: "under 1 hour",
+  },
+  "phi-analytics": {
+    title: "Third-party script on pages that show health data",
+    severity: fixed("medium"),
+    cwe: CWE.privateInfo,
+    whyItMatters:
+      "The script runs with full access to every page it loads on and sends page addresses and events to its vendor. On pages with health data, an address like /patients/<id> or an event with a field value already says something about a patient, which HIPAA counts as health information.",
+    fix: "Load analytics only on the public marketing pages, not in the logged-in app. If you need product analytics inside the app, pick a vendor that signs a BAA and send events without patient ids or field values.",
+    effort: "under 1 hour",
+  },
+  "phi-vendor-egress": {
+    title: "Health data sent to a vendor that must sign a BAA",
+    severity: fixed("high"),
+    cwe: CWE.privateInfo,
+    whyItMatters:
+      "This server code reads health records and sends a request to an outside API (AI, email or SMS). Under HIPAA that vendor is a business associate: without a signed BAA for the exact product you call, sending it patient data is a disclosure the law does not allow, whatever the vendor's own security.",
+    fix: "Check whether the vendor signs a BAA for this API, sign it before launch, and send only the fields the call needs. Where there is no BAA, send no patient fields (for email and SMS: 'You have a new message, sign in to read it').",
+    effort: "1-4 hours",
+  },
+  "phi-in-logs": {
+    title: "Health data written to function logs",
+    severity: fixed("medium"),
+    cwe: CWE.logFile,
+    whyItMatters:
+      "Everything an edge function prints goes to the Supabase logs, which anyone with dashboard access can read and which are kept outside your tables, policies and audit trail. Logged patient records are health data in a place nobody reviews.",
+    fix: "Log ids and outcomes only (`appointment ${id}: reminder sent`), never whole rows or fields from health tables.",
+    effort: "under 1 hour",
+  },
+  "phi-public-bucket": {
+    title: "Health files in a public storage bucket",
+    severity: fixed("critical"),
+    cwe: CWE.filesExposed,
+    whyItMatters:
+      "Every file in a public bucket opens for anyone who has its address, with no sign-in. Supabase's own HIPAA checklist says not to keep health data in public buckets. Lab results and scans with a predictable path are one guess away.",
+    fix: "Make the bucket private, limit reads to the owner's folder with a policy on `storage.objects`, and show files through short-lived signed URLs created after checking who is asking.",
+    effort: "1-4 hours",
+  },
+  "phi-table-unmanaged": {
+    title: "Table with health data has no migration",
+    severity: fixed("high"),
+    cwe: CWE.accessControl,
+    whyItMatters:
+      "The app's generated types show this table, so it exists on the live project, but no migration in the repo creates it or sets its policies. It was most likely made in the Supabase dashboard. Nobody reviewing the code can tell who may read these health records, and the RLS probe could not try it.",
+    fix: "Run `supabase db pull` to get the table and its policies into a migration, check that every policy compares the owner with `auth.uid()`, and run this audit again (or with --live) to test it.",
+    effort: "1-4 hours",
+  },
+  "phi-no-audit-log": {
+    title: "No audit trail for changes to health records",
+    severity: fixed("medium"),
+    cwe: CWE.insufficientLogging,
+    whyItMatters:
+      "The HIPAA Security Rule asks for audit controls: a record of who created, changed or deleted health data and when. Nothing in the migrations writes one, so after a mistake or a breach there is no way to tell who did what.",
+    fix: "Add an append-only audit table that a trigger fills on every insert, update and delete of the health tables, with the user id from `auth.uid()`, and that nobody, including the app, can update or delete.",
+    effort: "1-4 hours",
+  },
+};
+
 /** What the RLS probe class means in plain words, for findings no static rule explains. */
 const PROBE_CLASS: Record<string, { title: string; why: string; fix: string }> = {
   anon: {
@@ -284,6 +373,24 @@ const PROBE_CLASS: Record<string, { title: string; why: string; fix: string }> =
 
 /** Rows belong to someone: an owner column, or a parent row that has one. */
 const owned = (proof: Proof): boolean => proof.ownerColumns.length > 0 || proof.ownedVia !== undefined;
+
+/** Static rules that mean other people can read the rows, unless a probe shows otherwise. */
+const OPEN_READ = new Set(["rls-disabled", "view-bypasses-rls", "auth-users-exposed"]);
+
+/**
+ * Someone who is not the row's owner could read it: the local or live probe saw it, or a static rule says
+ * so and the probe did not show both a visitor and a second user getting none of rows that were there.
+ */
+function readByOthers(raw: RawFinding): boolean {
+  if (raw.proof?.leaks.some((c) => c.action === "select" && c.actor !== "owner")) return true;
+  if (raw.live?.verdict === "leak") return true;
+  const staticRead =
+    OPEN_READ.has(raw.rule) || (raw.rule === "rls-permissive-policy" && /\(select\)/.test(raw.message));
+  if (!staticRead) return false;
+  const reads = raw.proof?.checks.filter((c) => c.action === "select" && c.actor !== "owner") ?? [];
+  const blocked = reads.length >= 2 && reads.every((c) => c.of > 0 && c.rows === 0);
+  return !blocked;
+}
 
 /** Severity of what the probe could do: the rubric applied to measured access instead of policy text. */
 export function proofSeverity(proof: Proof): Severity | undefined {
@@ -319,7 +426,7 @@ export function liveSeverity(live: LiveTable | LiveBucket | undefined): Severity
 export function severityOf(raw: RawFinding, info: RuleInfo): Severity {
   const base = max(info.severity(raw), liveSeverity(raw.live));
   const proof = raw.proof;
-  if (!proof) return base;
+  if (!proof) return raw.phi?.length && readByOthers(raw) ? "critical" : base;
   const sharedRead =
     raw.rule === "rls-permissive-policy" &&
     /\(select\)/.test(raw.message) &&
@@ -328,7 +435,8 @@ export function severityOf(raw: RawFinding, info: RuleInfo): Severity {
     !proof.checks.some((c) => c.inconclusive) &&
     !liveSeverity(raw.live);
   if (sharedRead) return "low";
-  return max(base, proofSeverity(proof));
+  const measured = max(base, proofSeverity(proof));
+  return raw.phi?.length && readByOthers(raw) ? "critical" : measured;
 }
 
 /** CWE for launch-audit ids, by exact id or by prefix. */
@@ -424,6 +532,8 @@ export function ruleInfo(raw: RawFinding): RuleInfo | undefined {
       return launchAuditInfo(raw);
     case "live-probe":
       return LIVE[raw.rule];
+    case "phi-scan":
+      return PHI[raw.rule];
   }
 }
 
@@ -434,6 +544,7 @@ export function repoRuleTable(): { source: string; rule: string; title: string; 
     ...Object.entries(SECRETS).map(([rule, info]) => ({ source: "secret-scan", rule, ...info })),
     ...Object.entries(PROJECT_CONFIG).map(([rule, info]) => ({ source: "project-config", rule, ...info })),
     ...Object.entries(LIVE).map(([rule, info]) => ({ source: "live-probe", rule, ...info })),
+    ...Object.entries(PHI).map(([rule, info]) => ({ source: "phi-scan (--phi)", rule, ...info })),
     ...Object.entries(PROBE_CLASS).map(([kind, text]) => ({
       source: "rls-probe",
       rule: `rls-probe-leak (${kind})`,
@@ -465,6 +576,14 @@ const PLAIN_RISK: Record<string, string> = {
   "dependency-advisory": "A library your app ships has a published security advisory for the version you use.",
   "stripe-webhook-jwt-gate": "Supabase turns away Stripe's payment messages, so paying customers may not get access.",
   "live-storage-leak": "One customer can list the files another customer uploaded.",
+  "phi-session-replay": "A recording script copies what patients' records show on screen to an analytics company.",
+  "phi-analytics": "An analytics script runs on the pages that show patients' records.",
+  "phi-vendor-egress":
+    "Patient details are sent to an outside AI or messaging company that has to sign a HIPAA agreement first.",
+  "phi-in-logs": "Patient records are printed into server logs that anyone on the dashboard can read.",
+  "phi-public-bucket": "Patients' uploaded medical files can be opened by anyone with the link.",
+  "phi-table-unmanaged": "A table with patient data was made outside the code, so nobody can see who may read it.",
+  "phi-no-audit-log": "There is no record of who changed or deleted a patient's data.",
 };
 
 const PROBE_RISK: Record<string, string> = {
@@ -481,6 +600,7 @@ export function plainRisk(finding: {
   title: string;
   subject?: string;
   proof?: Proof;
+  phi?: string[];
 }): string {
   const stripeKey = /STRIPE/i.test(finding.subject ?? "");
   if (stripeKey && finding.rule === "server-secret-in-client") {
@@ -493,6 +613,13 @@ export function plainRisk(finding: {
     return finding.severity === "critical"
       ? "On the running app, visitors without an account can read your users' records."
       : "On the running app, one customer can read another customer's records.";
+  }
+  if (finding.phi?.length && finding.severity === "critical" && finding.source !== "phi-scan") {
+    return /view/i.test(finding.title) || finding.proof?.kind === "view"
+      ? "A database view shows patients' health records to people who should not see them."
+      : finding.proof?.leaks.some((c) => c.actor === "anon")
+        ? "Visitors without an account can read patients' health records."
+        : "Any signed-in user can read other patients' health records.";
   }
   if (finding.source === "rls-probe") {
     const kind = finding.proof && proofClass(finding.proof);

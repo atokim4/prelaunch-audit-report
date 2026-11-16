@@ -4,7 +4,13 @@ import { ruleInfo, severityOf } from "./rubric.ts";
 import { SEVERITIES, SEVERITY_RANK, type Finding, type RawFinding, type Severity } from "./types.ts";
 
 /** When two rules flag the same object with the same severity, the more specific one names the finding. */
-const SPECIFICITY = ["auth-users-exposed", "definer-function-anon", "storage-public-bucket", "server-secret-in-client"];
+const SPECIFICITY = [
+  "phi-public-bucket",
+  "auth-users-exposed",
+  "definer-function-anon",
+  "storage-public-bucket",
+  "server-secret-in-client",
+];
 
 function dedupeKey(raw: RawFinding): string {
   const where = raw.location.kind === "file" ? raw.location.file : raw.location.url;
@@ -106,6 +112,7 @@ export async function normalize(repo: string, raws: RawFinding[]): Promise<{ fin
       subject: lead.raw.source === "launch-audit" ? undefined : lead.raw.subject,
       proof: group.find((g) => g.raw.proof)?.raw.proof,
       live: group.find((g) => g.raw.live)?.raw.live,
+      ...(group.some((g) => g.raw.phi) ? { phi: group.find((g) => g.raw.phi)?.raw.phi } : {}),
       alsoFlaggedBy: others,
     });
   }

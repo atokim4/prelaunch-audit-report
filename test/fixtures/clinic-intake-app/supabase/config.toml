@@ -1,0 +1,13 @@
+project_id = "clinic-intake-demo"
+
+[api]
+schemas = ["public"]
+
+[functions.summarize-visit]
+verify_jwt = true
+
+[functions.send-reminder]
+verify_jwt = true
+
+[functions.clinic-blurb]
+verify_jwt = true

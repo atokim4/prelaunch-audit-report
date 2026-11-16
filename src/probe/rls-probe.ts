@@ -26,6 +26,8 @@ export interface TableProbe {
   name: string;
   kind: "table" | "view";
   rls: boolean;
+  /** Every column name, in table order. */
+  columns: string[];
   /** Columns that tie a row to a user directly. */
   ownerColumns: string[];
   /** No owner column, but a foreign key to a table that has one: the row belongs to the parent's owner. */
@@ -607,6 +609,7 @@ export async function probeRls(migrations: SqlFile[]): Promise<ProbeResult> {
         name: info.name,
         kind: info.kind,
         rls: info.rls,
+        columns: info.columns.map((c) => c.name),
         ownerColumns: info.ownerColumns,
         ...(info.ownedVia ? { ownedVia: info.ownedVia } : {}),
         policies: info.kind === "table" ? await policiesOf(db, info.name) : [],

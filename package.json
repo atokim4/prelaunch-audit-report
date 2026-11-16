@@ -1,6 +1,6 @@
 {
   "name": "prelaunch-audit-report",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Turns repo scanners, a Row Level Security probe in PGlite, an optional read-only probe of the live Supabase project and live-URL checks into a severity-rated pre-launch audit report (JSON, HTML, PDF) with verified patch diffs, for Next.js or Vite/React + Supabase + Stripe apps. Personal project.",
   "private": true,
   "type": "module",
@@ -22,7 +22,8 @@
     "check": "npm run typecheck && npm run lint && npm run format:check && npm test",
     "sample": "node src/cli.ts test/fixtures/broken-notes-app --out examples/sample-report --date 2026-11-09T09:00:00Z --note \"Sample report. broken-notes-app is a small Next.js + Supabase + Stripe demo written with security holes on purpose for this repo's tests (test/fixtures/broken-notes-app). Every finding below is real tool output on that code. It is not a client project.\"",
     "sample:vite": "node scripts/sample-live.ts",
-    "postgrest": "sh scripts/fetch-postgrest.sh"
+    "postgrest": "sh scripts/fetch-postgrest.sh",
+    "sample:phi": "node src/cli.ts test/fixtures/clinic-intake-app --phi --skip-npm-audit --out examples/sample-report-clinic-phi --date 2026-11-16T09:00:00Z --note \"Sample report. clinic-intake is a small Lovable-shaped clinic app (Vite + React, Supabase, Deno edge functions) written with health-data holes on purpose for this repo's tests (test/fixtures/clinic-intake-app). All patients and data in it are made up. Every finding below is real tool output on that code. It is not a client project.\""
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "5.3.0",

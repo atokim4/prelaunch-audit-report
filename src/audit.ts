@@ -7,11 +7,12 @@ import { attachPatches, fixContext, patchedMigrations } from "./patches/index.ts
 import { runLaunchAudit } from "./scanners/launch-audit.ts";
 import { mergeLive, runLiveProbe, type LiveOptions } from "./scanners/live-probe.ts";
 import { runNpmAudit } from "./scanners/npm-audit.ts";
+import { markPhi, runPhiScan } from "./scanners/phi.ts";
 import { runPreflight } from "./scanners/preflight.ts";
 import { mergeProbe, runRlsProbe, toProof } from "./scanners/rls-probe.ts";
 import { runSecretScan } from "./scanners/secrets.ts";
 import { detectShape, edgeConfigFindings } from "./shape.ts";
-import type { AuditResult, LiveResult, Proof, RawFinding, ToolRun } from "./types.ts";
+import type { AuditResult, LiveResult, PhiResult, Proof, RawFinding, ToolRun } from "./types.ts";
 
 export interface AuditOptions {
   repo: string;
@@ -26,7 +27,15 @@ export interface AuditOptions {
   npmAudit?: boolean;
   /** Read-only probe of the client's own Supabase project. The CLI asks for explicit consent first. */
   live?: LiveOptions;
+  /** Health-data mode: PHI map, PHI leaving for vendors, logs and buckets, audit trail, HIPAA checklist. */
+  phi?: boolean;
 }
+
+const PHI_NOT_CHECKED = [
+  "HIPAA compliance as a whole: this report finds technical gaps in the code. Compliance also needs a risk analysis, policies, staff training and signed agreements, and only a qualified person can sign it off. Nothing here is legal advice.",
+  "Health data under column names the map does not know: PHI is found by names such as diagnosis, date_of_birth or mrn. Check the PHI map against your schema.",
+  "Who reads health records: Postgres triggers log changes, not reads. Read logging needs pgaudit or server-side code.",
+];
 
 const LIVE_NOT_CHECKED =
   "The live database: policies or grants changed in the Supabase dashboard and not saved as migrations are invisible to a repo scan. The RLS probe runs your migrations in a local Postgres, not against your project.";
@@ -96,6 +105,19 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
   }
   if (secrets.tool.note) notChecked.unshift(secrets.tool.note);
 
+  let phi: PhiResult | undefined;
+  if (options.phi) {
+    const scan = await runPhiScan(
+      ctx,
+      (probe.result?.tables ?? []).filter((t) => !t.skipped),
+    );
+    tools.push(scan.tool);
+    markPhi(raws, scan.result.tables);
+    raws.push(...scan.findings);
+    phi = scan.result;
+    notChecked.push(...PHI_NOT_CHECKED);
+  }
+
   if (options.url) {
     const live = await runLaunchAudit({
       url: options.url,
@@ -143,6 +165,7 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
     tools,
     probe: matrix,
     ...(live ? { live } : {}),
+    ...(phi ? { phi } : {}),
     notChecked,
   };
 }

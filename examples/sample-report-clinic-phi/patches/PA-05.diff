@@ -1,0 +1,11 @@
+diff --git a/src/main.tsx b/src/main.tsx
+--- a/src/main.tsx
++++ b/src/main.tsx
+@@ -5,6 +5,7 @@ import { BrowserRouter } from "react-router-dom";
+ import App from "./App";
+ 
+ posthog.init(import.meta.env.VITE_POSTHOG_KEY, {
++  disable_session_recording: true,
+   api_host: "https://us.i.posthog.com",
+   session_recording: { maskAllInputs: false },
+ });

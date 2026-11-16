@@ -4,7 +4,14 @@ export type Severity = (typeof SEVERITIES)[number];
 export const SEVERITY_RANK: Record<Severity, number> = { critical: 4, high: 3, medium: 2, low: 1 };
 
 export type Source =
-  "vibe-preflight" | "launch-audit" | "secret-scan" | "rls-probe" | "project-config" | "npm-audit" | "live-probe";
+  | "vibe-preflight"
+  | "launch-audit"
+  | "secret-scan"
+  | "rls-probe"
+  | "project-config"
+  | "npm-audit"
+  | "live-probe"
+  | "phi-scan";
 
 export type Effort = "under 1 hour" | "1-4 hours" | "half a day to a day";
 
@@ -35,6 +42,8 @@ export interface RawFinding {
   cwe?: string;
   /** What the read-only probe of the live Supabase project saw for this table or bucket. */
   live?: LiveTable | LiveBucket;
+  /** With --phi: the health-data columns of the table or the code this finding is about. */
+  phi?: string[];
 }
 
 export type Actor = "anon" | "other-user" | "owner";
@@ -123,6 +132,8 @@ export interface Finding {
   proof?: Proof;
   /** What the read-only probe of the live project saw for the same table or bucket. */
   live?: LiveTable | LiveBucket;
+  /** With --phi: the health-data columns involved (PHI on a table, or PHI fields the code handles). */
+  phi?: string[];
   /** Other rules that flagged the same thing and were folded into this finding. */
   alsoFlaggedBy: string[];
 }
@@ -161,7 +172,59 @@ export interface AuditResult {
   probe?: Proof[];
   /** The consented, read-only probe of the client's own Supabase project. */
   live?: LiveResult;
+  /** With --phi: where health data lives and the Supabase HIPAA checklist. */
+  phi?: PhiResult;
   notChecked: string[];
+}
+
+/** "health": clinical content (diagnosis, medication). "identifier": ties a record to a person (dob, MRN, SSN). */
+export type PhiKind = "health" | "identifier";
+
+export interface PhiColumn {
+  name: string;
+  kind: PhiKind;
+}
+
+/** A table or view that holds protected health information, by its column names. */
+export interface PhiTable {
+  table: string;
+  relation: "table" | "view";
+  columns: PhiColumn[];
+  foundIn: ("migrations" | "types")[];
+  /** Who could read user A's rows in the local RLS probe; undefined when the probe could not tell. */
+  readBy?: ("anon" | "other-user")[];
+  /** Why there is no readBy: not in the migrations, or user A had no row to read (a view's filter). */
+  untested?: "not in migrations" | "no rows to test";
+  /** A trigger in the migrations writes changes of this table to an audit table. */
+  audited: boolean;
+}
+
+/** A third-party script loaded on pages that show PHI. */
+export interface PhiTracker {
+  vendor: string;
+  file: string;
+  line: number;
+  /** Records the screen (session replay), not only page views and events. */
+  replay: boolean;
+  /** Client files that read and show PHI fields, where this script runs too. */
+  pages: string[];
+}
+
+/** One customer-side control from Supabase's shared responsibility model for health data. */
+export interface HipaaControl {
+  control: string;
+  /** "repo": the scan could check it; "dashboard": only the project owner can confirm it. */
+  where: "repo" | "dashboard";
+  status: "ok" | "gap" | "confirm";
+  detail: string;
+}
+
+export interface PhiResult {
+  tables: PhiTable[];
+  trackers: PhiTracker[];
+  controls: HipaaControl[];
+  /** When the Supabase docs the checklist follows were read. */
+  docsReadOn: string;
 }
 
 /** Who made a live request: the public key alone, or one of the two test users the client created. */

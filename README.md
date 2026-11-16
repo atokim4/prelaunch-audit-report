@@ -15,13 +15,20 @@ visitor and as two test users the owner creates, never downloads a row, and puts
 probe with a list of where the live database and the migrations disagree (a policy fixed or opened in the
 dashboard, a table made there).
 
-I built it as a personal project. The two sample reports below are runs on demo apps I wrote with security
+For health apps, `--phi` adds a health-data pass: it maps the columns that hold protected health information
+(PHI), rates any read of them by someone other than the record's own account as Critical, follows the data into
+session replay and analytics scripts, AI, email and SMS calls, function logs and public buckets, writes an
+append-only audit-trail migration, and fills in Supabase's HIPAA checklist with what the code shows. It is a
+technical scan, not a compliance assessment.
+
+I built it as a personal project. The three sample reports below are runs on demo apps I wrote with security
 holes on purpose. They are not client audits.
 
 | Sample                                                                            | App shape                                                                   |
 | --------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
 | [Vite + Supabase Edge Functions](examples/sample-report-vite-supabase/report.pdf) | React SPA, migrations, Deno edge functions (the shape AI builders generate) |
 | [Next.js App Router](examples/sample-report/report.pdf)                           | Next.js 15, route handlers, migrations, storage buckets                     |
+| [Clinic app, health-data mode](examples/sample-report-clinic-phi/report.pdf)      | Lovable-shaped Vite SPA with patient records, run with `--phi`              |
 
 ![Pages 1 to 3 of the Vite + Supabase sample report](media/cover-vite-1600x900.png)
 
@@ -55,6 +62,7 @@ node src/cli.ts path/to/your-app --url https://your-app.example --launch-audit-c
 | `--name <name>`              | App name on the report (default: `name` in package.json)     |
 | `--date <ISO date>`          | Fixed report date, for reproducible output                   |
 | `--skip-npm-audit`           | Don't run `npm audit` (it needs network)                     |
+| `--phi`                      | Health-data mode (see below)                                 |
 | `--live <project url>`       | Read-only probe of the live Supabase project (see below)     |
 | `--i-own-this-project`       | Required with `--live`                                       |
 | `--live-env <file>`          | Read the key and test logins from a file (`.env.example`)    |
@@ -182,6 +190,39 @@ apify-launch-audit checks HTTPS and HSTS, security headers, cookie flags, keys i
 the JavaScript bundles, public source maps, exposed `.env` or `.git`, robots and sitemap, slow responses. These
 findings keep the severity that tool gives them.
 
+### Health data (`--phi`)
+
+For apps that store patient data. It reads files only, like the repo checks.
+
+- **PHI map.** Columns are matched by name: clinical content (`diagnosis`, `medications`, `allergies`,
+  `lab_*`, `clinical_*`; `notes` or `reason` only on tables such as `patients` or `appointments`) and identifiers
+  (`date_of_birth`, `mrn`, `ssn`, `insurance_*`). A birthday on a plain `profiles` table is not counted. Views get
+  the kinds of the columns they copy. Tables come from the migrations and from the generated types file, so a table
+  made in the dashboard shows up too.
+- **Who can read it.** The map is joined with the RLS probe. With `--phi`, a PHI table or view that a visitor
+  or a second user can read is Critical, where the same leak in a CRM is High. A view that skips RLS stays
+  Critical when the probe had no row to disprove it (a view filtered to today's date, for example).
+- **Scripts on PHI pages.** Session replay (PostHog unless `disable_session_recording: true`, Sentry Replay,
+  Hotjar, Clarity, FullStory, LogRocket) is High; page-view analytics (Google Analytics and Tag Manager, Meta
+  Pixel, Mixpanel, Segment, the Lovable editor script) is Medium. A script counts when it loads in a global file
+  (`index.html`, `main.tsx`, `App.tsx`, `app/layout`, `pages/_app`) or on the page itself, and a page counts when
+  it reads a PHI table and names a PHI column.
+- **Vendors.** Server code (edge functions, `app/api`, `pages/api`, `server/`) that reads a PHI table, names PHI
+  fields and calls OpenAI, Anthropic, Gemini, Resend, SendGrid, Postmark, Mailgun or Twilio is High: the vendor
+  must sign a Business Associate Agreement (BAA) first. The report never says a vendor is or is not compliant.
+- **Logs and buckets.** `console.*` calls in that server code that print PHI rows or fields (Medium), and public
+  buckets whose name or upload code says they hold patient files (Critical).
+- **Audit trail.** Without a trigger that writes changes of the PHI tables to an audit table, the report adds a
+  migration: `phi_audit_log` with the user id from `auth.uid()`, the role, the operation and the row id (no row
+  values, so the log holds no PHI), filled by a trigger on every PHI table, revoked from `anon` and
+  `authenticated`, and guarded so even the table owner gets SQLSTATE 42501 on update, delete or truncate. The
+  suite loads it in PGlite and proves both.
+- **Checklist.** The report copies the customer side of
+  [Supabase's shared responsibility model](https://supabase.com/docs/guides/deployment/shared-responsibility-model)
+  for health data (read 16 November 2026: BAA on the Team plan or above with the HIPAA add-on, High Compliance,
+  MFA, PITR, SSL enforcement, network restrictions, connection logging, no PHI in public buckets, no transfer to
+  a non-HIPAA organization) and marks the items the code can show as ok or gap; the rest say "confirm".
+
 ## What it does not check
 
 The cover of every report lists this too:
@@ -193,6 +234,10 @@ The cover of every report lists this too:
 - Rate limiting, abuse protection, and the auth and email settings in the Supabase dashboard.
 - Manual penetration testing. Every finding comes from an automated scanner, the local probe or read-only
   counts on the live project; nobody tried to break in by hand.
+
+With `--phi`, also: HIPAA compliance as a whole (that needs a risk analysis, policies, training and signed
+agreements), PHI in columns whose names don't give it away, reads of health records (triggers log changes only),
+Next.js server actions outside `app/api`, and whether a vendor already signed a BAA with you.
 
 The probe also has limits worth knowing: it seeds one row per table with guessed values, so a table whose check
 constraints or triggers reject those values is listed as "not tried"; it tests the two API roles, not
@@ -210,12 +255,16 @@ A rule gets the first level that fits:
    feature in a way that fails closed.
 4. **Low**: hygiene and launch polish.
 
+With `--phi` three placements come first: a read of health data by anyone but the record's own account, or
+health files in a public bucket, is Critical; health data sent to a vendor that must sign a BAA, or a PHI table
+with no migration, is High; PHI in logs, analytics on PHI pages and a missing audit trail are Medium.
+
 Two rules that flag the same object (for example a view over `auth.users` that also lacks `security_invoker`)
 become one finding, named after the more specific rule, with the other listed under "also flagged by".
 
 ## Patches
 
-For 13 rules the tool writes a fix: a new Supabase migration for the database rules, or an edit of the file for
+For 18 rules the tool writes a fix: a new Supabase migration for the database rules, or an edit of the file for
 the code rules. Each patch is a unified diff that applies with `git apply` from the repo root, and the tool runs
 `git apply --check` on it against the code as scanned before it calls the patch verified. Some of them:
 
@@ -227,6 +276,10 @@ the code rules. Each patch is a unified diff that applies with `git apply` from 
   function in Node, with stand-ins for `serve`, `Deno.env` and the Supabase client, before and after the patch,
   and signs events with the real Stripe package: the original upgrades a plan for an unsigned POST, the patched
   one returns 400 for a missing or forged signature and 200 for a signed event.
+- `phi-no-audit-log`: the append-only audit-trail migration described above.
+- `phi-session-replay` for PostHog: adds `disable_session_recording: true` to `posthog.init`. Other replay
+  vendors and the BAA findings get no patch, because the fix there is a decision (remove the script, sign a BAA,
+  or stop sending the fields), and the report says so under the finding.
 - `stripe-webhook-jwt-gate`: sets `verify_jwt = false` for that function in `supabase/config.toml`.
 - A secret behind `VITE_` or `NEXT_PUBLIC_` in browser code: renamed everywhere so the next build no longer ships
   it. That patch is marked **partial** in the report, because the code that used the key still runs in the
@@ -240,7 +293,7 @@ is who should have access". Read each one before applying it.
 
 ## Results on the demo apps
 
-Both apps live in `test/fixtures` with their ground truth next to them. Holes are seeded on purpose; controls are
+All three apps live in `test/fixtures` with their ground truth next to them. Holes are seeded on purpose; controls are
 done right and must not be flagged at Medium or above.
 
 **pipeline-crm-app** (Vite + React SPA, 7 migrations, 2 Deno edge functions): 9 holes, 7 controls.
@@ -269,9 +322,25 @@ benchmark of mine.
 - `scripts/typecheck-patched-app.sh` installs that app's real dependencies (Next.js 15.5, Stripe 19.1,
   supabase-js 2.58) and type-checks the patched code. It needs network, so it is not part of `npm test`.
 
-Read these numbers for what they are. I wrote both demo apps and the scanner rules, so the apps test what the
-tools know, and 9 of 9 or 12 of 12 is not an independent detection rate. On someone else's app expect misses.
-Neither app has committed secrets, so they say nothing about the credential scanner; its tests use keys built at
+**clinic-intake-app** (Vite + React SPA, 5 migrations, 3 Deno edge functions, run with `--phi`): 10 holes,
+5 controls, all patient data made up.
+
+- All 10 holes are reported, each with the expected rule: 3 Critical, 4 High, 4 Medium, plus 1 Low (the public
+  clinic address list). No control gets a PHI finding: the prescriptions table scoped through its patient, an edge
+  function that sends a clinic's public description to the Anthropic API and logs only an id, a public logos
+  bucket, and a page without health data. The logos bucket keeps the Medium that vibe-preflight gives every
+  public bucket, which is why this app's controls are judged on PHI findings only.
+- The patients leak (a select policy that checks `auth.role() = 'authenticated'`) is High without `--phi` and
+  Critical with it.
+- 6 findings have a verified patch, including all 3 Critical ones. The 3 High findings without one are the two
+  vendor calls and the table that exists only in the types file. With every patch applied, the audit run again
+  leaves the findings that need a decision (BAA or not, the dashboard-made table, analytics, the logging lines)
+  and the audit trail covers every PHI table.
+- `--phi` on the other two demo apps maps no PHI table and adds no finding.
+
+Read these numbers for what they are. I wrote the demo apps and the scanner rules, so the apps test what the
+tools know, and 9 of 9, 12 of 12 or 10 of 10 is not an independent detection rate. On someone else's app expect misses.
+None of the apps has committed secrets, so they say nothing about the credential scanner; its tests use keys built at
 runtime in temporary git repos.
 
 **The live probe** is tested end to end against the real [PostgREST](https://postgrest.org) 16.5 binary (the server
@@ -294,7 +363,7 @@ are real PostgREST and Postgres behaviour; auth and storage are emulated. On tha
 With the live part the Vite sample has 13 findings: 5 Critical, 7 High, 1 Low. 11 of the 12 Critical and High
 ones have a verified patch; the `open_tasks` view has none of its own, because the tasks patch is its fix.
 
-Regenerate the samples with `npm run sample` and `npm run sample:vite` (the second one needs `npm run postgrest`
+Regenerate the samples with `npm run sample`, `npm run sample:phi` and `npm run sample:vite` (the second one needs `npm run postgrest`
 once, which downloads PostgREST and checks its SHA-256).
 
 ## Development

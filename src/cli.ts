@@ -26,6 +26,10 @@ Options:
   --name <name>               app name on the report (default: package.json name)
   --date <ISO date>           report date (default: now), for reproducible output
   --skip-npm-audit            do not run npm audit (it needs network and a package-lock.json)
+  --phi                       health-data mode: map PHI columns, rate any read of them by
+                              others Critical, flag PHI sent to analytics, AI, email or SMS
+                              vendors, PHI in logs and public buckets, add an audit-trail
+                              patch and the Supabase HIPAA checklist
   -h, --help                  show this help
 
 Live project (read-only, only with the owner's consent):
@@ -94,6 +98,7 @@ async function main(): Promise<void> {
       note: { type: "string" },
       date: { type: "string" },
       "skip-npm-audit": { type: "boolean", default: false },
+      phi: { type: "boolean", default: false },
       live: { type: "string" },
       "i-own-this-project": { type: "boolean", default: false },
       "live-env": { type: "string" },
@@ -125,6 +130,7 @@ async function main(): Promise<void> {
     now,
     npmAudit: !values["skip-npm-audit"],
     live,
+    phi: values.phi,
   });
 
   const out = resolve(values.out);
