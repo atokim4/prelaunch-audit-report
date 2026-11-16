@@ -1,0 +1,4 @@
+project_id = "team-workspace-app"
+
+[api]
+schemas = ["public"]

@@ -1,7 +1,7 @@
 import { leaks, probeRls, PROBE_VERSION, type ProbeResult, type TableProbe } from "../probe/rls-probe.ts";
 import { weakPolicies } from "../patches/fixers.ts";
 import type { SqlFile } from "../patches/sql.ts";
-import type { Location, Proof, RawFinding, ToolRun } from "../types.ts";
+import type { Actor, Location, Proof, RawFinding, ToolRun } from "../types.ts";
 
 /** Static rules about one table or view; the probe's proof is attached to these instead of a new finding. */
 export const TABLE_RULES = new Set([
@@ -19,6 +19,7 @@ export function toProof(table: TableProbe): Proof {
     kind: table.kind,
     ownerColumns: table.ownerColumns,
     ...(table.ownedVia ? { ownedVia: table.ownedVia } : {}),
+    ...(table.tenant ? { tenant: table.tenant } : {}),
     checks: table.checks,
     leaks: leaks(table),
     policies: table.policies,
@@ -55,16 +56,37 @@ function locate(migrations: SqlFile[], table: string, policy: string | undefined
   );
 }
 
-const ACTOR_WORD = { anon: "a visitor without an account", "other-user": "user B", owner: "the row's owner" } as const;
+const ACTOR_WORD: Record<Actor, string> = {
+  anon: "a visitor without an account",
+  "other-user": "user B",
+  owner: "the row's owner",
+  "non-member": "user C",
+};
+
+/** With an organization model the same actors are named by where they belong. */
+const TENANT_WORD: Record<Actor, string> = {
+  anon: "a visitor without an account",
+  "other-user": "an admin of another organization",
+  owner: "a plain member",
+  "non-member": "a signed-in user in no organization",
+};
 
 /** One line of evidence: what got through, in counts. */
 export function describeLeaks(proof: Proof): string {
+  const word = proof.tenant ? TENANT_WORD : ACTOR_WORD;
+  const whose = proof.tenant ? "organization A's" : "user A's";
   const parts = proof.leaks.map((c) =>
-    c.action === "insert"
-      ? `${ACTOR_WORD[c.actor]} inserted a row in user A's name`
-      : c.column
-        ? `${ACTOR_WORD[c.actor]} changed \`${c.column}\``
-        : `${ACTOR_WORD[c.actor]} could ${c.action} ${c.rows} of ${c.of} of user A's rows`,
+    c.scenario === "self-join"
+      ? `${word[c.actor]} added themselves to organization A`
+      : c.scenario === "move-tenant"
+        ? `${word[c.actor]} moved their own membership to another organization`
+        : c.action === "insert"
+          ? proof.tenant
+            ? `${word[c.actor]} inserted a row into organization A`
+            : `${word[c.actor]} inserted a row in user A's name`
+          : c.column
+            ? `${word[c.actor]} changed \`${c.column}\``
+            : `${word[c.actor]} could ${c.action} ${c.rows} of ${c.of} of ${whose} rows`,
   );
   return `RLS probe on \`${proof.table}\`: ${parts.join("; ")}.`;
 }
@@ -79,7 +101,11 @@ export function mergeProbe(raws: RawFinding[], result: ProbeResult, migrations: 
     if (table.skipped) continue;
     const proof = toProof(table);
     const covering = raws.filter((r) => r.subject === table.table && TABLE_RULES.has(r.rule));
-    for (const raw of covering) raw.proof = proof;
+    for (const raw of covering) {
+      raw.proof = proof;
+      // On organization data the probe's words say more than the policy text (a self-join next to a role edit).
+      if (proof.tenant && proof.leaks.length) raw.message = `${raw.message} ${describeLeaks(proof)}`;
+    }
     if (covering.length || !proof.leaks.length) continue;
     const weak = weakPolicies(proof);
     const through = weak.length
@@ -142,7 +168,7 @@ export async function runRlsProbe(
         `${tested} tables and views tried as anon and as a second user.`,
         skipped.length ? `Not tried: ${skipped.map((t) => `${t.table} (${t.skipped})`).join("; ")}.` : "",
         result.failedStatements.length
-          ? `Stepped over ${result.failedStatements.length} statement(s) of schema files outside supabase/migrations that Postgres rejected (${[...new Set(result.failedStatements.map((f) => f.file))].join(", ")}); tables they name were not tried.`
+          ? `Stepped over ${result.failedStatements.length} statement(s) that Postgres rejected (${[...new Set(result.failedStatements.map((f) => f.file))].join(", ")}); tables they name were not tried.`
           : "",
         result.skippedExtensions.length
           ? `Stepped over platform extensions: ${result.skippedExtensions.join(", ")}.`

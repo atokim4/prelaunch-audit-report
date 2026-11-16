@@ -3,7 +3,8 @@ import { readFile } from "node:fs/promises";
 import { PGlite, type Extensions, type Transaction } from "@electric-sql/pglite";
 import { statements, type SqlFile } from "../patches/sql.ts";
 import { isStrict, loadOrder } from "./sources.ts";
-import type { Actor, OwnedVia, ProbeCheck, ProbePolicy } from "../types.ts";
+import { detectTenancy, type Tenancy } from "./tenancy.ts";
+import type { Actor, OwnedVia, ProbeCheck, ProbePolicy, TenantLink } from "../types.ts";
 
 /**
  * Behavioural Row Level Security check. Loads the repo's migrations into PGlite (Postgres in
@@ -14,11 +15,14 @@ import type { Actor, OwnedVia, ProbeCheck, ProbePolicy } from "../types.ts";
  * values break) is recorded as inconclusive, never as "blocked".
  */
 
-export const PROBE_VERSION = "1.2.0";
+export const PROBE_VERSION = "1.3.0";
 export const SHIM_PATH = new URL("./supabase-shim.sql", import.meta.url);
 
 export const USER_A = "00000000-0000-4000-8000-00000000000a";
 export const USER_B = "00000000-0000-4000-8000-00000000000b";
+/** Only with an organization model: C is signed in and belongs to no organization; D founded organization A. */
+export const USER_C = "00000000-0000-4000-8000-00000000000c";
+export const USER_D = "00000000-0000-4000-8000-00000000000d";
 
 export interface TableProbe {
   /** Display name, always `public.<name>`. */
@@ -33,6 +37,8 @@ export interface TableProbe {
   ownerColumns: string[];
   /** No owner column, but a foreign key to a table that has one: the row belongs to the parent's owner. */
   ownedVia?: OwnedVia;
+  /** Rows belong to an organization (team, workspace) through this link. */
+  tenant?: TenantLink;
   checks: ProbeCheck[];
   policies: ProbePolicy[];
   /** Set when the table could not be seeded or probed; no checks then. */
@@ -61,12 +67,12 @@ export interface FailedStatement {
   text: string;
 }
 
-/** True when rows belong to someone: an owner column, or a parent that has one. */
-export const isOwned = (t: { ownerColumns: string[]; ownedVia?: OwnedVia }): boolean =>
-  t.ownerColumns.length > 0 || t.ownedVia !== undefined;
+/** True when rows belong to someone: an owner column, a parent that has one, or an organization. */
+export const isOwned = (t: { ownerColumns: string[]; ownedVia?: OwnedVia; tenant?: TenantLink }): boolean =>
+  t.ownerColumns.length > 0 || t.ownedVia !== undefined || t.tenant !== undefined;
 
 /** A check that got through: the actor read or changed rows it should not. */
-export function leaks(probe: Pick<TableProbe, "checks" | "ownerColumns" | "ownedVia">): ProbeCheck[] {
+export function leaks(probe: Pick<TableProbe, "checks" | "ownerColumns" | "ownedVia" | "tenant">): ProbeCheck[] {
   return probe.checks.filter((check) => {
     if (check.rows === 0) return false;
     if (check.actor === "owner") return true; // escalation checks only run on privileged columns
@@ -112,6 +118,7 @@ async function columnsOf(db: PGlite, oid: number): Promise<ColumnInfo[]> {
     parent_table: string | null;
     parent_column: string | null;
     enum_labels: string[] | null;
+    checks: string[] | null;
   }>(
     `select a.attname as name, format_type(a.atttypid, a.atttypmod) as type,
             a.attnotnull as not_null, a.atthasdef as has_default,
@@ -126,7 +133,9 @@ async function columnsOf(db: PGlite, oid: number): Promise<ColumnInfo[]> {
             (select fa.attname::text from pg_constraint f join pg_attribute fa on fa.attrelid = f.confrelid and fa.attnum = f.confkey[1]
               join pg_class fc on fc.oid = f.confrelid join pg_namespace fn on fn.oid = fc.relnamespace
               where f.conrelid = a.attrelid and f.contype = 'f' and f.conkey = array[a.attnum] and fn.nspname = 'public' limit 1) as parent_column,
-            (select array_agg(e.enumlabel::text order by e.enumsortorder) from pg_enum e where e.enumtypid = a.atttypid) as enum_labels
+            (select array_agg(e.enumlabel::text order by e.enumsortorder) from pg_enum e where e.enumtypid = a.atttypid) as enum_labels,
+            (select array_agg(pg_get_constraintdef(k.oid)) from pg_constraint k
+              where k.conrelid = a.attrelid and k.contype = 'c' and k.conkey = array[a.attnum]) as checks
        from pg_attribute a
       where a.attrelid = $1 and a.attnum > 0 and not a.attisdropped
       order by a.attnum`,
@@ -142,8 +151,21 @@ async function columnsOf(db: PGlite, oid: number): Promise<ColumnInfo[]> {
     unique: r.primary_key || r.unique_col,
     user: r.user_ref,
     parent: r.parent_table && r.parent_column ? { name: r.parent_table, column: r.parent_column } : undefined,
-    enumLabels: r.enum_labels ?? undefined,
+    enumLabels: r.enum_labels ?? allowedValues(r.checks ?? []),
   }));
+}
+
+/**
+ * The values a one-column CHECK allows, when it is a list: Postgres stores `role in ('owner', 'member')`
+ * as `CHECK ((role = ANY (ARRAY['owner'::text, 'member'::text])))`. Undefined for any other check.
+ */
+export function allowedValues(checks: string[]): string[] | undefined {
+  for (const def of checks) {
+    if (!/=\s*ANY\s*\(\s*\(?\s*ARRAY\[/i.test(def) || /\b(AND|OR|NOT)\b/.test(def)) continue;
+    const values = [...def.matchAll(/'((?:[^']|'')*)'::/g)].map((m) => (m[1] ?? "").replaceAll("''", "'"));
+    if (values.length) return values;
+  }
+  return undefined;
 }
 
 const baseType = (column: ColumnInfo): string => column.type.replace(/\(.*\)/, "").trim();
@@ -158,12 +180,16 @@ function sampleValue(column: ColumnInfo): string | undefined {
   if (column.enumLabels?.length) {
     const plain = PRIVILEGED_COLUMN.test(column.name)
       ? column.enumLabels.find((l) => !PRIVILEGED_LABEL.test(l))
-      : undefined;
+      : /^(status|state)$/i.test(column.name)
+        ? column.enumLabels.find((l) => /^(active|accepted|approved|enabled|joined)$/i.test(l))
+        : undefined;
     return plain ?? column.enumLabels[0];
   }
   const type = baseType(column);
   if (type.endsWith("[]")) return "{}";
   // Unique columns need a fresh value per insert, or a second insert fails on the index, not on RLS.
+  // Email columns often carry a format CHECK; a valid address passes it.
+  if (isText(type) && /e_?mail/i.test(column.name)) return `probe-${randomUUID().slice(0, 8)}@example.com`;
   if (isText(type)) return column.unique ? `probe-${randomUUID().slice(0, 8)}` : "probe";
   if (type === "uuid") return randomUUID();
   if (isNumber(type)) return column.unique ? String(10_000 + Math.floor(Math.random() * 1_000_000)) : "1";
@@ -183,8 +209,31 @@ interface TableInfo {
   columns: ColumnInfo[];
   ownerColumns: string[];
   ownedVia?: OwnedVia;
+  tenant?: TenantLink;
+  /** Foreign keys over more than one column: their values have to come from the same parent row. */
+  compositeKeys: CompositeKey[];
   /** SQL condition true for user A's rows, fixed after seeding (literal values, no RLS-dependent subquery). */
   mine: string;
+}
+
+interface CompositeKey {
+  columns: string[];
+  parent: string;
+  parentColumns: string[];
+}
+
+async function compositeKeysOf(db: PGlite, oid: number): Promise<CompositeKey[]> {
+  const { rows } = await db.query<{ columns: string[]; parent: string; parent_columns: string[] }>(
+    `select array(select a.attname::text from unnest(f.conkey) with ordinality k(n, i)
+                    join pg_attribute a on a.attrelid = f.conrelid and a.attnum = k.n order by k.i) as columns,
+            fc.relname::text as parent,
+            array(select a.attname::text from unnest(f.confkey) with ordinality k(n, i)
+                    join pg_attribute a on a.attrelid = f.confrelid and a.attnum = k.n order by k.i) as parent_columns
+       from pg_constraint f join pg_class fc on fc.oid = f.confrelid join pg_namespace fn on fn.oid = fc.relnamespace
+      where f.conrelid = $1 and f.contype = 'f' and array_length(f.conkey, 1) > 1 and fn.nspname = 'public'`,
+    [oid],
+  );
+  return rows.map((r) => ({ columns: r.columns, parent: r.parent, parentColumns: r.parent_columns }));
 }
 
 function ownerColumnsOf(columns: ColumnInfo[]): string[] {
@@ -256,6 +305,7 @@ async function tablesOf(db: PGlite): Promise<TableInfo[]> {
       rls: row.rls,
       columns,
       ownerColumns: ownerColumnsOf(columns),
+      compositeKeys: await compositeKeysOf(db, row.oid),
       mine: "false",
     });
   }
@@ -281,8 +331,9 @@ function seedOrder(tables: TableInfo[]): TableInfo[] {
   const visit = (info: TableInfo, path: Set<string>): void => {
     if (done.has(info.name) || path.has(info.name)) return;
     path.add(info.name);
-    for (const column of info.columns) {
-      const parent = column.parent && byName.get(column.parent.name);
+    const parents = [...info.columns.map((c) => c.parent?.name), ...info.compositeKeys.map((k) => k.parent)];
+    for (const name of parents) {
+      const parent = name ? byName.get(name) : undefined;
       if (parent && parent !== info) visit(parent, path);
     }
     done.add(info.name);
@@ -312,7 +363,11 @@ function linkOwnership(ordered: TableInfo[]): void {
 }
 
 /** Freezes "user A's rows" into literal SQL, so the condition means the same for every actor. */
-async function fixMine(db: PGlite, info: TableInfo, byName: Map<string, TableInfo>): Promise<void> {
+async function fixMine(db: PGlite, info: TableInfo, byName: Map<string, TableInfo>, orgs?: TenantSeed): Promise<void> {
+  if (info.tenant) {
+    info.mine = await tenantMine(db, info.tenant, byName, orgs);
+    return;
+  }
   if (info.ownerColumns.length) {
     info.mine = `(${info.ownerColumns.map((c) => `${quote(c)}::text = '${USER_A}'`).join(" or ")})`;
     return;
@@ -329,19 +384,75 @@ async function fixMine(db: PGlite, info: TableInfo, byName: Map<string, TableInf
   info.mine = rows.length ? `${quote(via.column)}::text in (${rows.map((r) => lit(r.v)).join(", ")})` : "false";
 }
 
-/** Column values for one new row of user A, or the reason it cannot be built. */
+/** The two organizations the probe made: A has user A as a plain member, B has user B as an admin. */
+interface TenantSeed {
+  tenancy: Tenancy;
+  orgA?: string;
+  orgB?: string;
+}
+
+/** "Organization A's rows" as literal SQL. */
+async function tenantMine(
+  db: PGlite,
+  link: TenantLink,
+  byName: Map<string, TableInfo>,
+  orgs: TenantSeed | undefined,
+): Promise<string> {
+  if (!orgs?.orgA) return "false";
+  const org = lit(orgs.orgA);
+  const via = link.via;
+  if (via.kind === "tenant") return `${quote(link.tenantKey)}::text = ${org}`;
+  if (via.kind === "members") return `${quote(link.members.tenantColumn)}::text = ${org}`;
+  if (via.kind === "column") return `${quote(via.column)}::text = ${org}`;
+  const parent = byName.get(via.parent.replace(/^public\./, ""));
+  if (!parent) return "false";
+  const { rows } = await db.query<{ v: string }>(
+    `select distinct ${quote(via.parentColumn)}::text as v from ${rel(parent.name)} where ${parent.mine}`,
+  );
+  return rows.length ? `${quote(via.column)}::text in (${rows.map((r) => lit(r.v)).join(", ")})` : "false";
+}
+
+/**
+ * Column values for one new row, or the reason it cannot be built. Owner columns get `owner` (user A
+ * unless said otherwise); `overrides` pins columns by name (the organization and user of a membership).
+ */
 async function rowFor(
   db: PGlite | Transaction,
   info: TableInfo,
   byName: Map<string, TableInfo>,
+  owner: string = USER_A,
+  overrides: Record<string, string> = {},
 ): Promise<{ columns: string[]; values: string[]; casts: string[] } | string> {
   const columns: string[] = [];
   const values: string[] = [];
   const casts: string[] = [];
+  // A composite foreign key (project_id, tenant_id) -> projects (id, tenant_id) takes every value from one
+  // parent row, user A's (or organization A's) when there is one; pinned values narrow the choice.
+  const pinned: Record<string, string> = { ...overrides };
+  for (const key of info.compositeKeys) {
+    const parent = byName.get(key.parent);
+    const fixed = key.columns
+      .map((c, i) => (c in pinned ? `${quote(key.parentColumns[i] ?? "")}::text = ${lit(pinned[c] ?? "")}` : ""))
+      .filter(Boolean);
+    const pick = async (where: string) =>
+      (
+        await db.query<Record<string, string>>(
+          `select ${key.parentColumns.map((c, i) => `${quote(c)}::text as c${i}`).join(", ")} from ${rel(key.parent)}
+            where (${where})${fixed.length ? ` and ${fixed.join(" and ")}` : ""} limit 1`,
+        )
+      ).rows[0];
+    const row = (await pick(parent?.mine ?? "true")) ?? (await pick("true"));
+    if (!row) return `no row in public.${key.parent} to point ${key.columns.join(", ")} at`;
+    key.columns.forEach((c, i) => {
+      const v = row[`c${i}`];
+      if (v !== undefined && v !== null) pinned[c] = v;
+    });
+  }
   for (const column of info.columns) {
     if (column.generated) continue;
     let value: string | undefined;
-    if (info.ownerColumns.includes(column.name)) value = USER_A;
+    if (column.name in pinned) value = pinned[column.name];
+    else if (info.ownerColumns.includes(column.name)) value = owner;
     else if (column.parent) {
       const parent = byName.get(column.parent.name);
       const own = parent ? parent.mine : "true";
@@ -380,7 +491,47 @@ const CLAIMS: Record<Actor, { role: string; claims: string }> = {
   anon: { role: "anon", claims: JSON.stringify({ role: "anon" }) },
   "other-user": { role: "authenticated", claims: JSON.stringify({ sub: USER_B, role: "authenticated" }) },
   owner: { role: "authenticated", claims: JSON.stringify({ sub: USER_A, role: "authenticated" }) },
+  "non-member": { role: "authenticated", claims: JSON.stringify({ sub: USER_C, role: "authenticated" }) },
 };
+
+/**
+ * Per database: claims to send instead of the plain ones, when the schema reads the organization from the
+ * token (`auth.jwt() -> 'app_metadata' ->> 'org_id'`, set by a custom access token hook).
+ */
+const JWT_EXTRA = new WeakMap<PGlite, Partial<Record<Actor, string>>>();
+
+/** app_metadata keys the functions and policies read, sorted into organization and role keys. */
+async function tokenKeys(db: PGlite): Promise<{ org: string[]; role: string[] }> {
+  const { rows } = await db.query<{ src: string }>(
+    `select p.prosrc as src from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname not in ('pg_catalog', 'information_schema', 'auth', 'storage', 'extensions')
+     union all select coalesce(qual, '') || ' ' || coalesce(with_check, '') from pg_policies`,
+  );
+  const keys = new Set<string>();
+  for (const { src } of rows) {
+    for (const m of src.matchAll(/app_metadata'(?:::text)?\s*->>?\s*'(\w+)'/g)) keys.add(m[1] ?? "");
+  }
+  const all = [...keys];
+  return {
+    org: all.filter((k) => /org|tenant|team|workspace|account|company|unit/i.test(k)),
+    role: all.filter((k) => /role/i.test(k)),
+  };
+}
+
+async function tenantClaims(db: PGlite, orgs: TenantSeed): Promise<void> {
+  const keys = await tokenKeys(db);
+  if (!keys.org.length || !orgs.orgA || !orgs.orgB) return;
+  const m = orgs.tenancy.members;
+  const meta = (org: string, role: string | undefined) =>
+    Object.fromEntries([...keys.org.map((k) => [k, org]), ...keys.role.map((k) => [k, role ?? "member"])]);
+  const token = (sub: string, appMetadata: Record<string, string>) =>
+    JSON.stringify({ sub, role: "authenticated", app_metadata: appMetadata });
+  JWT_EXTRA.set(db, {
+    owner: token(USER_A, meta(orgs.orgA, m.memberRole)),
+    "other-user": token(USER_B, meta(orgs.orgB, m.adminRoles[0] ?? m.memberRole)),
+    "non-member": token(USER_C, {}),
+  });
+}
 
 interface Outcome {
   rows: number;
@@ -396,7 +547,9 @@ function isRefusal(code: string | undefined, message: string): boolean {
 
 /**
  * Runs `sql` as `actor` in a transaction that is always rolled back. `prepare` runs first as the
- * superuser in the same transaction (to clear a unique slot the insert needs).
+ * superuser in the same transaction (to clear a unique slot the insert needs). With `verify`, `sql` returns
+ * nothing (no RETURNING, as supabase-js sends a plain update) and `verify` counts the result afterwards as
+ * the superuser, in the same transaction: RETURNING would also apply the select policies to the new row.
  */
 async function tryAs(
   db: PGlite,
@@ -404,9 +557,11 @@ async function tryAs(
   sql: string,
   params: unknown[] = [],
   prepare?: string,
+  verify?: string,
 ): Promise<Outcome> {
   let outcome: Outcome = { rows: 0 };
-  const { role, claims } = CLAIMS[actor];
+  const { role } = CLAIMS[actor];
+  const claims = JWT_EXTRA.get(db)?.[actor] ?? CLAIMS[actor].claims;
   await db
     .transaction(async (tx) => {
       try {
@@ -414,7 +569,10 @@ async function tryAs(
         await tx.query(`select set_config('request.jwt.claims', $1, true)`, [claims]);
         await tx.exec(`set local role ${role}`);
         const result = await tx.query<{ n: number }>(sql, params);
-        outcome = { rows: Number(result.rows[0]?.n ?? 0) };
+        if (verify) {
+          await tx.exec("reset role");
+          outcome = { rows: Number((await tx.query<{ n: number }>(verify)).rows[0]?.n ?? 0) };
+        } else outcome = { rows: Number(result.rows[0]?.n ?? 0) };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const code = (error as { code?: string }).code;
@@ -428,10 +586,18 @@ async function tryAs(
   return outcome;
 }
 
-const toCheck = (actor: Actor, action: ProbeCheck["action"], of: number, o: Outcome, column?: string): ProbeCheck => ({
+const toCheck = (
+  actor: Actor,
+  action: ProbeCheck["action"],
+  of: number,
+  o: Outcome,
+  column?: string,
+  scenario?: ProbeCheck["scenario"],
+): ProbeCheck => ({
   actor,
   action,
   ...(column ? { column } : {}),
+  ...(scenario ? { scenario } : {}),
   rows: o.rows,
   of,
   ...(o.refused ? { refused: o.refused } : {}),
@@ -451,6 +617,76 @@ async function seed(db: PGlite, info: TableInfo, byName: Map<string, TableInfo>)
   }
 }
 
+/** Runs `sql` as the superuser with `auth.uid()` = `uid`, so triggers that record the creator see one. */
+async function insertAs(db: PGlite, uid: string, sql: string, params: string[]): Promise<{ k: string }[]> {
+  return db.transaction(async (tx) => {
+    await tx.query(`select set_config('request.jwt.claims', $1, true)`, [
+      JSON.stringify({ sub: uid, role: "authenticated" }),
+    ]);
+    return (await tx.query<{ k: string }>(sql, params)).rows;
+  });
+}
+
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** Organization A (founded by D) and organization B (founded by user B). */
+async function seedTenants(
+  db: PGlite,
+  info: TableInfo,
+  byName: Map<string, TableInfo>,
+  orgs: TenantSeed,
+): Promise<string | undefined> {
+  const key = quote(orgs.tenancy.tenantKey);
+  const made: string[] = [];
+  for (const founder of [USER_D, USER_B]) {
+    const row = await rowFor(db, info, byName, founder);
+    if (typeof row === "string") return row;
+    try {
+      const rows = await insertAs(db, founder, `${insertSql(info, row)} returning ${key}::text as k`, row.values);
+      if (rows[0]) made.push(rows[0].k);
+    } catch (error) {
+      return `seed insert of an organization failed: ${errorText(error)}`;
+    }
+  }
+  [orgs.orgA, orgs.orgB] = made;
+  return made.length === 2 ? undefined : "the organization rows did not come back";
+}
+
+/** User A joins organization A as a plain member, user B joins organization B as an admin. */
+async function seedMembers(
+  db: PGlite,
+  info: TableInfo,
+  byName: Map<string, TableInfo>,
+  orgs: TenantSeed,
+): Promise<string | undefined> {
+  const m = orgs.tenancy.members;
+  if (!orgs.orgA || !orgs.orgB) return "no organization rows to add members to";
+  const tries: [string, string, string | undefined][] = [
+    [orgs.orgA, USER_A, m.memberRole],
+    [orgs.orgB, USER_B, m.adminRoles[0] ?? m.memberRole],
+  ];
+  for (const [org, user, role] of tries) {
+    const pinned: Record<string, string> = { [m.tenantColumn]: org, [m.userColumn]: user };
+    if (m.roleColumn && role) pinned[m.roleColumn] = role;
+    const row = await rowFor(db, info, byName, user, pinned);
+    if (typeof row === "string") return row;
+    try {
+      await insertAs(db, user, `${insertSql(info, row)} on conflict do nothing returning 1 as k`, row.values);
+      // A trigger may already have added the user with another role: A has to be a plain member.
+      if (m.roleColumn && role) {
+        await db.query(
+          `update ${rel(info.name)} set ${quote(m.roleColumn)} = $1::text::${info.columns.find((c) => c.name === m.roleColumn)?.type ?? "text"}
+            where ${quote(m.tenantColumn)}::text = $2 and ${quote(m.userColumn)}::text = $3`,
+          [role, org, user],
+        );
+      }
+    } catch (error) {
+      return `seed insert of a membership failed: ${errorText(error)}`;
+    }
+  }
+  return undefined;
+}
+
 /** First column a no-op `set x = x` can touch: not an owner column, not the primary key, not generated. */
 function touchColumn(info: TableInfo): string | undefined {
   const plain = info.columns.find((c) => !c.generated && !c.primaryKey && !info.ownerColumns.includes(c.name));
@@ -468,10 +704,16 @@ function escalationValues(column: ColumnInfo, current: string | null): string[] 
 }
 
 /** User A writes a new value into a paid column of their own row; counts only rows whose stored value changed. */
-async function escalation(db: PGlite, info: TableInfo, column: ColumnInfo, of: number): Promise<ProbeCheck> {
+async function escalation(
+  db: PGlite,
+  info: TableInfo,
+  column: ColumnInfo,
+  of: number,
+  own: string = info.mine,
+): Promise<ProbeCheck> {
   const target = rel(info.name);
   const { rows } = await db.query<{ v: string | null }>(
-    `select ${quote(column.name)}::text as v from ${target} where ${info.mine} limit 1`,
+    `select ${quote(column.name)}::text as v from ${target} where ${own} limit 1`,
   );
   const candidates = escalationValues(column, rows[0]?.v ?? null);
   let last: Outcome = { rows: 0, inconclusive: `no value to try for ${column.type}` };
@@ -479,7 +721,7 @@ async function escalation(db: PGlite, info: TableInfo, column: ColumnInfo, of: n
     const o = await tryAs(
       db,
       "owner",
-      `with u as (update ${target} set ${quote(column.name)} = $1::${column.type} where ${info.mine}
+      `with u as (update ${target} set ${quote(column.name)} = $1::${column.type} where ${own}
          returning (${quote(column.name)} is not distinct from $1::${column.type}) as changed)
        select (count(*) filter (where changed))::int as n from u`,
       [value],
@@ -493,7 +735,51 @@ async function escalation(db: PGlite, info: TableInfo, column: ColumnInfo, of: n
   return toCheck("owner", "update", of, last, column.name);
 }
 
-async function probeTable(db: PGlite, info: TableInfo, byName: Map<string, TableInfo>): Promise<ProbeCheck[]> {
+/** Membership tries: user B adds themselves to organization A; user A moves their own row to organization B. */
+async function membershipChecks(
+  db: PGlite,
+  info: TableInfo,
+  byName: Map<string, TableInfo>,
+  orgs: TenantSeed,
+  own: string,
+): Promise<ProbeCheck[]> {
+  const m = orgs.tenancy.members;
+  if (!orgs.orgA || !orgs.orgB) return [];
+  const target = rel(info.name);
+  const pinned: Record<string, string> = { [m.tenantColumn]: orgs.orgA, [m.userColumn]: USER_B };
+  if (m.roleColumn && m.memberRole) pinned[m.roleColumn] = m.memberRole;
+  const row = await rowFor(db, info, byName, USER_B, pinned);
+  const join =
+    typeof row === "string"
+      ? { rows: 0, inconclusive: row }
+      : await tryAs(
+          db,
+          "other-user",
+          `with i as (${insertSql(info, row)} returning 1) select count(*)::int as n from i`,
+          row.values,
+        );
+  const type = info.columns.find((c) => c.name === m.tenantColumn)?.type ?? "text";
+  const move = await tryAs(
+    db,
+    "owner",
+    `update ${target} set ${quote(m.tenantColumn)} = $1::text::${type} where ${own}`,
+    [orgs.orgB],
+    undefined,
+    `select count(*)::int as n from ${target}
+      where ${quote(m.userColumn)}::text = '${USER_A}' and ${quote(m.tenantColumn)}::text = ${lit(orgs.orgB)}`,
+  );
+  return [
+    toCheck("other-user", "insert", 1, join, undefined, "self-join"),
+    toCheck("owner", "update", 1, move, m.tenantColumn, "move-tenant"),
+  ];
+}
+
+async function probeTable(
+  db: PGlite,
+  info: TableInfo,
+  byName: Map<string, TableInfo>,
+  orgs?: TenantSeed,
+): Promise<ProbeCheck[]> {
   const target = rel(info.name);
   const where = info.mine;
   const { rows } = await db.query<{ n: number }>(`select count(*)::int as n from ${target} where ${where}`);
@@ -503,17 +789,23 @@ async function probeTable(db: PGlite, info: TableInfo, byName: Map<string, Table
   // An insert in A's name collides with A's seeded row when the owner column is unique (profiles keyed by user).
   const ownerUnique = info.columns.some((c) => info.ownerColumns.includes(c.name) && c.unique);
   const clearSlot = ownerUnique ? `delete from ${target} where ${where}` : undefined;
+  const via = info.tenant?.via.kind;
+  const actors: Actor[] = info.tenant ? ["anon", "other-user", "non-member"] : ["anon", "other-user"];
 
-  for (const actor of ["anon", "other-user"] as const) {
+  for (const actor of actors) {
     checks.push(
       toCheck(actor, "select", of, await tryAs(db, actor, `select count(*)::int as n from ${target} where ${where}`)),
     );
-    if (info.kind === "view") continue;
+    // User C stands for "any signed-in account": reads only; user B covers writes from outside.
+    if (info.kind === "view" || actor === "non-member") continue;
 
-    const row = await rowFor(db, info, byName);
+    // Joining organization A is its own try (membershipChecks). Creating a new organization is normal, and
+    // one that names user A as its creator gives B nothing of A's, so B does not try it.
+    const skipInsert = actor === "other-user" && (via === "members" || via === "tenant");
+    const row = skipInsert ? undefined : await rowFor(db, info, byName);
     if (typeof row === "string") {
       checks.push(toCheck(actor, "insert", 1, { rows: 0, inconclusive: row }));
-    } else {
+    } else if (row) {
       const insert = await tryAs(
         db,
         actor,
@@ -539,10 +831,18 @@ async function probeTable(db: PGlite, info: TableInfo, byName: Map<string, Table
     checks.push(toCheck(actor, "delete", of, remove));
   }
 
-  if (info.kind === "table" && info.ownerColumns.length) {
-    for (const column of info.columns.filter((c) => PRIVILEGED_COLUMN.test(c.name) && !c.generated)) {
-      checks.push(await escalation(db, info, column, of));
-    }
+  if (info.kind === "table" && (info.ownerColumns.length || info.tenant)) {
+    const m = info.tenant?.members;
+    // On a membership table, user A may only touch their own row; elsewhere, user A's (or organization A's) rows.
+    const own =
+      via === "members" && m && orgs?.orgA
+        ? `${quote(m.userColumn)}::text = '${USER_A}' and ${quote(m.tenantColumn)}::text = ${lit(orgs.orgA)}`
+        : where;
+    const privileged = info.columns.filter(
+      (c) => !c.generated && (PRIVILEGED_COLUMN.test(c.name) || (via === "members" && c.name === m?.roleColumn)),
+    );
+    for (const column of privileged) checks.push(await escalation(db, info, column, of, own));
+    if (via === "members" && orgs) checks.push(...(await membershipChecks(db, info, byName, orgs, own)));
   }
   return checks;
 }
@@ -661,8 +961,38 @@ async function loadTolerant(db: PGlite, file: SqlFile, text: string, failed: Fai
   }
 }
 
-/** The statement names the table (quoted names exactly, plain names in any case). */
+const NAME = String.raw`((?:"(?:[^"]|"")+"|[\w$]+)(?:\s*\.\s*(?:"(?:[^"]|"")+"|[\w$]+))?)`;
+/** What a statement is about: create/alter table, a policy, trigger, index or grant on it. */
+const TARGETS = [
+  new RegExp(String.raw`^\s*create\s+(?:unlogged\s+)?table\s+(?:if\s+not\s+exists\s+)?${NAME}`, "i"),
+  new RegExp(String.raw`^\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?${NAME}`, "i"),
+  new RegExp(String.raw`^\s*create\s+policy\s+(?:"(?:[^"]|"")+"|\w+)\s+on\s+${NAME}`, "i"),
+  new RegExp(
+    String.raw`^\s*(?:create\s+(?:or\s+replace\s+)?(?:constraint\s+)?trigger|create\s+(?:unique\s+)?index|grant|revoke|comment)\b[\s\S]*?\bon\s+(?:table\s+)?(?:only\s+)?${NAME}`,
+    "i",
+  ),
+];
+
+/** The bare table name a DDL statement is about, or undefined when it is something else (a DO block). */
+export function statementTarget(statement: string): string | undefined {
+  const body = statement.replace(/^(?:\s*--[^\n]*\n)+/, "");
+  for (const pattern of TARGETS) {
+    const raw = body.match(pattern)?.[1];
+    if (!raw) continue;
+    const last = raw.split(/\s*\.\s*(?=(?:"|[\w$]))/).pop() ?? raw;
+    return last.startsWith('"') ? last.slice(1, -1).replaceAll('""', '"') : last.toLowerCase();
+  }
+  return undefined;
+}
+
+/**
+ * The statement is about the table: its target when the statement has one (a failed `create table x
+ * (... references organizations)` is about x, not organizations), else any mention of the name (quoted
+ * names exactly, plain names in any case).
+ */
 function mentions(statement: string, table: string): boolean {
+  const target = statementTarget(statement);
+  if (target !== undefined) return target === table;
   const name = escapeRegExp(table);
   const plain = /^[a-z_][a-z0-9_]*$/.test(table) ? `|\\b${name}\\b` : "";
   return new RegExp(`"${name}"${plain}`, plain ? "i" : "").test(statement);
@@ -714,6 +1044,22 @@ export async function probeRls(migrations: SqlFile[], tolerant = false): Promise
     const byName = new Map(tables.map((t) => [t.name, t]));
     const ordering = seedOrder(tables.filter((t) => t.kind === "table"));
     linkOwnership(ordering);
+    // An organization model decides who owns the rows it reaches, ahead of a creator column or a parent.
+    const tenancy = detectTenancy(tables);
+    const orgs: TenantSeed | undefined = tenancy ? { tenancy } : undefined;
+    if (tenancy) {
+      for (const info of tables) {
+        const link = tenancy.links.get(info.name);
+        if (!link) continue;
+        info.tenant = link;
+        delete info.ownedVia;
+      }
+      await db.query(
+        `insert into auth.users (id, email, raw_user_meta_data) values
+           ($1, 'user-c@example.invalid', '{"full_name":"User C"}'), ($2, 'user-d@example.invalid', '{"full_name":"User D"}')`,
+        [USER_C, USER_D],
+      );
+    }
     const skipped = new Map<string, string>();
     // A table a rejected statement was about (its RLS switch, a policy) is not in the state the real database
     // is in, so the probe leaves it out rather than report what that missing statement would have blocked.
@@ -724,11 +1070,23 @@ export async function probeRls(migrations: SqlFile[], tolerant = false): Promise
     }
     for (const info of ordering) {
       if (skipped.has(info.name)) continue;
-      await fixMine(db, info, byName);
+      const via = info.tenant?.via.kind;
+      const first =
+        orgs && via === "tenant"
+          ? await seedTenants(db, info, byName, orgs)
+          : orgs && via === "members"
+            ? await seedMembers(db, info, byName, orgs)
+            : undefined;
+      if (first) {
+        skipped.set(info.name, first);
+        continue;
+      }
+      await fixMine(db, info, byName, orgs);
       const reason = await seed(db, info, byName);
       if (reason) skipped.set(info.name, reason);
     }
-    for (const view of tables.filter((t) => t.kind === "view")) await fixMine(db, view, byName);
+    for (const view of tables.filter((t) => t.kind === "view")) await fixMine(db, view, byName, orgs);
+    if (orgs) await tenantClaims(db, orgs);
 
     const out: TableProbe[] = [];
     for (const info of tables) {
@@ -740,11 +1098,14 @@ export async function probeRls(migrations: SqlFile[], tolerant = false): Promise
         columns: info.columns.map((c) => c.name),
         ownerColumns: info.ownerColumns,
         ...(info.ownedVia ? { ownedVia: info.ownedVia } : {}),
+        ...(info.tenant ? { tenant: info.tenant } : {}),
         policies: info.kind === "table" ? await policiesOf(db, info.name) : [],
       };
       const reason = skipped.get(info.name);
       out.push(
-        reason ? { ...base, checks: [], skipped: reason } : { ...base, checks: await probeTable(db, info, byName) },
+        reason
+          ? { ...base, checks: [], skipped: reason }
+          : { ...base, checks: await probeTable(db, info, byName, orgs) },
       );
     }
     return {

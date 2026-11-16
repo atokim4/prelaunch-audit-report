@@ -74,7 +74,12 @@ export interface StaticContext {
   publicContentBucket?: boolean;
 }
 
-export type Actor = "anon" | "other-user" | "owner";
+/**
+ * "other-user" is user B. With an organization (team, workspace) model, B is an admin of a second
+ * organization and "non-member" is a signed-in user C who belongs to none; "owner" is then user A as a
+ * plain member of organization A.
+ */
+export type Actor = "anon" | "other-user" | "owner" | "non-member";
 export type Action = "select" | "insert" | "update" | "delete";
 
 /** One try of the RLS probe: an actor doing an action on user A's rows, inside a rolled-back transaction. */
@@ -91,6 +96,38 @@ export interface ProbeCheck {
   refused?: string;
   /** The try failed for another reason (a constraint the guessed values broke): neither leak nor block. */
   inconclusive?: string;
+  /**
+   * Membership tries: "self-join" is user B adding themselves to organization A; "move-tenant" is user A
+   * moving their own membership row to organization B.
+   */
+  scenario?: "self-join" | "move-tenant";
+}
+
+/** The membership table of an organization (team, workspace) model. */
+export interface Membership {
+  /** `public.<name>`. */
+  table: string;
+  tenantColumn: string;
+  userColumn: string;
+  roleColumn?: string;
+  /** Role values that manage the organization (owner, admin); empty when the schema does not say. */
+  adminRoles: string[];
+  /** The plain member value the probe gave user A. */
+  memberRole?: string;
+}
+
+/** How one table's rows belong to an organization. */
+export interface TenantLink {
+  /** The organization table, `public.<name>`, its key column and the key's type. */
+  tenant: string;
+  tenantKey: string;
+  tenantKeyType: string;
+  members: Membership;
+  via:
+    | { kind: "tenant" }
+    | { kind: "members" }
+    | { kind: "column"; column: string }
+    | { kind: "parent"; column: string; parent: string; parentColumn: string; parentTenantColumn?: string };
 }
 
 /** A row with no owner column of its own that belongs to whoever owns its parent row. */
@@ -117,6 +154,8 @@ export interface Proof {
   /** Columns that tie a row to a user. Empty with no ownedVia: shared data (price list, settings). */
   ownerColumns: string[];
   ownedVia?: OwnedVia;
+  /** Rows belong to an organization: members of it may reach them, nobody else. */
+  tenant?: TenantLink;
   checks: ProbeCheck[];
   /** The checks that got through. */
   leaks: ProbeCheck[];

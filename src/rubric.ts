@@ -367,6 +367,21 @@ const PROBE_CLASS: Record<string, { title: string; why: string; fix: string }> =
     why: "The probe signed in as the row's owner and changed a plan, role or billing column. A free account can make itself paid with one request.",
     fix: "Revoke update on the table, grant update only on the safe columns, and change paid columns only from the server after Stripe confirms payment.",
   },
+  "tenant-join": {
+    title: "Any signed-in user can join another organization",
+    why: "The probe signed in as an admin of organization B and added themselves to organization A, or moved their own membership row there. Every policy that trusts membership then lets them read and change that organization's data, so one sign-up gets into every customer's workspace.",
+    fix: "Allow inserts and updates of the membership table only for admins of the target organization (or only from the server through an invite flow), and stop members from changing the organization column of their own row.",
+  },
+  "cross-tenant": {
+    title: "One organization can reach another organization's rows",
+    why: "The table belongs to organizations and has Row Level Security, but the probe, signed in as an admin of organization B or as a user in no organization, still read or changed rows of organization A. The policy checks that the caller is signed in or is a member of some organization, not of this row's organization.",
+    fix: "Compare the row's organization with the caller's memberships in every policy, through a SECURITY DEFINER helper such as `is_org_member(org_id)` so the membership table's own policies do not recurse.",
+  },
+  "member-escalation": {
+    title: "Plain members can change their own role or the organization's billing fields",
+    why: "The probe signed in as a plain member of organization A and changed a role, plan or billing column that only an admin, the server or Stripe should set. A member can make themselves the owner and then remove everyone else.",
+    fix: "Let only the organization's admins update the membership table, lock the organization column of membership rows, and change plan columns only from the server after Stripe confirms payment.",
+  },
   "anon-write": {
     title: "Anyone can change shared data",
     why: "The probe added, changed or deleted rows of a table that belongs to no user (a price list, settings), which every visitor sees.",
@@ -374,8 +389,9 @@ const PROBE_CLASS: Record<string, { title: string; why: string; fix: string }> =
   },
 };
 
-/** Rows belong to someone: an owner column, or a parent row that has one. */
-const owned = (proof: Proof): boolean => proof.ownerColumns.length > 0 || proof.ownedVia !== undefined;
+/** Rows belong to someone: an owner column, a parent row that has one, or an organization. */
+const owned = (proof: Proof): boolean =>
+  proof.ownerColumns.length > 0 || proof.ownedVia !== undefined || proof.tenant !== undefined;
 
 /** Static rules that mean other people can read the rows, unless a probe shows otherwise. */
 const OPEN_READ = new Set(["rls-disabled", "view-bypasses-rls", "auth-users-exposed"]);
@@ -400,7 +416,9 @@ export function proofSeverity(proof: Proof): Severity | undefined {
   if (!proof.leaks.length) return undefined;
   const anon = proof.leaks.some((c) => c.actor === "anon");
   const writes = proof.leaks.some((c) => c.action !== "select");
-  if (anon || (!owned(proof) && writes)) return "critical";
+  // Joining someone else's organization opens every table that trusts membership.
+  const joins = proof.leaks.some((c) => c.scenario);
+  if (anon || joins || (!owned(proof) && writes)) return "critical";
   return "high";
 }
 
@@ -409,9 +427,22 @@ export function proofClass(proof: Proof): keyof typeof PROBE_CLASS | undefined {
   if (!proof.leaks.length) return undefined;
   if (!owned(proof)) return "anon-write";
   if (proof.leaks.some((c) => c.actor === "anon")) return "anon";
-  if (proof.leaks.some((c) => c.actor === "other-user")) return "other-user";
+  if (proof.leaks.some((c) => c.scenario)) return "tenant-join";
+  if (proof.tenant) {
+    return proof.leaks.some((c) => c.actor !== "owner") ? "cross-tenant" : "member-escalation";
+  }
+  if (proof.leaks.some((c) => c.actor === "other-user" || c.actor === "non-member")) return "other-user";
   return "owner";
 }
+
+/** CWE of a probe class. */
+const PROBE_CWE: Record<string, Cwe> = {
+  owner: CWE.massAssignment,
+  "other-user": CWE.incorrectAuthz,
+  "tenant-join": CWE.privilege,
+  "cross-tenant": CWE.incorrectAuthz,
+  "member-escalation": CWE.privilege,
+};
 
 const max = (a: Severity, b: Severity | undefined): Severity => (b && SEVERITY_RANK[b] > SEVERITY_RANK[a] ? b : a);
 
@@ -534,15 +565,29 @@ function probeInfo(raw: RawFinding): RuleInfo | undefined {
   return {
     title: text.title,
     severity: () => proofSeverity(proof) ?? "low",
-    cwe: kind === "owner" ? CWE.massAssignment : kind === "other-user" ? CWE.incorrectAuthz : CWE.missingAuthz,
+    cwe: PROBE_CWE[kind] ?? CWE.missingAuthz,
     whyItMatters: text.why,
     fix: text.fix,
     effort: "under 1 hour",
   };
 }
 
-/** Rubric entry for a raw finding, or undefined when it is not a finding for the report. */
+const TENANT_CLASSES = new Set(["tenant-join", "cross-tenant", "member-escalation"]);
+
+/**
+ * Rubric entry for a raw finding, or undefined when it is not a finding for the report. A static rule on a
+ * table that belongs to an organization takes the probe's words when the probe saw a leak: "users can edit
+ * their own plan" undersells a member who can make themselves owner or join another company.
+ */
 export function ruleInfo(raw: RawFinding): RuleInfo | undefined {
+  const own = staticRuleInfo(raw);
+  const kind = raw.proof?.tenant && raw.source !== "rls-probe" ? proofClass(raw.proof) : undefined;
+  if (!own || !kind || !TENANT_CLASSES.has(kind)) return own;
+  const probe = probeInfo(raw);
+  return probe ? { ...probe, severity: (r) => max(own.severity(r), probe.severity(r)), effort: own.effort } : own;
+}
+
+function staticRuleInfo(raw: RawFinding): RuleInfo | undefined {
   switch (raw.source) {
     case "rls-probe":
       return probeInfo(raw);
@@ -575,7 +620,7 @@ export function repoRuleTable(): { source: string; rule: string; title: string; 
       source: "rls-probe",
       rule: `rls-probe-leak (${kind})`,
       title: text.title,
-      cwe: kind === "owner" ? CWE.massAssignment : kind === "other-user" ? CWE.incorrectAuthz : CWE.missingAuthz,
+      cwe: PROBE_CWE[kind] ?? CWE.missingAuthz,
     })),
   ].map(({ source, rule, title, cwe }) => ({ source, rule, title, cwe }));
 }
@@ -616,6 +661,9 @@ const PROBE_RISK: Record<string, string> = {
   anon: "Visitors without an account can read or change your users' records.",
   "other-user": "Any signed-in user can see or change other customers' records.",
   owner: "A signed-in user can switch their own account to the paid plan without paying.",
+  "tenant-join": "Anyone who signs up can add themselves to another company's workspace and see its data.",
+  "cross-tenant": "One customer company can see or change another company's data.",
+  "member-escalation": "A team member can make themselves the owner of their workspace.",
   "anon-write": "Anyone can change data every customer sees, such as your prices.",
 };
 
@@ -651,6 +699,8 @@ export function plainRisk(finding: {
   if (finding.adminGate) {
     return "Any signed-in user can make themselves an admin and then see or change everyone's data.";
   }
+  const tenantKind = finding.proof?.tenant ? proofClass(finding.proof) : undefined;
+  if (tenantKind && TENANT_CLASSES.has(tenantKind)) return PROBE_RISK[tenantKind] ?? finding.title;
   if (finding.source === "rls-probe") {
     const kind = finding.proof && proofClass(finding.proof);
     return (kind && PROBE_RISK[kind]) ?? finding.title;

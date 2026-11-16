@@ -101,6 +101,18 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
         `${probe.tool.note ?? ""} supabase/migrations alone did not load (${first.tool.note ?? ""}), so the probe ran again with ${added.join(", ")} loaded first.`.trim();
     }
   }
+  // Still failing: the migrations themselves do not run in order on an empty database (a table used before
+  // the file that creates it). Load what loads, statement by statement; the tables a rejected statement
+  // names are left out of the probe and listed.
+  if (probe.tool.status === "failed") {
+    const retry = await runRlsProbe(ctx.probeSql, true);
+    if (retry.tool.status === "ok") {
+      probe = retry;
+      tolerant = true;
+      probe.tool.note =
+        `${probe.tool.note ?? ""} The migrations did not load in order (${first.tool.note ?? ""}), so the probe loaded them statement by statement.`.trim();
+    }
+  }
   const kept = await filterPreflight(preflight.findings, ctx.read, ARCHIVED_SQL);
   preflight.findings = kept.findings;
   if (kept.archived.length) {
@@ -130,6 +142,23 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
     preflight.findings = preflight.findings.filter((f) => !notCallable.includes(f));
     probe.tool.note =
       `${probe.tool.note ?? ""} ${notCallable.length} SECURITY DEFINER function(s) the static rule called open to visitors are not executable by anon once the schema is loaded (${notCallable.map((f) => `\`${f.subject ?? ""}\``).join(", ")}); not reported.`.trim();
+  }
+  // The static rule reads "an update policy and a role column" as "users can promote themselves". When the
+  // probe tried exactly that column as a plain user and Postgres refused (an admin-only policy, a trigger),
+  // and nothing else leaked on the table, the claim is disproved.
+  const probed = new Map((probe.result?.tables ?? []).filter((t) => !t.skipped).map((t) => [t.table, t]));
+  const disproved = preflight.findings.filter((f) => {
+    if (f.rule !== "rls-update-privileged-column") return false;
+    const table = probed.get((f.subject ?? "").toLowerCase());
+    const column = f.message.match(/including `(\w+)`/)?.[1];
+    if (!table || !column || leaks(table).length) return false;
+    const tries = table.checks.filter((c) => c.actor === "owner" && c.column);
+    return tries.some((c) => c.column === column) && tries.every((c) => c.refused || (c.rows === 0 && !c.inconclusive));
+  });
+  if (disproved.length) {
+    preflight.findings = preflight.findings.filter((f) => !disproved.includes(f));
+    probe.tool.note =
+      `${probe.tool.note ?? ""} ${disproved.length} update polic${disproved.length === 1 ? "y" : "ies"} the static rule read as "users can edit their own role or plan" did not let a plain signed-in user change those columns in the probe (${disproved.map((f) => `\`${f.subject ?? ""}\``).join(", ")}); not reported.`.trim();
   }
   for (const result of [preflight, secrets, ...(deps ? [deps] : [])]) {
     raws.push(...result.findings);

@@ -1,5 +1,5 @@
 import { functionTable } from "../shape.ts";
-import type { Finding, LiveBucket, LiveTable, ProbePolicy, Proof } from "../types.ts";
+import type { Action, Finding, LiveBucket, LiveTable, ProbePolicy, Proof } from "../types.ts";
 import type { FileEdit } from "./diff.ts";
 import {
   functionArgs,
@@ -496,7 +496,12 @@ function scopesToCaller(expression: string | undefined, owners: string[]): boole
 const scopeColumns = (proof: Proof): string[] =>
   proof.ownerColumns.length ? proof.ownerColumns : proof.ownedVia ? [proof.ownedVia.column] : [];
 
-const ROLE_OF = { anon: "anon", "other-user": "authenticated", owner: "authenticated" } as const;
+const ROLE_OF = {
+  anon: "anon",
+  "other-user": "authenticated",
+  owner: "authenticated",
+  "non-member": "authenticated",
+} as const;
 
 /** Permissive policies that let the probe's leaks through: right command and role, not scoped to the caller. */
 export function weakPolicies(proof: Proof): ProbePolicy[] {
@@ -588,11 +593,51 @@ function lockEscalatedColumns(finding: Finding, ctx: FixContext, proof: Proof): 
   };
 }
 
+/**
+ * Shared data (no owner, no organization) that visitors or users can write: keep what reads it, drop every
+ * write the API roles had, so only the server (service role) and the dashboard change it.
+ */
+function readOnlyShared(finding: Finding, ctx: FixContext, proof: Proof): PatchDraft | undefined {
+  const writes = new Set(proof.leaks.filter((c) => c.action !== "select").map((c) => c.action));
+  const weak = proof.policies.filter((p) => p.command === "all" || writes.has(p.command as Action));
+  if (!weak.length) return undefined;
+  const table = publicRel(proof.table);
+  const body = weak.flatMap((p, n) => [
+    ...(n ? [""] : []),
+    `drop policy if exists ${identPart(p.name)} on ${table};`,
+    ...(p.command === "all"
+      ? [
+          "",
+          `create policy ${identPart(p.name)}`,
+          `  on ${table} for select`,
+          `  to ${p.roles.map((r) => identPart(r)).join(", ")}`,
+          `  using (${p.using ?? "true"});`,
+        ]
+      : []),
+  ]);
+  return {
+    edits: [
+      migration(
+        ctx,
+        `read_only_${slugOf(proof.table)}`,
+        `${finding.id}: ${proof.table} is shared data; writes only from the server.`,
+        body,
+      ),
+    ],
+    summary: `Drops the write side of ${weak.map((p) => `"${p.name}"`).join(", ")}: ${proof.table} stays readable as before, and only the server (service role) or the dashboard can change it.`,
+    caveats: [
+      "If an admin screen in the browser edits this table, move that into a server function that checks the caller is an admin.",
+    ],
+  };
+}
+
 export const probeLeak: Fixer = async (finding, ctx) => {
   const proof = finding.proof;
   if (!proof || proof.kind !== "table") return undefined;
   if (proof.leaks.length && proof.leaks.every((c) => c.actor === "owner"))
     return lockEscalatedColumns(finding, ctx, proof);
+  const shared = !proof.ownerColumns.length && !proof.ownedVia && !proof.tenant;
+  if (shared && proof.leaks.some((c) => c.action !== "select")) return readOnlyShared(finding, ctx, proof);
   const condition = ownerCondition(proof);
   if (!condition) return undefined;
   const weak = weakPolicies(proof);

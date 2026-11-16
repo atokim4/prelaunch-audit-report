@@ -85,6 +85,7 @@ const ACTOR_LABEL: Record<Actor, string> = {
   anon: "Visitor, no account",
   "other-user": "Another user",
   owner: "Owner",
+  "non-member": "Signed in, no organization",
 };
 const ACTIONS: Action[] = ["select", "insert", "update", "delete"];
 const ACTION_LABEL: Record<Action, string> = {
@@ -111,21 +112,41 @@ function ownerText(proof: Proof): string {
   return ", no owner column (shared data)";
 }
 
+/** With an organization model the actors are named by where they belong. */
+const TENANT_LABEL: Record<Actor, string> = {
+  anon: "Visitor, no account",
+  "other-user": "Admin of org B",
+  owner: "Plain member of org A",
+  "non-member": "Signed in, no org",
+};
+
 /** The probe's tries on one table, as a small grid: actors down, actions across. */
 function proofHtml(proof: Proof): string {
   const leaked = new Set(proof.leaks);
-  const rows = (["anon", "other-user"] as const)
+  const tenant = proof.tenant;
+  const labels = tenant ? TENANT_LABEL : ACTOR_LABEL;
+  const actors: Actor[] = tenant ? ["anon", "other-user", "non-member"] : ["anon", "other-user"];
+  const rows = actors
     .map((actor) => {
       const cells = ACTIONS.map((action) => {
-        const check = proof.checks.find((c) => c.actor === actor && c.action === action && !c.column);
+        const check = proof.checks.find((c) => c.actor === actor && c.action === action && !c.column && !c.scenario);
         return cell(check, check ? leaked.has(check) : false);
       });
-      return `<tr><th scope="row">${ACTOR_LABEL[actor]}</th>${cells.join("")}</tr>`;
+      return `<tr><th scope="row">${labels[actor]}</th>${cells.join("")}</tr>`;
     })
     .join("");
   const escalations = proof.checks
-    .filter((c) => c.actor === "owner" && c.column)
+    .filter((c) => c.actor === "owner" && c.column && !c.scenario)
     .map((c) => `<code>${esc(c.column ?? "")}</code> ${c.rows ? '<b class="pc-leak-text">changed</b>' : "refused"}`);
+  const membership = proof.checks
+    .filter((c) => c.scenario)
+    .map((c) => {
+      const what =
+        c.scenario === "self-join"
+          ? "admin of org B adds themselves to org A"
+          : "plain member moves their own row to org B";
+      return `${what}: ${c.inconclusive ? "?" : c.rows ? '<b class="pc-leak-text">got through</b>' : "refused"}`;
+    });
   const after = proof.afterPatches;
   const verdict =
     after === undefined
@@ -134,18 +155,20 @@ function proofHtml(proof: Proof): string {
         ? ""
         : after.length === 0
           ? `<p class="probe-after">Same harness with the report's patches applied: <b>0 leaks</b>.</p>`
-          : `<p class="probe-after">Same harness with the report's patches applied: <b>${after.length} still open</b> (${after.map((c) => `${ACTOR_LABEL[c.actor].toLowerCase()} ${c.column ? `changes ${c.column}` : ACTION_LABEL[c.action]}`).join(", ")}).</p>`;
+          : `<p class="probe-after">Same harness with the report's patches applied: <b>${after.length} still open</b> (${after.map((c) => `${labels[c.actor].toLowerCase()} ${c.scenario === "self-join" ? "joins org A" : c.column ? `changes ${c.column}` : ACTION_LABEL[c.action]}`).join(", ")}).</p>`;
   return `<section class="probe">
     <h4>Tested in Postgres</h4>
-    <p class="probe-what">User A owns ${proof.kind === "view" ? "the rows behind this view" : "one row"}; each cell is what the actor got in a rolled-back transaction${ownerText(proof)}.${proof.checks.some((c) => c.inconclusive) ? ` "?" means the try failed for another reason (a constraint the test values broke), so it proves nothing either way.` : ""}</p>
-    <table class="probe-grid"><thead><tr><th></th>${ACTIONS.map((a) => `<th>${ACTION_LABEL[a]}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table>
-    ${escalations.length ? `<p class="probe-what">Owner editing paid columns on their own row: ${escalations.join(", ")}.</p>` : ""}
+    <p class="probe-what">${tenant ? `Organization A has ${tenant.via.kind === "members" ? "user A as a plain member" : "one row here"} (rows belong to <code>${esc(tenant.tenant)}</code>${tenant.via.kind === "parent" ? ` through <code>${esc(tenant.via.column)}</code> → <code>${esc(tenant.via.parent)}</code>` : tenant.via.kind === "column" ? ` through <code>${esc(tenant.via.column)}</code>` : ""}); each cell is what the actor got in a rolled-back transaction.` : `User A owns ${proof.kind === "view" ? "the rows behind this view" : "one row"}; each cell is what the actor got in a rolled-back transaction${ownerText(proof)}.`}${proof.checks.some((c) => c.inconclusive) ? ` "?" means the try failed for another reason (a constraint the test values broke), so it proves nothing either way.` : ""}</p>
+    <table class="probe-grid"><thead><tr><th></th>${ACTIONS.map((a) => `<th>${tenant && a === "insert" ? "insert into org A" : ACTION_LABEL[a]}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table>
+    ${escalations.length ? `<p class="probe-what">${tenant ? "Plain member editing role or billing columns" : "Owner editing paid columns on their own row"}: ${escalations.join(", ")}.</p>` : ""}
+    ${membership.length ? `<p class="probe-what">Membership: ${membership.join("; ")}.</p>` : ""}
     ${verdict}
   </section>`;
 }
 
 /** Every table the probe tried, one line each: the access matrix for the summary. */
 function matrixHtml(matrix: Proof[]): string {
+  const tenancy = matrix.find((p) => p.tenant)?.tenant;
   const rows = matrix
     .map((p) => {
       const read = (actor: Actor) => p.checks.find((c) => c.actor === actor && c.action === "select");
@@ -164,12 +187,16 @@ function matrixHtml(matrix: Proof[]): string {
       };
       const own = p.leaks.filter((c) => c.actor === "owner").map((c) => c.column ?? "");
       const ownText = own.length > 1 ? `${own[0]} +${own.length - 1}` : (own[0] ?? "");
-      return `<tr><td><code>${esc(p.table.replace(/^public\./, ""))}</code>${p.kind === "view" ? ' <span class="kind">view</span>' : ""}</td>${readCell("anon")}${writeCell("anon")}${readCell("other-user")}${writeCell("other-user")}<td class="pc ${own.length ? "pc-leak" : "pc-ok"}">${own.length ? esc(ownText) : "none"}</td></tr>`;
+      return `<tr><td><code>${esc(p.table.replace(/^public\./, ""))}</code>${p.kind === "view" ? ' <span class="kind">view</span>' : ""}</td>${readCell("anon")}${writeCell("anon")}${readCell("other-user")}${writeCell("other-user")}${tenancy ? readCell("non-member") : ""}<td class="pc ${own.length ? "pc-leak" : "pc-ok"}">${own.length ? esc(ownText) : "none"}</td></tr>`;
     })
     .join("");
   return `<h4>Who can reach user A's rows</h4>
     <p class="probe-what">The RLS probe ran your migrations in a local Postgres, gave user A one row per table and tried every action as a visitor without an account and as a second user. Red cells got through: "1/1" means one of user A's one rows. "Self-upgrade" is user A changing a plan or billing column on their own row. A table with no owner column of its own belongs to the owner of the row its foreign key points at; shared tables with no owner at all (price lists) count only writes. "?" is a try that failed for another reason and proves nothing.</p>
-    <table class="matrix"><thead><tr><th>Table</th><th>Visitor read</th><th>Visitor write</th><th>User B read</th><th>User B write</th><th>Self-upgrade</th></tr></thead><tbody>${rows}</tbody></table>`;
+    <table class="matrix"><thead><tr><th>Table</th><th>Visitor read</th><th>Visitor write</th><th>User B read</th><th>User B write</th>${tenancy ? "<th>No-org read</th>" : ""}<th>Self-upgrade</th></tr></thead><tbody>${rows}</tbody></table>${
+      tenancy
+        ? `<p class="probe-what">The schema has an organization model (<code>${esc(tenancy.tenant)}</code>, members in <code>${esc(tenancy.members.table)}</code>). For the tables that belong to an organization, "user A's rows" means organization A's rows: user A is a plain member of organization A, user B is an admin of organization B, and "No-org read" is a signed-in user who belongs to no organization. On those tables "Self-upgrade" also covers a plain member changing their own role and moving their membership to another organization.</p>`
+        : ""
+    }`;
 }
 
 function liveCell(c: LiveCount | undefined, leaked = false): string {
@@ -555,7 +582,7 @@ export async function renderHtml(result: AuditResult, options: RenderOptions = {
       <div><h4>What was checked</h4><ul>
         <li>Project: ${esc(shapeLine(result))}.</li>
         <li>Supabase migrations: RLS, policies, views, SECURITY DEFINER functions, storage buckets.</li>
-        ${result.probe ? `<li>Row Level Security by behaviour: ${result.probe.length} tables and views tried as a visitor and as a second user in a local Postgres, before and after the patches.</li>` : ""}
+        ${result.probe ? `<li>Row Level Security by behaviour: ${result.probe.length} tables and views tried as a visitor and as a second user in a local Postgres, before and after the patches.${result.probe.some((p) => p.tenant) ? ` Organization tables also as an admin of another organization and a user in none, with self-join and self-promotion tries.` : ""}</li>` : ""}
         <li>App code: server keys in browser code, public env prefixes, the Stripe webhook${result.app.shape.edgeFunctions.length ? " (including Deno edge functions and their JWT setting)" : ""}.</li>
         <li>Credentials in the files and in git history.</li>
         ${result.tools.some((t) => t.name === "npm audit" && t.status === "ok") ? "<li>Runtime dependencies against npm's advisory database.</li>" : ""}

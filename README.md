@@ -15,13 +15,20 @@ visitor and as two test users the owner creates, never downloads a row, and puts
 probe with a list of where the live database and the migrations disagree (a policy fixed or opened in the
 dashboard, a table made there).
 
+B2B apps with organizations, teams or workspaces get the same treatment one level up. When the schema has a
+membership table, the probe makes two organizations, puts user A in the first as a plain member and user B in
+the second as an admin, adds a signed-in user C who belongs to nowhere, and checks whether B or C can reach the
+first organization's rows, whether B can add themselves to it, and whether A can promote themselves or move
+their membership elsewhere. The patch for those tables is a pair of membership helpers and policies that ask
+"is the caller a member (or an admin) of this row's organization".
+
 For health apps, `--phi` adds a health-data pass: it maps the columns that hold protected health information
 (PHI), rates any read of them by someone other than the record's own account as Critical, follows the data into
 session replay and analytics scripts, AI, email and SMS calls, function logs and public buckets, writes an
 append-only audit-trail migration, and fills in Supabase's HIPAA checklist with what the code shows. It is a
 technical scan, not a compliance assessment.
 
-I built it as a personal project. The three sample reports below are runs on demo apps I wrote with security
+I built it as a personal project. The four sample reports below are runs on demo apps I wrote with security
 holes on purpose. They are not client audits.
 
 | Sample                                                                            | App shape                                                                   |
@@ -29,6 +36,7 @@ holes on purpose. They are not client audits.
 | [Vite + Supabase Edge Functions](examples/sample-report-vite-supabase/report.pdf) | React SPA, migrations, Deno edge functions (the shape AI builders generate) |
 | [Next.js App Router](examples/sample-report/report.pdf)                           | Next.js 15, route handlers, migrations, storage buckets                     |
 | [Clinic app, health-data mode](examples/sample-report-clinic-phi/report.pdf)      | Lovable-shaped Vite SPA with patient records, run with `--phi`              |
+| [B2B team workspace](examples/sample-report-multitenant/report.pdf)               | Next.js, organizations, members, invitations, projects, Stripe per org      |
 
 ![Pages 1 to 3 of the Vite + Supabase sample report](media/cover-vite-1600x900.png)
 
@@ -100,7 +108,8 @@ columns get fresh values. Then, each in a transaction that is rolled back:
 Which SQL loads: `supabase/migrations` when the repo has it, with Prisma or Drizzle migrations first (they create
 the tables those migrations add policies to). Without it, the base files (`schema.sql`, `sql/baseline.sql`) and
 then each `migrations/` folder, in path order. Seeds, demo data, rollbacks, tests, docs and read-only diagnostics
-are left out. Files outside `supabase/migrations` load one statement at a time: a statement Postgres rejects is
+are left out. When the migrations do not run in order on an empty database (a table referenced one file before the file that
+creates it), the probe loads them one statement at a time too. Files outside `supabase/migrations` load one statement at a time: a statement Postgres rejects is
 stepped over and listed, and any table it names is left out of the probe, so a policy that failed to load is
 never reported as a hole. When `supabase/migrations` builds on a `schema.sql` it never created, the probe runs
 again with that file first. Role columns of user A start at a plain value (`receptionist`, not `admin`).
@@ -116,6 +125,43 @@ on every other column. A table that belongs to no user at all (a price list) may
 everyone; only writes to it count. When no static rule explains a leak, it becomes its own finding pointing at the policy that
 let it through. The two most common shapes it catches that policy linters pass are `using (auth.role() =
 'authenticated')` on a select and `with check (auth.uid() is not null)` on an insert.
+
+#### Organizations, teams and workspaces
+
+The probe looks for a membership table in the loaded catalog: a table whose name says member, membership, seat
+or staff, with a foreign key to another table and a column tied to a user. The table it points at is the
+organization, whatever it is called (`organizations`, `tenants`, `business_units`). When there are several
+(organization members and project members), the top one wins. Every table with a foreign key to the
+organization, or a column with the membership table's organization column name and type and no foreign key at
+all, belongs to an organization; so does a table below one of those (tasks of a project), and a view that
+exposes the organization column. Those tables count as organization A's rows, ahead of any `created_by` column.
+
+Seeding: organization A is made with `auth.uid()` set to a founder D (so a trigger that adds the creator as
+owner works), organization B by user B. User A joins A with the plain role, user B joins B as an admin; role
+values come from the enum or from a CHECK list (`role in ('owner', 'admin', 'member')`), and any other
+not-null column with a CHECK list gets one of its allowed values too. A composite foreign key (`project_id,
+tenant_id`) takes both values from one parent row. When the schema reads the organization from the token
+(`auth.jwt() -> 'app_metadata' ->> 'org_id'`, set by a custom access token hook), the test users' tokens carry
+it. Then, besides the visitor tries:
+
+- user B (admin of organization B): select, insert, update and delete on organization A's rows;
+- user C (signed in, no organization): select;
+- user B inserts a membership row that puts themselves in organization A (self-join);
+- user A, a plain member, writes a higher value into their own role, a plan or billing column of the
+  organization, and moves their own membership row to organization B. The move is sent as a plain filtered
+  update, the way supabase-js sends it; Postgres then also checks the new row against the select policy, so on
+  many schemas this one is refused for that reason.
+
+Self-join and moving a membership are Critical: every policy that trusts membership then lets the person in.
+Reaching another organization's rows, and a member promoting themselves, are High. The patch adds
+`is_org_member(org)` and, when the schema has admin roles, `has_org_role(org, roles)`: SECURITY DEFINER (so a
+policy on the membership table does not recurse), `search_path` pinned, not executable by `anon`. If the app
+already has functions with those names, the patch uses `is_member_of_org` and `has_role_in_org` instead. Each
+leaking policy is replaced by one per command with a name that says what it now allows ("Org admins can add
+organization_members"). On the membership table only admins write and nobody can change the organization or user
+column of a row; on the organization table plan and billing columns can only change from the server. Inviting
+and onboarding flows that insert membership rows from the browser have to move into a SECURITY DEFINER function
+or an edge function, and the caveat under each patch says so.
 
 If a migration still does not load in PGlite (`vector` or `postgis`, which this PGlite build doesn't have, for
 example), the report says so and only the static checks run.
@@ -316,7 +362,7 @@ is who should have access". Read each one before applying it.
 
 ## Results on the demo apps
 
-All three apps live in `test/fixtures` with their ground truth next to them. Holes are seeded on purpose; controls are
+All four apps live in `test/fixtures` with their ground truth next to them. Holes are seeded on purpose; controls are
 done right and must not be flagged at Medium or above.
 
 **pipeline-crm-app** (Vite + React SPA, 7 migrations, 2 Deno edge functions): 9 holes, 7 controls.
@@ -365,6 +411,22 @@ Read these numbers for what they are. I wrote the demo apps and the scanner rule
 tools know, and 9 of 9, 12 of 12 or 10 of 10 is not an independent detection rate. On someone else's app expect misses.
 None of the apps has committed secrets, so they say nothing about the credential scanner; its tests use keys built at
 runtime in temporary git repos.
+
+**team-workspace-app** (Next.js App Router, 6 migrations, organizations with members, invitations, projects and
+tasks, Stripe per organization): 6 holes, 5 controls. RLS is on for every table and every table has a policy.
+
+- All 6 holes are reported: 2 Critical (anyone signed in can add themselves to any organization; a usage view
+  without `security_invoker` shows every organization's name and plan to visitors) and 3 High (a member can make
+  themselves owner and edit the plan and Stripe id; a projects policy that asks for any membership instead of
+  this organization's; invite tokens readable by every signed-in user). The first and the projects hole look
+  fine to a policy linter and need the probe.
+- No control is flagged at Medium or above: tasks scoped through the parent project, an append-only audit
+  table, the membership helper and the trigger that makes the creator the owner.
+- All 5 patches apply with `git apply`, and the probe re-run on the patched files finds 0 leaks. A separate test
+  loads the patched migrations and checks the app still works for the people it is for: the founder creates an
+  organization and becomes owner through the trigger, adds a member, the member creates and reads a project, an
+  outsider sees nothing and cannot join, the member cannot promote themselves or change the plan, and the owner
+  can rename the organization.
 
 **The live probe** is tested end to end against the real [PostgREST](https://postgrest.org) 16.5 binary (the server
 behind `supabase.co/rest/v1`) running on PGlite through
@@ -454,12 +516,56 @@ What it still misses:
 - Health data the column names don't reveal. The PHI map found nothing in 3 of the 5 new apps: CT predictions,
   prescription documents kept as files, and a patients table that holds only names, emails and phone numbers.
   Run 5 had the same gap with an AI chat history table.
-- Patches for tables owned by an organization rather than a user: 17 of the lab service's 19 Criticals have
-  none, because the fix is a membership policy that needs a person to write it.
+- Patches for tables owned by an organization rather than a user: 17 of the lab service's 19 Criticals had
+  none. Fixed in v0.6.0 (below): 20 of 20 Criticals there now have a verified patch, and the re-probe with all of
+  them applied finds 0 leaks.
 - Tables whose CHECK constraints reject the probe's guessed values (6 in the new five) are listed as "not tried".
+  v0.6.0 reads CHECK lists and email formats for seed values.
 - Calls that need a person's judgment: patient-portal or share-link functions that are public on purpose and
   check a token, and a public doctors directory, which the probe now rates Critical because its rows link to user
   accounts.
+
+## Five multi-tenant repos (v0.6.0)
+
+For the organization model I picked five public Supabase apps and starters with a membership table, pushed
+between October and November 2026, none used in earlier runs: an HR SaaS, a reference multi-tenant schema, a
+work-order sample, and two SaaS starters. Same method: clone, scan, probe locally, label every finding by hand.
+
+The first pass found the organization model in all five (one calls it `business_units`, one `tenants`) and gave
+16 findings, 14 right. The two wrong ones were static "a user can edit their own role" readings of update
+policies that only an owner or admin can use. It missed the worst hole in the set: one starter's insert policy
+on memberships lets any signed-in user add themselves to any organization with any role, and the probe could
+not load that repo because its first migration uses a table the second one creates. Four tables were not tried
+either (composite foreign keys, an email format check), and one app takes the organization from the token, which
+the test users did not carry.
+
+Eight fixes followed, each with a test and a control, each checked by removing it and watching its test fail:
+composite foreign keys, email seed values, organization and role claims in `app_metadata`, a statement-by-
+statement load when migrations are out of order (a rejected statement now only removes the table it creates or
+alters), organization columns without a foreign key, dropping a role claim the probe disproved, a read-only patch
+for shared tables anyone could write, and views that expose the organization column. After them:
+
+| app                      | Critical | High | Medium | Low | tables probed | organization tables | Critical/High patched |
+| ------------------------ | -------- | ---- | ------ | --- | ------------- | ------------------- | --------------------- |
+| HR SaaS                  | 0        | 0    | 0      | 0   | 12            | 12                  | -                     |
+| reference schema         | 0        | 0    | 0      | 0   | 4             | 4                   | -                     |
+| work-order sample        | 0        | 0    | 0      | 0   | 5             | 5                   | -                     |
+| SaaS starter (Next.js)   | 0        | 0    | 0      | 1   | 7             | 5                   | -                     |
+| SaaS starter (SvelteKit) | 11       | 3    | 0      | 0   | 10            | 7                   | 14 of 14              |
+
+The self-join is now the top Critical in the last one, and the re-probe with all 14 patches finds 0 leaks. Four
+of the five are done carefully, and zero there is the right answer: in the HR app the API grants are revoked
+outright. That also means zero on such a repo says less than it seems, which is the first item below.
+
+What it still misses here:
+
+- It checks that outsiders get nothing, not that members get what they need. A schema where members cannot read
+  their own organization's rows shows as 0 leaks. The fixture test checks member access after the patches, but
+  real repos do not get that check.
+- Membership tables with names outside member, membership, seat, staff or users (say `org_people`), and roles
+  kept in a separate table (`role_id`), are not understood.
+- Organization claims in the token are filled by key name (org, tenant, team, workspace, account, company, unit,
+  role); other names are not.
 
 Real gaps in these repos go to their maintainers, through the channel each repo asks for, and not into this
 README.

@@ -1,0 +1,1614 @@
+{
+  "schema": "prelaunch-audit/v1",
+  "app": {
+    "name": "team-workspace-app",
+    "repo": "team-workspace-app",
+    "shape": {
+      "framework": "next-app-router",
+      "label": "Next.js (App Router)",
+      "migrations": 6,
+      "edgeFunctions": []
+    }
+  },
+  "generatedAt": "2026-11-16T09:00:00.000Z",
+  "counts": {
+    "critical": 2,
+    "high": 3,
+    "medium": 0,
+    "low": 0
+  },
+  "findings": [
+    {
+      "id": "PA-01",
+      "source": "vibe-preflight",
+      "rule": "rls-update-privileged-column",
+      "severity": "critical",
+      "title": "Any signed-in user can join another organization",
+      "cwe": {
+        "id": 269,
+        "name": "Improper Privilege Management"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261116090100_organization_policies.sql",
+        "line": 29
+      },
+      "evidence": "Policy \"Users can update their membership\" lets users update their row in `public.organization_members`, including `role`. No column privilege or trigger stops them. RLS probe on `public.organization_members`: a plain member changed `role`; an admin of another organization added themselves to organization A.",
+      "snippet": "  29 | create policy \"Users can update their membership\"\n  30 |   on public.organization_members for update\n  31 |   to authenticated\n  32 |   using (user_id = (select auth.uid()));",
+      "whyItMatters": "The probe signed in as an admin of organization B and added themselves to organization A, or moved their own membership row there. Every policy that trusts membership then lets them read and change that organization's data, so one sign-up gets into every customer's workspace.",
+      "fix": "Allow inserts and updates of the membership table only for admins of the target organization (or only from the server through an invite flow), and stop members from changing the organization column of their own row.",
+      "effort": "1-4 hours",
+      "subject": "public.organization_members",
+      "proof": {
+        "table": "public.organization_members",
+        "kind": "table",
+        "ownerColumns": [
+          "user_id"
+        ],
+        "tenant": {
+          "tenant": "public.organizations",
+          "tenantKey": "id",
+          "tenantKeyType": "uuid",
+          "members": {
+            "table": "public.organization_members",
+            "tenantColumn": "organization_id",
+            "userColumn": "user_id",
+            "roleColumn": "role",
+            "adminRoles": [
+              "owner",
+              "admin"
+            ],
+            "memberRole": "member"
+          },
+          "via": {
+            "kind": "members"
+          }
+        },
+        "checks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 0,
+            "of": 2
+          },
+          {
+            "actor": "anon",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"organization_members\""
+          },
+          {
+            "actor": "anon",
+            "action": "update",
+            "rows": 0,
+            "of": 2
+          },
+          {
+            "actor": "anon",
+            "action": "delete",
+            "rows": 0,
+            "of": 2
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 0,
+            "of": 2
+          },
+          {
+            "actor": "other-user",
+            "action": "update",
+            "rows": 0,
+            "of": 2
+          },
+          {
+            "actor": "other-user",
+            "action": "delete",
+            "rows": 0,
+            "of": 2
+          },
+          {
+            "actor": "non-member",
+            "action": "select",
+            "rows": 0,
+            "of": 2
+          },
+          {
+            "actor": "owner",
+            "action": "update",
+            "column": "role",
+            "rows": 1,
+            "of": 2
+          },
+          {
+            "actor": "other-user",
+            "action": "insert",
+            "scenario": "self-join",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "owner",
+            "action": "update",
+            "column": "organization_id",
+            "scenario": "move-tenant",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"organization_members\""
+          }
+        ],
+        "leaks": [
+          {
+            "actor": "owner",
+            "action": "update",
+            "column": "role",
+            "rows": 1,
+            "of": 2
+          },
+          {
+            "actor": "other-user",
+            "action": "insert",
+            "scenario": "self-join",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "policies": [
+          {
+            "name": "Members can view their team",
+            "command": "select",
+            "roles": [
+              "authenticated"
+            ],
+            "using": "is_member(organization_id)"
+          },
+          {
+            "name": "Users can join organizations",
+            "command": "insert",
+            "roles": [
+              "authenticated"
+            ],
+            "withCheck": "(user_id = ( SELECT auth.uid() AS uid))"
+          },
+          {
+            "name": "Users can leave organizations",
+            "command": "delete",
+            "roles": [
+              "authenticated"
+            ],
+            "using": "(user_id = ( SELECT auth.uid() AS uid))"
+          },
+          {
+            "name": "Users can update their membership",
+            "command": "update",
+            "roles": [
+              "authenticated"
+            ],
+            "using": "(user_id = ( SELECT auth.uid() AS uid))"
+          }
+        ],
+        "afterPatches": []
+      },
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261116090501_org_policies_organization_members.sql b/supabase/migrations/20261116090501_org_policies_organization_members.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261116090501_org_policies_organization_members.sql\n@@ -0,0 +1,42 @@\n+-- PA-01: rows of public.organization_members belong to an organization (public.organizations); tie every policy to membership.\n+-- Generated by prelaunch-audit. Review before applying.\n+-- Membership helpers. SECURITY DEFINER so they read the membership table without its policies\n+-- (a policy that queries its own table recurses); search_path pinned; not callable by visitors.\n+create or replace function public.is_org_member(target_org uuid)\n+returns boolean\n+language sql stable security definer\n+set search_path = ''\n+as $$\n+  select exists (select 1 from public.organization_members m where m.organization_id = target_org and m.user_id = (select auth.uid()));\n+$$;\n+revoke execute on function public.is_org_member(uuid) from public, anon;\n+grant execute on function public.is_org_member(uuid) to authenticated;\n+\n+create or replace function public.has_org_role(target_org uuid, allowed text[])\n+returns boolean\n+language sql stable security definer\n+set search_path = ''\n+as $$\n+  select exists (select 1 from public.organization_members m where m.organization_id = target_org and m.user_id = (select auth.uid()) and m.role::text = any (allowed));\n+$$;\n+revoke execute on function public.has_org_role(uuid, text[]) from public, anon;\n+grant execute on function public.has_org_role(uuid, text[]) to authenticated;\n+\n+drop policy if exists \"Users can update their membership\" on public.organization_members;\n+drop policy if exists \"Users can join organizations\" on public.organization_members;\n+\n+drop policy if exists \"Org admins can add organization_members\" on public.organization_members;\n+create policy \"Org admins can add organization_members\"\n+  on public.organization_members for insert\n+  to authenticated\n+  with check (public.has_org_role(organization_id, array['owner', 'admin']));\n+\n+drop policy if exists \"Org admins can change organization_members\" on public.organization_members;\n+create policy \"Org admins can change organization_members\"\n+  on public.organization_members for update\n+  to authenticated\n+  using (public.has_org_role(organization_id, array['owner', 'admin']))\n+  with check (public.has_org_role(organization_id, array['owner', 'admin']));\n+\n+revoke update on public.organization_members from anon, authenticated;\n+grant update (role) on public.organization_members to authenticated;\n",
+        "summary": "Adds `is_org_member(org)` and `has_org_role(org, roles)` (SECURITY DEFINER, search_path pinned, not callable by visitors) and rewrites the membership policies on public.organization_members: \"Org admins can add organization_members\", \"Org admins can change organization_members\". Only admins (owner, admin) of an organization can add, change or remove its members; nobody can change organization_id or user_id of a membership row.",
+        "caveats": [
+          "Invites and onboarding: if the browser inserts the first membership row of a new organization or accepts an invite by inserting its own row, move that into a SECURITY DEFINER function or an edge function that checks the invite token.",
+          "Pending invitations: if membership rows also hold invites (a status column), add the active status to the helper's where clause."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-02",
+      "source": "vibe-preflight",
+      "rule": "view-bypasses-rls",
+      "severity": "critical",
+      "title": "View skips Row Level Security",
+      "cwe": {
+        "id": 863,
+        "name": "Incorrect Authorization"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261116090500_org_usage.sql",
+        "line": 2
+      },
+      "evidence": "View `public.org_usage` has no `security_invoker`, so it reads the tables below it without RLS. RLS probe on `public.org_usage`: a visitor without an account could select 1 of 1 of organization A's rows; an admin of another organization could select 1 of 1 of organization A's rows; a signed-in user in no organization could select 1 of 1 of organization A's rows.",
+      "snippet": "   2 | create view public.org_usage as\n   3 |   select o.id as organization_id, o.name, o.plan, count(p.id) as projects\n   4 |   from public.organizations o\n   5 |   left join public.projects p on p.organization_id = o.id",
+      "whyItMatters": "Postgres views run with the rights of whoever created them, so they ignore the policies of the tables below. Supabase serves the view over the API, which gives every caller the rows your policies were meant to hide.",
+      "fix": "Set `security_invoker = true` on the view (Postgres 15+), so it runs with the caller's rights and the table policies apply.",
+      "effort": "under 1 hour",
+      "subject": "public.org_usage",
+      "proof": {
+        "table": "public.org_usage",
+        "kind": "view",
+        "ownerColumns": [],
+        "tenant": {
+          "tenant": "public.organizations",
+          "tenantKey": "id",
+          "tenantKeyType": "uuid",
+          "members": {
+            "table": "public.organization_members",
+            "tenantColumn": "organization_id",
+            "userColumn": "user_id",
+            "roleColumn": "role",
+            "adminRoles": [
+              "owner",
+              "admin"
+            ],
+            "memberRole": "member"
+          },
+          "via": {
+            "kind": "column",
+            "column": "organization_id"
+          }
+        },
+        "checks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "non-member",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "leaks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "non-member",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "policies": [],
+        "afterPatches": []
+      },
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261116090502_security_invoker_org_usage.sql b/supabase/migrations/20261116090502_security_invoker_org_usage.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261116090502_security_invoker_org_usage.sql\n@@ -0,0 +1,3 @@\n+-- PA-02: make public.org_usage respect the caller's RLS.\n+-- Generated by prelaunch-audit. Review before applying.\n+alter view public.org_usage set (security_invoker = true);\n",
+        "summary": "Sets security_invoker on public.org_usage, so the policies of the tables below it apply to whoever queries it.",
+        "caveats": [
+          "Needs Postgres 15 or newer (every current Supabase project is)."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-03",
+      "source": "vibe-preflight",
+      "rule": "rls-update-privileged-column",
+      "severity": "high",
+      "title": "Plain members can change their own role or the organization's billing fields",
+      "cwe": {
+        "id": 269,
+        "name": "Improper Privilege Management"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261116090100_organization_policies.sql",
+        "line": 14
+      },
+      "evidence": "Policy \"Members can update their organization\" lets users update their row in `public.organizations`, including `plan` and `stripe_customer_id`. No column privilege or trigger stops them. RLS probe on `public.organizations`: a plain member changed `plan`; a plain member changed `stripe_customer_id`.",
+      "snippet": "  14 | create policy \"Members can update their organization\"\n  15 |   on public.organizations for update\n  16 |   to authenticated\n  17 |   using (public.is_member(id));",
+      "whyItMatters": "The probe signed in as a plain member of organization A and changed a role, plan or billing column that only an admin, the server or Stripe should set. A member can make themselves the owner and then remove everyone else.",
+      "fix": "Let only the organization's admins update the membership table, lock the organization column of membership rows, and change plan columns only from the server after Stripe confirms payment.",
+      "effort": "1-4 hours",
+      "subject": "public.organizations",
+      "proof": {
+        "table": "public.organizations",
+        "kind": "table",
+        "ownerColumns": [
+          "created_by"
+        ],
+        "tenant": {
+          "tenant": "public.organizations",
+          "tenantKey": "id",
+          "tenantKeyType": "uuid",
+          "members": {
+            "table": "public.organization_members",
+            "tenantColumn": "organization_id",
+            "userColumn": "user_id",
+            "roleColumn": "role",
+            "adminRoles": [
+              "owner",
+              "admin"
+            ],
+            "memberRole": "member"
+          },
+          "via": {
+            "kind": "tenant"
+          }
+        },
+        "checks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"organizations\""
+          },
+          {
+            "actor": "anon",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "delete",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "delete",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "non-member",
+            "action": "select",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "owner",
+            "action": "update",
+            "column": "plan",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "owner",
+            "action": "update",
+            "column": "stripe_customer_id",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "leaks": [
+          {
+            "actor": "owner",
+            "action": "update",
+            "column": "plan",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "owner",
+            "action": "update",
+            "column": "stripe_customer_id",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "policies": [
+          {
+            "name": "Members can update their organization",
+            "command": "update",
+            "roles": [
+              "authenticated"
+            ],
+            "using": "is_member(id)"
+          },
+          {
+            "name": "Members can view their organization",
+            "command": "select",
+            "roles": [
+              "authenticated"
+            ],
+            "using": "is_member(id)"
+          },
+          {
+            "name": "Signed-in users can create organizations",
+            "command": "insert",
+            "roles": [
+              "authenticated"
+            ],
+            "withCheck": "(( SELECT auth.uid() AS uid) IS NOT NULL)"
+          }
+        ],
+        "afterPatches": []
+      },
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261116090503_org_policies_organizations.sql b/supabase/migrations/20261116090503_org_policies_organizations.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261116090503_org_policies_organizations.sql\n@@ -0,0 +1,35 @@\n+-- PA-03: rows of public.organizations belong to an organization (public.organizations); tie every policy to membership.\n+-- Generated by prelaunch-audit. Review before applying.\n+-- Membership helpers. SECURITY DEFINER so they read the membership table without its policies\n+-- (a policy that queries its own table recurses); search_path pinned; not callable by visitors.\n+create or replace function public.is_org_member(target_org uuid)\n+returns boolean\n+language sql stable security definer\n+set search_path = ''\n+as $$\n+  select exists (select 1 from public.organization_members m where m.organization_id = target_org and m.user_id = (select auth.uid()));\n+$$;\n+revoke execute on function public.is_org_member(uuid) from public, anon;\n+grant execute on function public.is_org_member(uuid) to authenticated;\n+\n+create or replace function public.has_org_role(target_org uuid, allowed text[])\n+returns boolean\n+language sql stable security definer\n+set search_path = ''\n+as $$\n+  select exists (select 1 from public.organization_members m where m.organization_id = target_org and m.user_id = (select auth.uid()) and m.role::text = any (allowed));\n+$$;\n+revoke execute on function public.has_org_role(uuid, text[]) from public, anon;\n+grant execute on function public.has_org_role(uuid, text[]) to authenticated;\n+\n+drop policy if exists \"Members can update their organization\" on public.organizations;\n+\n+drop policy if exists \"Org admins can change organizations\" on public.organizations;\n+create policy \"Org admins can change organizations\"\n+  on public.organizations for update\n+  to authenticated\n+  using (public.has_org_role(id, array['owner', 'admin']))\n+  with check (public.has_org_role(id, array['owner', 'admin']));\n+\n+revoke update on public.organizations from anon, authenticated;\n+grant update (name, slug, created_by) on public.organizations to authenticated;\n",
+        "summary": "Adds `is_org_member(org)` and `has_org_role(org, roles)` (SECURITY DEFINER, search_path pinned, not callable by visitors) and rewrites the organization policies on public.organizations: \"Org admins can change organizations\". Members read their own organization; only its admins change it; plan, stripe_customer_id change only from the server.",
+        "caveats": [
+          "If some rows of this table are meant to be public (a published page), add a separate select policy for exactly those rows.",
+          "Pending invitations: if membership rows also hold invites (a status column), add the active status to the helper's where clause."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-04",
+      "source": "rls-probe",
+      "rule": "rls-probe-leak",
+      "severity": "high",
+      "title": "One organization can reach another organization's rows",
+      "cwe": {
+        "id": 863,
+        "name": "Incorrect Authorization"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261116090200_projects.sql",
+        "line": 11
+      },
+      "evidence": "RLS probe on `public.projects`: an admin of another organization could select 1 of 1 of organization A's rows; an admin of another organization inserted a row into organization A; an admin of another organization could update 1 of 1 of organization A's rows; an admin of another organization could delete 1 of 1 of organization A's rows. Let through by policy \"Members can manage projects\" (all, `using (EXISTS ( SELECT 1\n   FROM organization_members m\n  WHERE (m.user_id = ( SELECT auth.uid() AS uid))))`).",
+      "snippet": "  11 | create policy \"Members can manage projects\"\n  12 |   on public.projects for all\n  13 |   to authenticated\n  14 |   using (exists (select 1 from public.organization_members m where m.user_id = (select auth.uid())));",
+      "whyItMatters": "The table belongs to organizations and has Row Level Security, but the probe, signed in as an admin of organization B or as a user in no organization, still read or changed rows of organization A. The policy checks that the caller is signed in or is a member of some organization, not of this row's organization.",
+      "fix": "Compare the row's organization with the caller's memberships in every policy, through a SECURITY DEFINER helper such as `is_org_member(org_id)` so the membership table's own policies do not recurse.",
+      "effort": "under 1 hour",
+      "subject": "public.projects",
+      "proof": {
+        "table": "public.projects",
+        "kind": "table",
+        "ownerColumns": [
+          "created_by"
+        ],
+        "tenant": {
+          "tenant": "public.organizations",
+          "tenantKey": "id",
+          "tenantKeyType": "uuid",
+          "members": {
+            "table": "public.organization_members",
+            "tenantColumn": "organization_id",
+            "userColumn": "user_id",
+            "roleColumn": "role",
+            "adminRoles": [
+              "owner",
+              "admin"
+            ],
+            "memberRole": "member"
+          },
+          "via": {
+            "kind": "column",
+            "column": "organization_id"
+          }
+        },
+        "checks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"projects\""
+          },
+          {
+            "actor": "anon",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "delete",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "insert",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "update",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "delete",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "non-member",
+            "action": "select",
+            "rows": 0,
+            "of": 1
+          }
+        ],
+        "leaks": [
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "insert",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "update",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "delete",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "policies": [
+          {
+            "name": "Members can manage projects",
+            "command": "all",
+            "roles": [
+              "authenticated"
+            ],
+            "using": "(EXISTS ( SELECT 1\n   FROM organization_members m\n  WHERE (m.user_id = ( SELECT auth.uid() AS uid))))"
+          }
+        ],
+        "afterPatches": []
+      },
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261116090504_org_policies_projects.sql b/supabase/migrations/20261116090504_org_policies_projects.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261116090504_org_policies_projects.sql\n@@ -0,0 +1,40 @@\n+-- PA-04: rows of public.projects belong to an organization (public.organizations); tie every policy to membership.\n+-- Generated by prelaunch-audit. Review before applying.\n+-- Membership helpers. SECURITY DEFINER so they read the membership table without its policies\n+-- (a policy that queries its own table recurses); search_path pinned; not callable by visitors.\n+create or replace function public.is_org_member(target_org uuid)\n+returns boolean\n+language sql stable security definer\n+set search_path = ''\n+as $$\n+  select exists (select 1 from public.organization_members m where m.organization_id = target_org and m.user_id = (select auth.uid()));\n+$$;\n+revoke execute on function public.is_org_member(uuid) from public, anon;\n+grant execute on function public.is_org_member(uuid) to authenticated;\n+\n+drop policy if exists \"Members can manage projects\" on public.projects;\n+\n+drop policy if exists \"Org members can read projects\" on public.projects;\n+create policy \"Org members can read projects\"\n+  on public.projects for select\n+  to authenticated\n+  using (public.is_org_member(organization_id));\n+\n+drop policy if exists \"Org members can add projects\" on public.projects;\n+create policy \"Org members can add projects\"\n+  on public.projects for insert\n+  to authenticated\n+  with check (public.is_org_member(organization_id));\n+\n+drop policy if exists \"Org members can change projects\" on public.projects;\n+create policy \"Org members can change projects\"\n+  on public.projects for update\n+  to authenticated\n+  using (public.is_org_member(organization_id))\n+  with check (public.is_org_member(organization_id));\n+\n+drop policy if exists \"Org members can delete projects\" on public.projects;\n+create policy \"Org members can delete projects\"\n+  on public.projects for delete\n+  to authenticated\n+  using (public.is_org_member(organization_id));\n",
+        "summary": "Adds `is_org_member(org)` (SECURITY DEFINER, search_path pinned, not callable by visitors) and rewrites the organization-owned policies on public.projects: \"Org members can read projects\", \"Org members can add projects\", \"Org members can change projects\", \"Org members can delete projects\". Only members of the row's organization can read or change it.",
+        "caveats": [
+          "If some rows of this table are meant to be public (a published page), add a separate select policy for exactly those rows.",
+          "Every member can now edit the organization's rows. If only the author (created_by) should edit, add `and created_by = (select auth.uid())` to the update and delete policies.",
+          "Pending invitations: if membership rows also hold invites (a status column), add the active status to the helper's where clause."
+        ],
+        "verified": true
+      }
+    },
+    {
+      "id": "PA-05",
+      "source": "vibe-preflight",
+      "rule": "rls-permissive-policy",
+      "severity": "high",
+      "title": "One organization can reach another organization's rows",
+      "cwe": {
+        "id": 863,
+        "name": "Incorrect Authorization"
+      },
+      "location": {
+        "kind": "file",
+        "file": "supabase/migrations/20261116090300_invitations.sql",
+        "line": 14
+      },
+      "evidence": "Policy \"Invites are readable by signed-in users\" on `public.invitations` (select) lets any signed-in user read every row. RLS probe on `public.invitations`: an admin of another organization could select 1 of 1 of organization A's rows; a signed-in user in no organization could select 1 of 1 of organization A's rows.",
+      "snippet": "  14 | create policy \"Invites are readable by signed-in users\"\n  15 |   on public.invitations for select\n  16 |   to authenticated\n  17 |   using (true);",
+      "whyItMatters": "The table belongs to organizations and has Row Level Security, but the probe, signed in as an admin of organization B or as a user in no organization, still read or changed rows of organization A. The policy checks that the caller is signed in or is a member of some organization, not of this row's organization.",
+      "fix": "Compare the row's organization with the caller's memberships in every policy, through a SECURITY DEFINER helper such as `is_org_member(org_id)` so the membership table's own policies do not recurse.",
+      "effort": "under 1 hour",
+      "subject": "public.invitations",
+      "proof": {
+        "table": "public.invitations",
+        "kind": "table",
+        "ownerColumns": [
+          "invited_by"
+        ],
+        "tenant": {
+          "tenant": "public.organizations",
+          "tenantKey": "id",
+          "tenantKeyType": "uuid",
+          "members": {
+            "table": "public.organization_members",
+            "tenantColumn": "organization_id",
+            "userColumn": "user_id",
+            "roleColumn": "role",
+            "adminRoles": [
+              "owner",
+              "admin"
+            ],
+            "memberRole": "member"
+          },
+          "via": {
+            "kind": "column",
+            "column": "organization_id"
+          }
+        },
+        "checks": [
+          {
+            "actor": "anon",
+            "action": "select",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"invitations\""
+          },
+          {
+            "actor": "anon",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "anon",
+            "action": "delete",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "insert",
+            "rows": 0,
+            "of": 1,
+            "refused": "new row violates row-level security policy for table \"invitations\""
+          },
+          {
+            "actor": "other-user",
+            "action": "update",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "other-user",
+            "action": "delete",
+            "rows": 0,
+            "of": 1
+          },
+          {
+            "actor": "non-member",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "owner",
+            "action": "update",
+            "column": "role",
+            "rows": 0,
+            "of": 1
+          }
+        ],
+        "leaks": [
+          {
+            "actor": "other-user",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          },
+          {
+            "actor": "non-member",
+            "action": "select",
+            "rows": 1,
+            "of": 1
+          }
+        ],
+        "policies": [
+          {
+            "name": "Invites are readable by signed-in users",
+            "command": "select",
+            "roles": [
+              "authenticated"
+            ],
+            "using": "true"
+          },
+          {
+            "name": "Members can invite",
+            "command": "insert",
+            "roles": [
+              "authenticated"
+            ],
+            "withCheck": "is_member(organization_id)"
+          }
+        ],
+        "afterPatches": []
+      },
+      "alsoFlaggedBy": [],
+      "patch": {
+        "diff": "diff --git a/supabase/migrations/20261116090505_org_policies_invitations.sql b/supabase/migrations/20261116090505_org_policies_invitations.sql\nnew file mode 100644\n--- /dev/null\n+++ b/supabase/migrations/20261116090505_org_policies_invitations.sql\n@@ -0,0 +1,21 @@\n+-- PA-05: rows of public.invitations belong to an organization (public.organizations); tie every policy to membership.\n+-- Generated by prelaunch-audit. Review before applying.\n+-- Membership helpers. SECURITY DEFINER so they read the membership table without its policies\n+-- (a policy that queries its own table recurses); search_path pinned; not callable by visitors.\n+create or replace function public.is_org_member(target_org uuid)\n+returns boolean\n+language sql stable security definer\n+set search_path = ''\n+as $$\n+  select exists (select 1 from public.organization_members m where m.organization_id = target_org and m.user_id = (select auth.uid()));\n+$$;\n+revoke execute on function public.is_org_member(uuid) from public, anon;\n+grant execute on function public.is_org_member(uuid) to authenticated;\n+\n+drop policy if exists \"Invites are readable by signed-in users\" on public.invitations;\n+\n+drop policy if exists \"Org members can read invitations\" on public.invitations;\n+create policy \"Org members can read invitations\"\n+  on public.invitations for select\n+  to authenticated\n+  using (public.is_org_member(organization_id));\n",
+        "summary": "Adds `is_org_member(org)` (SECURITY DEFINER, search_path pinned, not callable by visitors) and rewrites the organization-owned policies on public.invitations: \"Org members can read invitations\". Only members of the row's organization can read or change it.",
+        "caveats": [
+          "The invited person is not a member yet: look the invite up by its token in a SECURITY DEFINER function or an edge function that returns only that one invite, instead of a select policy.",
+          "Every member can now edit the organization's rows. If only the author (invited_by) should edit, add `and invited_by = (select auth.uid())` to the update and delete policies.",
+          "Pending invitations: if membership rows also hold invites (a status column), add the active status to the helper's where clause."
+        ],
+        "verified": true
+      }
+    }
+  ],
+  "tools": [
+    {
+      "name": "vibe-preflight",
+      "version": "1.3.0",
+      "command": "node vendor/vibe-preflight/preflight.mjs team-workspace-app --format json --fail-on never",
+      "status": "ok"
+    },
+    {
+      "name": "secret-scan (built in)",
+      "version": "10 patterns",
+      "command": "working tree (git ls-files) + git log -p --all",
+      "status": "ok"
+    },
+    {
+      "name": "rls-probe",
+      "version": "1.3.0",
+      "command": "prelaunch-audit rls-probe (PGlite + Supabase shim, rolled-back tries as anon and a second user)",
+      "status": "ok",
+      "note": "7 tables and views tried as anon and as a second user."
+    }
+  ],
+  "probe": [
+    {
+      "table": "public.audit_events",
+      "kind": "table",
+      "ownerColumns": [
+        "actor_id"
+      ],
+      "tenant": {
+        "tenant": "public.organizations",
+        "tenantKey": "id",
+        "tenantKeyType": "uuid",
+        "members": {
+          "table": "public.organization_members",
+          "tenantColumn": "organization_id",
+          "userColumn": "user_id",
+          "roleColumn": "role",
+          "adminRoles": [
+            "owner",
+            "admin"
+          ],
+          "memberRole": "member"
+        },
+        "via": {
+          "kind": "column",
+          "column": "organization_id"
+        }
+      },
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"audit_events\""
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"audit_events\""
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "non-member",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        }
+      ],
+      "leaks": [],
+      "policies": [
+        {
+          "name": "Members can read their audit trail",
+          "command": "select",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "is_member(organization_id)"
+        },
+        {
+          "name": "Members can write their own events",
+          "command": "insert",
+          "roles": [
+            "authenticated"
+          ],
+          "withCheck": "(is_member(organization_id) AND (actor_id = ( SELECT auth.uid() AS uid)))"
+        }
+      ],
+      "afterPatches": []
+    },
+    {
+      "table": "public.invitations",
+      "kind": "table",
+      "ownerColumns": [
+        "invited_by"
+      ],
+      "tenant": {
+        "tenant": "public.organizations",
+        "tenantKey": "id",
+        "tenantKeyType": "uuid",
+        "members": {
+          "table": "public.organization_members",
+          "tenantColumn": "organization_id",
+          "userColumn": "user_id",
+          "roleColumn": "role",
+          "adminRoles": [
+            "owner",
+            "admin"
+          ],
+          "memberRole": "member"
+        },
+        "via": {
+          "kind": "column",
+          "column": "organization_id"
+        }
+      },
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"invitations\""
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"invitations\""
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "non-member",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "owner",
+          "action": "update",
+          "column": "role",
+          "rows": 0,
+          "of": 1
+        }
+      ],
+      "leaks": [
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "non-member",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "policies": [
+        {
+          "name": "Invites are readable by signed-in users",
+          "command": "select",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "true"
+        },
+        {
+          "name": "Members can invite",
+          "command": "insert",
+          "roles": [
+            "authenticated"
+          ],
+          "withCheck": "is_member(organization_id)"
+        }
+      ],
+      "afterPatches": []
+    },
+    {
+      "table": "public.org_usage",
+      "kind": "view",
+      "ownerColumns": [],
+      "tenant": {
+        "tenant": "public.organizations",
+        "tenantKey": "id",
+        "tenantKeyType": "uuid",
+        "members": {
+          "table": "public.organization_members",
+          "tenantColumn": "organization_id",
+          "userColumn": "user_id",
+          "roleColumn": "role",
+          "adminRoles": [
+            "owner",
+            "admin"
+          ],
+          "memberRole": "member"
+        },
+        "via": {
+          "kind": "column",
+          "column": "organization_id"
+        }
+      },
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "non-member",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "leaks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "non-member",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "policies": [],
+      "afterPatches": []
+    },
+    {
+      "table": "public.organization_members",
+      "kind": "table",
+      "ownerColumns": [
+        "user_id"
+      ],
+      "tenant": {
+        "tenant": "public.organizations",
+        "tenantKey": "id",
+        "tenantKeyType": "uuid",
+        "members": {
+          "table": "public.organization_members",
+          "tenantColumn": "organization_id",
+          "userColumn": "user_id",
+          "roleColumn": "role",
+          "adminRoles": [
+            "owner",
+            "admin"
+          ],
+          "memberRole": "member"
+        },
+        "via": {
+          "kind": "members"
+        }
+      },
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 0,
+          "of": 2
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"organization_members\""
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 0,
+          "of": 2
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 0,
+          "of": 2
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 0,
+          "of": 2
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 0,
+          "of": 2
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 0,
+          "of": 2
+        },
+        {
+          "actor": "non-member",
+          "action": "select",
+          "rows": 0,
+          "of": 2
+        },
+        {
+          "actor": "owner",
+          "action": "update",
+          "column": "role",
+          "rows": 1,
+          "of": 2
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "scenario": "self-join",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "owner",
+          "action": "update",
+          "column": "organization_id",
+          "scenario": "move-tenant",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"organization_members\""
+        }
+      ],
+      "leaks": [
+        {
+          "actor": "owner",
+          "action": "update",
+          "column": "role",
+          "rows": 1,
+          "of": 2
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "scenario": "self-join",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "policies": [
+        {
+          "name": "Members can view their team",
+          "command": "select",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "is_member(organization_id)"
+        },
+        {
+          "name": "Users can join organizations",
+          "command": "insert",
+          "roles": [
+            "authenticated"
+          ],
+          "withCheck": "(user_id = ( SELECT auth.uid() AS uid))"
+        },
+        {
+          "name": "Users can leave organizations",
+          "command": "delete",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "(user_id = ( SELECT auth.uid() AS uid))"
+        },
+        {
+          "name": "Users can update their membership",
+          "command": "update",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "(user_id = ( SELECT auth.uid() AS uid))"
+        }
+      ],
+      "afterPatches": []
+    },
+    {
+      "table": "public.organizations",
+      "kind": "table",
+      "ownerColumns": [
+        "created_by"
+      ],
+      "tenant": {
+        "tenant": "public.organizations",
+        "tenantKey": "id",
+        "tenantKeyType": "uuid",
+        "members": {
+          "table": "public.organization_members",
+          "tenantColumn": "organization_id",
+          "userColumn": "user_id",
+          "roleColumn": "role",
+          "adminRoles": [
+            "owner",
+            "admin"
+          ],
+          "memberRole": "member"
+        },
+        "via": {
+          "kind": "tenant"
+        }
+      },
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"organizations\""
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "non-member",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "owner",
+          "action": "update",
+          "column": "plan",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "owner",
+          "action": "update",
+          "column": "stripe_customer_id",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "leaks": [
+        {
+          "actor": "owner",
+          "action": "update",
+          "column": "plan",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "owner",
+          "action": "update",
+          "column": "stripe_customer_id",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "policies": [
+        {
+          "name": "Members can update their organization",
+          "command": "update",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "is_member(id)"
+        },
+        {
+          "name": "Members can view their organization",
+          "command": "select",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "is_member(id)"
+        },
+        {
+          "name": "Signed-in users can create organizations",
+          "command": "insert",
+          "roles": [
+            "authenticated"
+          ],
+          "withCheck": "(( SELECT auth.uid() AS uid) IS NOT NULL)"
+        }
+      ],
+      "afterPatches": []
+    },
+    {
+      "table": "public.projects",
+      "kind": "table",
+      "ownerColumns": [
+        "created_by"
+      ],
+      "tenant": {
+        "tenant": "public.organizations",
+        "tenantKey": "id",
+        "tenantKeyType": "uuid",
+        "members": {
+          "table": "public.organization_members",
+          "tenantColumn": "organization_id",
+          "userColumn": "user_id",
+          "roleColumn": "role",
+          "adminRoles": [
+            "owner",
+            "admin"
+          ],
+          "memberRole": "member"
+        },
+        "via": {
+          "kind": "column",
+          "column": "organization_id"
+        }
+      },
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"projects\""
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "non-member",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        }
+      ],
+      "leaks": [
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 1,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 1,
+          "of": 1
+        }
+      ],
+      "policies": [
+        {
+          "name": "Members can manage projects",
+          "command": "all",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "(EXISTS ( SELECT 1\n   FROM organization_members m\n  WHERE (m.user_id = ( SELECT auth.uid() AS uid))))"
+        }
+      ],
+      "afterPatches": []
+    },
+    {
+      "table": "public.tasks",
+      "kind": "table",
+      "ownerColumns": [],
+      "tenant": {
+        "tenant": "public.organizations",
+        "tenantKey": "id",
+        "tenantKeyType": "uuid",
+        "members": {
+          "table": "public.organization_members",
+          "tenantColumn": "organization_id",
+          "userColumn": "user_id",
+          "roleColumn": "role",
+          "adminRoles": [
+            "owner",
+            "admin"
+          ],
+          "memberRole": "member"
+        },
+        "via": {
+          "kind": "parent",
+          "column": "project_id",
+          "parent": "public.projects",
+          "parentColumn": "id",
+          "parentTenantColumn": "organization_id"
+        }
+      },
+      "checks": [
+        {
+          "actor": "anon",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"tasks\""
+        },
+        {
+          "actor": "anon",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "anon",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "insert",
+          "rows": 0,
+          "of": 1,
+          "refused": "new row violates row-level security policy for table \"tasks\""
+        },
+        {
+          "actor": "other-user",
+          "action": "update",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "other-user",
+          "action": "delete",
+          "rows": 0,
+          "of": 1
+        },
+        {
+          "actor": "non-member",
+          "action": "select",
+          "rows": 0,
+          "of": 1
+        }
+      ],
+      "leaks": [],
+      "policies": [
+        {
+          "name": "Members can manage tasks",
+          "command": "all",
+          "roles": [
+            "authenticated"
+          ],
+          "using": "(EXISTS ( SELECT 1\n   FROM projects p\n  WHERE ((p.id = tasks.project_id) AND is_member(p.organization_id))))",
+          "withCheck": "(EXISTS ( SELECT 1\n   FROM projects p\n  WHERE ((p.id = tasks.project_id) AND is_member(p.organization_id))))"
+        }
+      ],
+      "afterPatches": []
+    }
+  ],
+  "notChecked": [
+    "The deployed site: no URL was given, so HTTPS, security headers, cookies and the built JavaScript bundles were not checked.",
+    "Business logic and authorization inside your own API routes, server actions and edge functions (beyond the Stripe webhook).",
+    "Rate limiting, abuse and brute-force protection, email/auth settings in the Supabase dashboard.",
+    "Dependencies with known CVEs: npm audit was turned off for this run.",
+    "The live database: policies or grants changed in the Supabase dashboard and not saved as migrations are invisible to a repo scan. The RLS probe runs your migrations in a local Postgres, not against your project.",
+    "Manual penetration testing: every finding here comes from automated scanners and a local probe, and nothing was tried against your running app."
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "$comment": "Ground truth for team-workspace-app, a small B2B team workspace (Next.js App Router, Supabase organizations/members/invitations/projects, Stripe per organization) written for these tests. Holes are seeded on purpose; controls are done right and must not be flagged at Medium or above. RLS is on for every table and every table has policies, so a dashboard check passes; H01, H02, H03 and H05 need the behavioural probe to be rated right.",
+  "holes": [
+    {
+      "id": "H01",
+      "kind": "membership-self-join",
+      "target": { "object": "public.organization_members", "file": "supabase/migrations/20261116090100_organization_policies.sql" },
+      "summary": "Insert policy with check (user_id = auth.uid()): any signed-in user adds their own membership row to any organization, then every policy that trusts membership lets them in."
+    },
+    {
+      "id": "H02",
+      "kind": "membership-self-promotion",
+      "target": { "object": "public.organization_members", "file": "supabase/migrations/20261116090100_organization_policies.sql" },
+      "summary": "Update policy using (user_id = auth.uid()) with no column limit: a plain member sets their own role to owner. (Moving the row to another organization is refused here, because the select policy is membership-scoped.)"
+    },
+    {
+      "id": "H03",
+      "kind": "any-membership-policy",
+      "target": { "object": "public.projects", "file": "supabase/migrations/20261116090200_projects.sql" },
+      "summary": "Policy for all using (exists (select 1 from organization_members m where m.user_id = auth.uid())): a member of any organization reads and changes every organization's projects. No static rule sees it."
+    },
+    {
+      "id": "H04",
+      "kind": "invites-readable",
+      "target": { "object": "public.invitations", "file": "supabase/migrations/20261116090300_invitations.sql" },
+      "summary": "Select policy using (true) for authenticated: any signed-in user reads every organization's invite emails and tokens."
+    },
+    {
+      "id": "H05",
+      "kind": "member-edits-billing",
+      "target": { "object": "public.organizations", "file": "supabase/migrations/20261116090100_organization_policies.sql" },
+      "summary": "Update policy using (is_member(id)): any plain member changes the organization's plan and stripe_customer_id."
+    },
+    {
+      "id": "H06",
+      "kind": "view-bypasses-rls",
+      "target": { "object": "public.org_usage", "file": "supabase/migrations/20261116090500_org_usage.sql" },
+      "summary": "View without security_invoker: anyone with the API key reads every organization's name, plan and project count."
+    }
+  ],
+  "controls": [
+    { "id": "C01", "target": { "object": "public.tasks", "file": "supabase/migrations/20261116090200_projects.sql" }, "summary": "Tasks belong to an organization through projects; the policy checks is_member() on the parent project's organization." },
+    { "id": "C02", "target": { "object": "public.audit_events", "file": "supabase/migrations/20261116090400_audit_events.sql" }, "summary": "Members read their organization's events and insert only their own; no update or delete policy." },
+    { "id": "C03", "target": { "object": "public.is_member", "file": "supabase/migrations/20261116090000_organizations.sql" }, "summary": "SECURITY DEFINER helper with search_path = '', execute revoked from anon." },
+    { "id": "C04", "target": { "object": "public.handle_new_organization", "file": "supabase/migrations/20261116090000_organizations.sql" }, "summary": "SECURITY DEFINER trigger that makes the creator the owner, search_path = ''." },
+    { "id": "C05", "target": { "object": "stripe webhook", "file": "app/api/stripe/webhook/route.ts" }, "summary": "Route handler that verifies the Stripe signature on the raw body before it updates the plan with the service role." }
+  ]
+}

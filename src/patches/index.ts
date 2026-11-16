@@ -1,12 +1,22 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { SEVERITY_RANK, type Finding } from "../types.ts";
+import { SEVERITY_RANK, type Finding, type Patch } from "../types.ts";
+import { tenantPatch } from "./tenancy.ts";
 import { applies, unifiedDiff, type FileEdit } from "./diff.ts";
 import { FIXERS, probeLeak, type FixContext } from "./fixers.ts";
 import { probeSources } from "../probe/sources.ts";
 import type { SqlFile } from "./sql.ts";
 
 const MIGRATIONS_DIR = "supabase/migrations";
+
+/** Static fixers that do not write an owner condition, safe on organization-owned tables too. */
+const OWNER_FREE = new Set([
+  "view-bypasses-rls",
+  "rls-disabled",
+  "auth-users-exposed",
+  "definer-function-anon",
+  "definer-search-path",
+]);
 
 /** Folders of SQL that no longer runs: old schema copies kept for reference. */
 export const ARCHIVED_SQL = /(?:^|\/)(?:archives?|archived|deprecated|old|backups?|legacy|unused)\//i;
@@ -60,17 +70,31 @@ export async function fixContext(repo: string, files: string[], now: Date): Prom
  */
 export async function attachPatches(findings: Finding[], ctx: FixContext, repo: string): Promise<FileEdit[]> {
   const verified: FileEdit[] = [];
+  // One organization patch per table: it rewrites every leaking policy there, so a second finding on the
+  // same table shares it.
+  const tenantPatches = new Map<string, { id: string; patch: Patch }>();
   for (const finding of findings) {
     if (SEVERITY_RANK[finding.severity] < SEVERITY_RANK.medium) continue;
+    const table = finding.proof?.tenant && finding.proof.leaks.length ? finding.proof.table : undefined;
+    const shared = table ? tenantPatches.get(table) : undefined;
+    if (shared) {
+      finding.patch = { ...shared.patch, summary: `Same patch as ${shared.id}. ${shared.patch.summary}` };
+      continue;
+    }
+    // A table that belongs to an organization gets membership policies, never owner-only ones.
+    // Fixers that do not assume an owner (a view's security_invoker, turning RLS on) still apply when the
+    // organization patch has nothing to rewrite (a view, a table two links below the organization).
+    let draft = table ? tenantPatch(finding, ctx) : undefined;
     const fixer = FIXERS[finding.rule];
-    let draft = fixer ? await fixer(finding, ctx) : undefined;
+    if (!draft && fixer && (!table || OWNER_FREE.has(finding.rule))) draft = await fixer(finding, ctx);
     // A static rule's fixer may not know the table's shape (a child table has no owner column); the
     // probe's proof can still say which policies leaked and who owns the rows.
-    if (!draft && finding.proof?.leaks.length) draft = await probeLeak(finding, ctx);
+    if (!draft && !table && finding.proof?.leaks.length) draft = await probeLeak(finding, ctx);
     if (!draft) continue;
     const diff = await unifiedDiff(draft.edits);
     const ok = await applies(repo, draft.edits, diff);
     finding.patch = { diff, summary: draft.summary, caveats: draft.caveats, verified: ok, partial: draft.partial };
+    if (table) tenantPatches.set(table, { id: finding.id, patch: finding.patch });
     if (ok) verified.push(...draft.edits);
   }
   return verified;

@@ -285,11 +285,13 @@ create function public.wipe_old() returns void language sql security definer as 
   });
 
   it("rates a public content table Low and a caller-checking definer function Medium; controls keep their level", async () => {
-    // PostGIS is not in PGlite, so the strict migration load fails and only the static reading is left.
+    // PostGIS is not in PGlite: the strict load fails, and in the statement-by-statement retry every table
+    // with a geometry column fails too, so only the static reading is left for them.
+    const geo = SQL.replace(/(create table [^\n]*)\);/g, "$1, geom geometry);");
     const dir = await app({
       "package.json": pkg,
       "supabase/migrations/20240101000000_init.sql": `create extension if not exists postgis;
-${SQL}
+${geo}
 alter table public.homepage_sections enable row level security;
 create policy "read sections" on public.homepage_sections for select using (true);
 alter table public.bookings enable row level security;
@@ -297,7 +299,8 @@ create policy "read bookings" on public.bookings for select using (true);
 `,
     });
     const result = await audit({ repo: dir, now: NOW, npmAudit: false });
-    expect(result.tools.find((t) => t.name === "rls-probe")?.status).toBe("failed");
+    expect(result.tools.find((t) => t.name === "rls-probe")?.note).toMatch(/statement by statement/);
+    expect(result.probe?.map((p) => p.table) ?? []).toEqual([]);
     expect(find(result, "rls-permissive-policy", "public.homepage_sections")?.severity).toBe("low");
     expect(find(result, "rls-permissive-policy", "public.homepage_sections")?.evidence).toMatch(
       /looks like public content/,
