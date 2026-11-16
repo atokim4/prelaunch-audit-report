@@ -17,6 +17,8 @@ const SPECIFICITY = [
 function dedupeKey(raw: RawFinding): string {
   const where = raw.location.kind === "file" ? raw.location.file : raw.location.url;
   if (raw.source === "launch-audit") return `${where}|${raw.rule}`;
+  // One webhook handler reading the body wrong is one finding, however many lines the scanners point at.
+  if (raw.rule.startsWith("stripe-webhook-") && raw.location.kind === "file") return `${where}|${raw.rule}`;
   // The same policy created again in a later migration is one finding, not one per file.
   const policy = where.endsWith(".sql") ? raw.message.match(/^Policy "([^"]+)"/)?.[1] : undefined;
   if (policy && raw.subject) return `policy|${raw.rule}|${raw.subject.toLowerCase()}|${policy}`;

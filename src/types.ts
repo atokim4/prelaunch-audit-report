@@ -147,6 +147,11 @@ export interface Membership {
    * app-wide admin reaching every organization is the design, not a leak.
    */
   globalAdmin?: string;
+  /**
+   * Roles kept in a lookup table (`role_id -> roles.id`, label in `roles.name`): that table, its key column
+   * and its label column. `roleColumn` is then the foreign key and `adminRoles`/`memberRole` are labels.
+   */
+  roleTable?: { table: string; key: string; label: string };
 }
 
 /** How one table's rows belong to an organization. */

@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { PGlite, type Extensions, type Transaction } from "@electric-sql/pglite";
 import { statements, type SqlFile } from "../patches/sql.ts";
 import { isStrict, loadOrder } from "./sources.ts";
-import { detectTenancy, type Tenancy } from "./tenancy.ts";
+import { ADMIN_ROLE, detectTenancy, type Tenancy } from "./tenancy.ts";
 import type { AccessCheck, AccessVerdict, Actor, OwnedVia, ProbeCheck, ProbePolicy, TenantLink } from "../types.ts";
 
 /**
@@ -15,7 +15,7 @@ import type { AccessCheck, AccessVerdict, Actor, OwnedVia, ProbeCheck, ProbePoli
  * values break) is recorded as inconclusive, never as "blocked".
  */
 
-export const PROBE_VERSION = "1.4.0";
+export const PROBE_VERSION = "1.5.0";
 export const SHIM_PATH = new URL("./supabase-shim.sql", import.meta.url);
 
 export const USER_A = "00000000-0000-4000-8000-00000000000a";
@@ -571,6 +571,60 @@ async function tokenKeys(db: PGlite): Promise<{ org: string[]; role: string[] }>
   };
 }
 
+/** Label -> key of the rows of a roles lookup table, per membership model; kept out of the JSON output. */
+const ROLE_KEYS = new WeakMap<Tenancy["members"], Map<string, string>>();
+
+/** What a membership row stores for a role: the label itself, or the key of that label's roles row. */
+function roleValue(m: Tenancy["members"], label: string | undefined): string | undefined {
+  if (label === undefined || !m.roleTable) return label;
+  return ROLE_KEYS.get(m)?.get(label);
+}
+
+/**
+ * Roles in a lookup table: reads its rows (a migration usually seeds them), or adds owner/admin/member
+ * when it is empty, then takes the admin and plain-member labels from what is there. When that fails the
+ * probe goes on without roles, as for a membership table that has no role column.
+ */
+async function resolveRoleTable(db: PGlite, m: Tenancy["members"], byName: Map<string, TableInfo>): Promise<void> {
+  const lookup = m.roleTable;
+  if (!lookup) return;
+  const info = byName.get(lookup.table.replace(/^public\./, ""));
+  const read = async () =>
+    info
+      ? (
+          await db.query<{ k: string; l: string }>(
+            `select ${quote(lookup.key)}::text as k, ${quote(lookup.label)}::text as l from ${rel(info.name)}`,
+          )
+        ).rows
+      : [];
+  let failed = !info;
+  let rows = await read().catch(() => ((failed = true), []));
+  if (info && !failed && !rows.length) {
+    for (const label of new Set([...m.adminRoles, m.memberRole ?? "member"])) {
+      const row = await rowFor(db, info, byName, USER_A, { [lookup.label]: label });
+      if (typeof row === "string") {
+        failed = true;
+        break;
+      }
+      await db.query(insertSql(info, row), row.values).catch(() => (failed = true));
+    }
+    rows = await read().catch(() => ((failed = true), []));
+  }
+  if (failed || !rows.length) {
+    delete m.roleTable;
+    delete m.roleColumn;
+    m.adminRoles = [];
+    delete m.memberRole;
+    return;
+  }
+  ROLE_KEYS.set(m, new Map(rows.map((r) => [r.l, r.k])));
+  const labels = rows.map((r) => r.l);
+  m.adminRoles = labels.filter((l) => ADMIN_ROLE.test(l));
+  m.memberRole =
+    labels.find((l) => !ADMIN_ROLE.test(l) && /member|user|viewer|staff|basic|read/i.test(l)) ??
+    labels.find((l) => !ADMIN_ROLE.test(l));
+}
+
 /** User B's role in organization B: an admin, unless admins are app-wide (then a plain member). */
 const roleOfB = (m: Tenancy["members"]): string | undefined =>
   m.globalAdmin ? m.memberRole : (m.adminRoles[0] ?? m.memberRole);
@@ -759,17 +813,18 @@ async function seedMembers(
   ];
   for (const [org, user, role] of tries) {
     const pinned: Record<string, string> = { [m.tenantColumn]: org, [m.userColumn]: user };
-    if (m.roleColumn && role) pinned[m.roleColumn] = role;
+    const value = roleValue(m, role);
+    if (m.roleColumn && value) pinned[m.roleColumn] = value;
     const row = await rowFor(db, info, byName, user, pinned);
     if (typeof row === "string") return row;
     try {
       await insertAs(db, user, `${insertSql(info, row)} on conflict do nothing returning 1 as k`, row.values);
       // A trigger may already have added the user with another role: A has to be a plain member.
-      if (m.roleColumn && role) {
+      if (m.roleColumn && value) {
         await db.query(
           `update ${rel(info.name)} set ${quote(m.roleColumn)} = $1::text::${info.columns.find((c) => c.name === m.roleColumn)?.type ?? "text"}
             where ${quote(m.tenantColumn)}::text = $2 and ${quote(m.userColumn)}::text = $3`,
-          [role, org, user],
+          [value, org, user],
         );
       }
     } catch (error) {
@@ -802,12 +857,14 @@ async function escalation(
   column: ColumnInfo,
   of: number,
   own: string = info.mine,
+  values?: string[],
 ): Promise<ProbeCheck> {
   const target = rel(info.name);
   const { rows } = await db.query<{ v: string | null }>(
     `select ${quote(column.name)}::text as v from ${target} where ${own} limit 1`,
   );
-  const candidates = escalationValues(column, rows[0]?.v ?? null);
+  const current = rows[0]?.v ?? null;
+  const candidates = values ? values.filter((v) => v !== current) : escalationValues(column, current);
   let last: Outcome = { rows: 0, inconclusive: `no value to try for ${column.type}` };
   for (const value of candidates) {
     const o = await tryAs(
@@ -839,7 +896,8 @@ async function membershipChecks(
   if (!orgs.orgA || !orgs.orgB) return [];
   const target = rel(info.name);
   const pinned: Record<string, string> = { [m.tenantColumn]: orgs.orgA, [m.userColumn]: USER_B };
-  if (m.roleColumn && m.memberRole) pinned[m.roleColumn] = m.memberRole;
+  const memberValue = roleValue(m, m.memberRole);
+  if (m.roleColumn && memberValue) pinned[m.roleColumn] = memberValue;
   const row = await rowFor(db, info, byName, USER_B, pinned);
   const join =
     typeof row === "string"
@@ -975,7 +1033,14 @@ async function probeTable(
     const privileged = info.columns.filter(
       (c) => !c.generated && (PRIVILEGED_COLUMN.test(c.name) || (via === "members" && c.name === m?.roleColumn)),
     );
-    for (const column of privileged) checks.push(await escalation(db, info, column, of, own));
+    // A role kept in a lookup table is promoted by pointing the row at an admin role's key.
+    const adminKeys =
+      m?.roleTable && orgs
+        ? m.adminRoles.map((label) => roleValue(m, label)).filter((k): k is string => k !== undefined)
+        : undefined;
+    for (const column of privileged) {
+      checks.push(await escalation(db, info, column, of, own, column.name === m?.roleColumn ? adminKeys : undefined));
+    }
     if (via === "members" && orgs) checks.push(...(await membershipChecks(db, info, byName, orgs, own)));
   }
   return { checks, access: await accessChecks(db, info, of, orgs) };
@@ -1181,6 +1246,7 @@ export async function probeRls(migrations: SqlFile[], tolerant = false): Promise
     // An organization model decides who owns the rows it reaches, ahead of a creator column or a parent.
     const tenancy = detectTenancy(tables);
     if (tenancy) {
+      await resolveRoleTable(db, tenancy.members, byName);
       const global = await globalAdminCheck(db, tenancy);
       if (global) tenancy.members.globalAdmin = global;
     }

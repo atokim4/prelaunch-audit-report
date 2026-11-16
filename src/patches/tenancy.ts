@@ -64,7 +64,9 @@ function helpers(link: TenantLink, names: { member: string; role: string }, with
     "language sql stable security definer",
     "set search_path = ''",
     "as $$",
-    `  select exists (select 1 from ${table} m where ${match} and m.${identPart(m.roleColumn)}::text = any (allowed));`,
+    m.roleTable
+      ? `  select exists (select 1 from ${table} m join ${publicRel(m.roleTable.table)} r on r.${identPart(m.roleTable.key)} = m.${identPart(m.roleColumn)} where ${match} and r.${identPart(m.roleTable.label)}::text = any (allowed));`
+      : `  select exists (select 1 from ${table} m where ${match} and m.${identPart(m.roleColumn)}::text = any (allowed));`,
     "$$;",
     `revoke execute on function public.${names.role}(${type}, text[]) from public, anon;`,
     `grant execute on function public.${names.role}(${type}, text[]) to authenticated;`,

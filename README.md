@@ -152,8 +152,9 @@ let it through. The two most common shapes it catches that policy linters pass a
 
 #### Organizations, teams and workspaces
 
-The probe looks for a membership table in the loaded catalog: a table whose name says member, membership, seat
-or staff, with a foreign key to another table and a column tied to a user. The table it points at is the
+The probe looks for a membership table in the loaded catalog: a table whose name says member, membership, seat,
+staff, people, collaborator or users (`org_people`, `workspace_users`), with a foreign key to another table and
+a column tied to a user. The table it points at is the
 organization, whatever it is called (`organizations`, `tenants`, `business_units`). When there are several
 (organization members and project members), the top one wins. Every table with a foreign key to the
 organization, or a column with the membership table's organization column name and type and no foreign key at
@@ -162,7 +163,9 @@ exposes the organization column. Those tables count as organization A's rows, ah
 
 Seeding: organization A is made with `auth.uid()` set to a founder D (so a trigger that adds the creator as
 owner works), organization B by user B. User A joins A with the plain role, user B joins B as an admin; role
-values come from the enum or from a CHECK list (`role in ('owner', 'admin', 'member')`), and any other
+values come from the enum or from a CHECK list (`role in ('owner', 'admin', 'member')`), or from the rows of a
+separate roles table when the membership row only holds `role_id` (an app-wide `roles` table with a text name
+column; the probe adds owner, admin and member rows if the migrations leave it empty), and any other
 not-null column with a CHECK list gets one of its allowed values too. A composite foreign key (`project_id,
 tenant_id`) takes both values from one parent row. When the schema reads the organization from the token
 (`auth.jwt() -> 'app_metadata' ->> 'org_id'`, set by a custom access token hook), the test users' tokens carry
@@ -220,7 +223,7 @@ pinned, see [vendor/vibe-preflight](vendor/vibe-preflight/README.md)), then adju
 | `rls-no-policy`: RLS on and no policies (safe, but reads come back empty)                                                    | Low                                                                                                                                                                         | none |
 | `server-secret-in-client`: service role or Stripe secret in browser code                                                     | Critical                                                                                                                                                                    | 668  |
 | `public-env-secret`: secret behind `NEXT_PUBLIC_` / `VITE_` / `EXPO_PUBLIC_`                                                 | Critical or High                                                                                                                                                            | 668  |
-| `stripe-webhook-unverified`: webhook without `constructEvent` (route handlers and Deno edge functions)                       | Critical                                                                                                                                                                    | 345  |
+| `stripe-webhook-unverified`: webhook without `constructEvent` (route handlers, pages/api, Express, Deno edge functions)      | Critical                                                                                                                                                                    | 345  |
 | `stripe-webhook-parsed-body`: signature checked against a parsed body                                                        | Medium                                                                                                                                                                      | 345  |
 | `env-file-committed`: `.env` file with values tracked by git                                                                 | Critical, or Low when it holds only demo keys or public values                                                                                                              | 312  |
 | `stripe-webhook-jwt-gate`: webhook edge function that checks the signature but keeps `verify_jwt = true`, so Stripe gets 401 | Medium (fails closed)                                                                                                                                                       | none |
@@ -346,6 +349,13 @@ constraints or triggers reject those values is listed as "not tried"; it tests t
 `service_role`; functions called over `/rest/v1/rpc/` are checked statically, not called; and SQL in docs, seeds or a folder it
 does not recognise as schema is read statically (rules, PHI map), not run.
 
+Stripe webhooks: the Express check reads one file at a time for middleware order, so a webhook router mounted
+after an `app.use(express.json())` in another file is only caught by vibe-preflight's simpler rule (raw parser
+nowhere in the repo), and gets no patch because the order isn't visible. Handlers passed by name
+(`app.post("/webhook", express.raw(…), handleWebhook)`) are checked only by vibe-preflight's rule on the
+handler's own file, and get no patch. A helper that verifies
+the signature is trusted after reading its source; it is not run.
+
 ## Severity rubric
 
 A rule gets the first level that fits:
@@ -376,11 +386,28 @@ the code rules. Each patch is a unified diff that applies with `git apply` from 
   column must equal `(select auth.uid())`. When the leak is the owner raising their own role or plan, update is
   revoked on the table and granted back on every other column instead.
 - Stripe webhook in a Next.js route handler: raw body plus `constructEventAsync`.
+- Stripe webhook in Express: the route gets `express.raw({ type: "application/json" })` (replacing a
+  route-level `express.json()`), an app-wide `express.json()` registered earlier in the same file skips the
+  webhook's full path (mount path included for a router), and the handler checks the signature on the Buffer.
+  A `Buffer.isBuffer` guard answers 500 if a parser ever runs first again, so it shows up in Stripe's delivery
+  log. When the JSON parser lives in another file the order isn't visible, so there is no patch, only the
+  written fix. Besides vibe-preflight's rules, the tool has its own Express check: a webhook route with no
+  signature check in a file the scanner doesn't read as a webhook, and a correct route that an earlier
+  app-wide `express.json()` empties.
+- Stripe webhook in Next.js pages/api: `export const config = { api: { bodyParser: false } }`, a small reader
+  for the raw bytes, `constructEvent` on them; a sync handler becomes async.
+- Parsed body in a route handler or edge function: `await req.json()` becomes `await req.text()`, and when the
+  parsed object is still used later it is parsed from that text.
 - Stripe webhook in a Supabase Edge Function (Deno): raw body plus `constructEventAsync` with
   `Stripe.createSubtleCryptoProvider()`, because Deno has no Node crypto. The test suite runs the bench app's
   function in Node, with stand-ins for `serve`, `Deno.env` and the Supabase client, before and after the patch,
   and signs events with the real Stripe package: the original upgrades a plan for an unsigned POST, the patched
-  one returns 400 for a missing or forged signature and 200 for a signed event.
+  one returns 400 for a missing or forged signature and 200 for a signed event. The Express, pages/api and
+  `Deno.serve` variants get the same treatment (test/webhook-variants.test.ts): each broken fixture is audited,
+  its patch is applied with `git apply`, and the patched handler gets real Express 5, a Node server that does
+  what Next's body parser does, or a `Deno.serve` stand-in, with events signed by the Stripe package. Each patch
+  is then broken one piece at a time (no skip, no `express.raw`, the wrong mount path, no `bodyParser: false`)
+  and the signed event has to fail. Two correct fixtures must get no webhook finding.
 - `phi-no-audit-log`: the append-only audit-trail migration described above.
 - `phi-session-replay` for PostHog: adds `disable_session_recording: true` to `posthog.init`. Other replay
   vendors and the BAA findings get no patch, because the fix there is a decision (remove the script, sign a BAA,
@@ -608,10 +635,29 @@ outright. That also means zero on such a repo says less than it seems, which is 
 What it still misses here:
 
 - (Closed in v0.7.0: every probed table now gets a positive check, see "Row Level Security, by behaviour".)
-- Membership tables with names outside member, membership, seat, staff or users (say `org_people`), and roles
-  kept in a separate table (`role_id`), are not understood.
+- (v0.8.0: `org_people`-style names and roles in a separate `roles` table are understood now. A roles table
+  that belongs to each organization, with its own `org_id`, still is not.)
 - Organization claims in the token are filled by key name (org, tenant, team, workspace, account, company, unit,
   role); other names are not.
+
+## Thirteen Express repos with Stripe code (v0.8.0)
+
+To check the new Express webhook support I took 13 public Node/Express repos with Stripe code, pushed in the
+two weeks before, and read every webhook by hand. None had a real webhook hole. v0.7.0 still reported 5
+Criticals "webhook doesn't verify the signature" there, and all 5 were wrong: three routes hand the signature
+to a helper in another file that does call `constructEvent`, and two files aren't endpoints at all (a job
+handler, a browser-side test tool). The first v0.8.0 build added a sixth wrong one, an authenticated
+`/portal` route that only mentions `stripe_customer_id`.
+
+v0.8.0 reads one level further: when a route passes the `stripe-signature` header to a function that another
+file defines and that file calls `constructEvent`, the finding is dropped and the report says which helper it
+trusted, so a person can confirm the helper gets the raw body. A file that never reads a request body isn't
+treated as a webhook. After that: 0 webhook findings on the 13 and 0 known misses. None of these repos had a
+broken handler, so the Express and pages/api patches have only been tested on this repo's fixtures so far.
+
+The 17 repos from the earlier sections give the same findings, patches and probe results on v0.7.0 and v0.8.0.
+None of them has Stripe webhook code or a separate roles table, so that rerun shows nothing broke. It doesn't
+show the new code working on real repos.
 
 Real gaps in these repos go to their maintainers, through the channel each repo asks for, and not into this
 README.

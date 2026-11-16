@@ -1,0 +1,1 @@
+{ "name": "pages-parsed", "private": true, "type": "module", "dependencies": { "next": "16.0.0", "stripe": "19.3.1" } }

@@ -1,6 +1,7 @@
 import { functionTable } from "../shape.ts";
 import type { Action, Finding, LiveBucket, LiveTable, ProbePolicy, Proof } from "../types.ts";
 import type { FileEdit } from "./diff.ts";
+import { stripeWebhookParsedBody, stripeWebhookUnverified } from "./webhooks.ts";
 import {
   functionArgs,
   ident,
@@ -41,7 +42,7 @@ export interface PatchDraft {
   offApi?: string;
 }
 
-type Fixer = (finding: Finding, ctx: FixContext) => Promise<PatchDraft | undefined>;
+export type Fixer = (finding: Finding, ctx: FixContext) => Promise<PatchDraft | undefined>;
 
 /** The first `backticked` name in the scanner message, normalised. */
 function subject(finding: Finding): string | undefined {
@@ -376,164 +377,6 @@ const serverSecretInClient: Fixer = async (finding, ctx) => {
     caveats: [
       "The component now sees only the rows its user may see. If it is an admin screen that needs every row, move the query to a route handler that checks the caller is an admin and uses the service role there.",
       "Rotate the service role key if this ever shipped.",
-    ],
-  };
-};
-
-/** `@/lib/stripe` when tsconfig maps @/* to the root, else a relative path. */
-function importPath(from: string, to: string, aliasRoot: boolean): string {
-  const bare = to.replace(/\.(ts|tsx|js|mjs)$/, "");
-  if (aliasRoot) return `@/${bare}`;
-  const up = from
-    .split("/")
-    .slice(0, -1)
-    .map(() => "..");
-  return [...(up.length ? up : ["."]), bare].join("/");
-}
-
-/** A module (other than `self`) that exports a shared `stripe` client. */
-async function findStripeModule(ctx: FixContext, self: string): Promise<string | undefined> {
-  for (const file of ctx.files) {
-    if (!/\.(ts|tsx|js|mjs)$/.test(file) || file === self) continue;
-    const text = await ctx.read(file);
-    if (text && /export\s+const\s+stripe\s*=\s*new\s+Stripe\(/.test(text)) return file;
-  }
-  return undefined;
-}
-
-/** Adds import lines after the last existing import (or at the top). */
-function insertImports(source: string, imports: string[]): string {
-  if (!imports.length) return source;
-  const last = [...source.matchAll(/^import .*;$/gm)].pop();
-  if (!last) return `${imports.join("\n")}\n${source}`;
-  const at = (last.index ?? 0) + last[0].length;
-  return `${source.slice(0, at)}\n${imports.join("\n")}${source.slice(at)}`;
-}
-
-/** Matches `const event = await req.json()` (optionally wrapped in parens and cast to Stripe.Event). */
-const PARSED_EVENT =
-  /^([ \t]*)(?:const|let)\s+(\w+)\s*=\s*\(?\s*await\s+(\w+)\.json\(\)\s*\)?(?:\s+as\s+Stripe\.Event)?\s*;[ \t]*$/m;
-
-/** Any default import of Stripe, whatever the specifier (npm:, esm.sh, or a bare name from an import map). */
-const DENO_STRIPE_IMPORT = /^import\s+Stripe\s*(?:,\s*\{[^}]*\})?\s+from\s+["'][^"']+["'];?$/m;
-
-/**
- * Supabase Edge Function (Deno) version: Deno has no Node crypto, so the signature check needs
- * constructEventAsync with Stripe's SubtleCrypto provider, on the raw text of the request.
- */
-async function denoWebhookFix(path: string, before: string): Promise<PatchDraft | undefined> {
-  const parse = before.match(PARSED_EVENT);
-  if (!parse) return undefined;
-  const [line, indent = "  ", eventVar, requestVar] = parse;
-  // A type-only import cannot back `new Stripe(...)`: make it a value import of the same module.
-  let source = before.replace(/^import\s+type\s+(Stripe\s+from\s+["'][^"']+["'];?)$/m, "import $1");
-  const top: string[] = [];
-  if (!DENO_STRIPE_IMPORT.test(source)) top.push('import Stripe from "npm:stripe@19.3.1";');
-  const client = source.match(/^(?:export\s+)?const\s+(\w+)\s*=\s*new\s+Stripe\(/m)?.[1];
-  const stripeRef = client ?? "stripe";
-  const setup = [
-    ...(client
-      ? []
-      : [
-          'const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY") ?? "", { httpClient: Stripe.createFetchHttpClient() });',
-        ]),
-    "const cryptoProvider = Stripe.createSubtleCryptoProvider();",
-  ];
-  const i = indent;
-  const verified = [
-    `${i}const signature = ${requestVar}.headers.get("stripe-signature");`,
-    `${i}if (!signature) {`,
-    `${i}  return new Response("Missing stripe-signature header", { status: 400 });`,
-    `${i}}`,
-    "",
-    `${i}let ${eventVar}: Stripe.Event;`,
-    `${i}try {`,
-    `${i}  ${eventVar} = await ${stripeRef}.webhooks.constructEventAsync(`,
-    `${i}    await ${requestVar}.text(),`,
-    `${i}    signature,`,
-    `${i}    Deno.env.get("STRIPE_WEBHOOK_SECRET") ?? "",`,
-    `${i}    undefined,`,
-    `${i}    cryptoProvider,`,
-    `${i}  );`,
-    `${i}} catch {`,
-    `${i}  return new Response("Invalid signature", { status: 400 });`,
-    `${i}}`,
-  ].join("\n");
-  source = source.replace(line, verified);
-  // New imports and the client go right after the last import, so the file still reads top to bottom.
-  const last = [...source.matchAll(/^import .*;$/gm)].pop();
-  const at = last ? (last.index ?? 0) + last[0].length : 0;
-  const block = [...top, "", ...setup].join("\n");
-  const after = last ? `${source.slice(0, at)}\n${block}${source.slice(at)}` : `${block}\n${source}`;
-  return {
-    edits: [{ path, before, after }],
-    summary: `Reads the raw body and checks the stripe-signature header with constructEventAsync and Stripe's SubtleCrypto provider (Deno has no Node crypto) before the function touches the event. Unsigned or tampered requests get a 400.`,
-    caveats: [
-      `Set the secret: \`supabase secrets set STRIPE_WEBHOOK_SECRET=whsec_...\` (the endpoint's signing secret from the Stripe dashboard).`,
-      `Keep \`verify_jwt = false\` for this function in supabase/config.toml: Stripe sends no Supabase token, and the signature is now the gate.`,
-      `Test: \`stripe listen --forward-to <project>.supabase.co/functions/v1/${path.split("/")[2] ?? "stripe-webhook"}\`, then \`stripe trigger checkout.session.completed\`.`,
-    ],
-  };
-}
-
-const stripeWebhookUnverified: Fixer = async (finding, ctx) => {
-  if (finding.location.kind !== "file") return undefined;
-  const path = finding.location.file;
-  const before = await ctx.read(path);
-  if (!before) return undefined;
-  if (path.startsWith("supabase/functions/")) return denoWebhookFix(path, before);
-  if (!/export\s+async\s+function\s+POST\s*\(/.test(before)) return undefined; // App Router route handlers
-  const parse = before.match(PARSED_EVENT);
-  if (!parse) return undefined;
-  const [line, indent = "  ", eventVar, requestVar] = parse;
-
-  const stripeModule = await findStripeModule(ctx, path);
-  const imports: string[] = [];
-  let source = before;
-  let stripeRef = "stripe";
-  if (stripeModule) {
-    const tsconfig = (await ctx.read("tsconfig.json")) ?? "";
-    const aliasRoot = /"@\/\*"\s*:\s*\[\s*"\.\/\*"\s*\]/.test(tsconfig);
-    imports.push(`import { stripe } from "${importPath(path, stripeModule, aliasRoot)}";`);
-    if (!/^import\s+(?:type\s+)?Stripe\s+from\s+"stripe";$/m.test(source))
-      imports.push('import type Stripe from "stripe";');
-  } else {
-    stripeRef = "new Stripe(process.env.STRIPE_SECRET_KEY!)";
-    if (/^import\s+type\s+Stripe\s+from\s+"stripe";$/m.test(source)) {
-      source = source.replace(/^import\s+type\s+Stripe\s+from\s+"stripe";$/m, 'import Stripe from "stripe";');
-    } else if (!/^import\s+Stripe\s+from\s+"stripe";$/m.test(source)) {
-      imports.push('import Stripe from "stripe";');
-    }
-  }
-  if (!/import\s*\{[^}]*\bNextResponse\b[^}]*\}\s*from\s*"next\/server"/.test(source)) {
-    imports.unshift('import { NextResponse } from "next/server";');
-  }
-  const i = indent;
-  const verified = [
-    `${i}const signature = ${requestVar}.headers.get("stripe-signature");`,
-    `${i}if (!signature) {`,
-    `${i}  return NextResponse.json({ error: "Missing stripe-signature header" }, { status: 400 });`,
-    `${i}}`,
-    "",
-    `${i}let ${eventVar}: Stripe.Event;`,
-    `${i}try {`,
-    `${i}  ${eventVar} = await ${stripeRef}.webhooks.constructEventAsync(`,
-    `${i}    await ${requestVar}.text(),`,
-    `${i}    signature,`,
-    `${i}    process.env.STRIPE_WEBHOOK_SECRET!,`,
-    `${i}  );`,
-    `${i}} catch {`,
-    `${i}  return NextResponse.json({ error: "Invalid signature" }, { status: 400 });`,
-    `${i}}`,
-  ].join("\n");
-  const after = insertImports(source.replace(line, verified), imports);
-  return {
-    edits: [{ path, before, after }],
-    summary:
-      "Reads the raw body and checks the stripe-signature header with constructEventAsync before the handler touches the event. Unsigned or tampered requests get a 400.",
-    caveats: [
-      "Set STRIPE_WEBHOOK_SECRET to the endpoint's signing secret (whsec_…) in every environment.",
-      "Test with `stripe listen --forward-to localhost:3000/api/stripe/webhook` and `stripe trigger checkout.session.completed`.",
     ],
   };
 };
@@ -939,4 +782,5 @@ export const FIXERS: Record<string, Fixer> = {
   "public-env-secret": publicEnvSecret,
   "server-secret-in-client": serverSecretInClient,
   "stripe-webhook-unverified": stripeWebhookUnverified,
+  "stripe-webhook-parsed-body": stripeWebhookParsedBody,
 };

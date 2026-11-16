@@ -609,7 +609,8 @@ function staticRuleInfo(raw: RawFinding): RuleInfo | undefined {
     case "rls-probe":
       return PROBE_RULES[raw.rule] ?? probeInfo(raw);
     case "project-config":
-      return PROJECT_CONFIG[raw.rule];
+      // The Express webhook check reports under the same two webhook rules as vibe-preflight.
+      return PROJECT_CONFIG[raw.rule] ?? (raw.rule.startsWith("stripe-webhook-") ? PREFLIGHT[raw.rule] : undefined);
     case "npm-audit":
       return npmAuditInfo(raw);
     case "vibe-preflight":

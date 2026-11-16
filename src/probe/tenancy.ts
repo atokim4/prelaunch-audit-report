@@ -26,8 +26,11 @@ export interface TenancyTable {
 
 const TENANT_NAME =
   /^(organi[sz]ations?|orgs?|teams?|workspaces?|tenants?|compan(y|ies)|accounts?|groups?|business_units?|clinics?|practices?|agenc(y|ies)|schools?|stores?|shops?|households?)$/i;
-const MEMBER_NAME = /member|seat|staff|(^|_)users?$|^users?_|_roles?$/i;
+const MEMBER_NAME = /member|seat|staff|people|collaborator|(^|_)users?$|^users?_|_roles?$/i;
 const ROLE_COLUMN = /^(role|roles|member_role|org_role|team_role|workspace_role|access_level|permission_level)$/i;
+/** A lookup table of roles (`roles`, `member_roles`) and the column that names each role in it. */
+const ROLE_TABLE = /^(?:\w+_)?roles?$/i;
+const ROLE_LABEL = /^(name|slug|key|code|role|title|label)$/i;
 /** Role values that manage an organization. */
 export const ADMIN_ROLE = /owner|admin|super|manager|editor_admin|root/i;
 const DEFAULT_ADMINS = ["owner", "admin"];
@@ -77,6 +80,33 @@ function roles(column: TenancyColumn | undefined): Pick<Membership, "adminRoles"
   return { adminRoles: admins, memberRole: plain ?? labels.find((l) => !ADMIN_ROLE.test(l)) };
 }
 
+/**
+ * Roles held in a separate table: a membership column with a foreign key to an app-wide roles table that
+ * has a text label column. A roles table that itself belongs to the organization is left out (its rows
+ * would need the organization seeded first, and its labels differ per organization).
+ */
+function roleLookup(
+  members: TenancyTable,
+  tenant: TenancyTable,
+  tables: TenancyTable[],
+): { column: string; table: NonNullable<Membership["roleTable"]>; labelColumn: TenancyColumn } | undefined {
+  for (const column of members.columns) {
+    const parent = column.parent && tables.find((t) => t.name === column.parent?.name);
+    if (!parent || parent === members || parent.kind !== "table" || !ROLE_TABLE.test(parent.name)) continue;
+    if (parent.columns.some((c) => c.parent?.name === tenant.name)) continue;
+    const label = parent.columns.find(
+      (c) => ROLE_LABEL.test(c.name) && c.name !== column.parent?.column && /text|char/i.test(c.type),
+    );
+    if (!label || !column.parent) continue;
+    return {
+      column: column.name,
+      table: { table: `public.${parent.name}`, key: column.parent.column, label: label.name },
+      labelColumn: label,
+    };
+  }
+  return undefined;
+}
+
 export function detectTenancy(tables: TenancyTable[]): Tenancy | undefined {
   const found = candidates(tables);
   if (!found.length) return undefined;
@@ -95,12 +125,14 @@ export function detectTenancy(tables: TenancyTable[]): Tenancy | undefined {
   const keyColumn = tenant.columns.find((c) => c.name === best.tenantColumn.parent?.column);
   if (!keyColumn) return undefined;
   const roleColumn = members.columns.find((c) => ROLE_COLUMN.test(c.name));
+  const lookup = roleColumn ? undefined : roleLookup(members, tenant, tables);
   const membership: Membership = {
     table: `public.${members.name}`,
     tenantColumn: best.tenantColumn.name,
     userColumn: best.userColumn,
     ...(roleColumn ? { roleColumn: roleColumn.name } : {}),
-    ...roles(roleColumn),
+    ...(lookup ? { roleColumn: lookup.column, roleTable: lookup.table } : {}),
+    ...roles(roleColumn ?? lookup?.labelColumn),
   };
   const base = { tenant: `public.${tenant.name}`, tenantKey: keyColumn.name, tenantKeyType: keyColumn.type };
   const links = new Map<string, TenantLink>();

@@ -8,6 +8,8 @@ import { runLaunchAudit } from "./scanners/launch-audit.ts";
 import { mergeLive, runLiveProbe, type LiveOptions } from "./scanners/live-probe.ts";
 import { runNpmAudit } from "./scanners/npm-audit.ts";
 import { markPhi, runPhiScan } from "./scanners/phi.ts";
+import { expressWebhookFindings } from "./scanners/express.ts";
+import { filterUnverifiedWebhooks } from "./scanners/webhook-context.ts";
 import { filterPreflight, runPreflight } from "./scanners/preflight.ts";
 import { addStaticContext, dynamicRlsTables } from "./scanners/static-context.ts";
 import { probeSources } from "./probe/sources.ts";
@@ -168,6 +170,10 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
   if (!deps) notChecked.push("Dependencies with known CVEs: npm audit was turned off for this run.");
   tools.push(probe.tool);
   raws.push(...(await edgeConfigFindings(shape, ctx.read)));
+  raws.push(...(await expressWebhookFindings(ctx.files, ctx.read, preflight.findings)));
+  const webhooks = await filterUnverifiedWebhooks(raws.splice(0), ctx.files, ctx.read);
+  raws.push(...webhooks.findings);
+  notChecked.push(...webhooks.notes);
   if (probe.result) raws.push(...mergeProbe(raws, probe.result, ctx.probeSql));
   if (probe.note) notChecked.unshift(probe.note);
 

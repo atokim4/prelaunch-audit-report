@@ -1,0 +1,6 @@
+{
+  "name": "workspace-roles-app",
+  "private": true,
+  "description": "Deliberately broken test fixture: workspaces whose member roles live in a separate roles table. Made-up data only.",
+  "dependencies": { "@supabase/supabase-js": "2.81.0", "next": "16.0.0", "react": "19.2.0" }
+}

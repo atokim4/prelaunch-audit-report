@@ -1,0 +1,28 @@
+{
+  "$comment": "Ground truth for workspace-roles-app, a small workspace app whose member roles live in a separate roles table (workspace_users.role_id -> roles.id, label in roles.name). Written with holes on purpose for these tests; all data is made up. Controls are done right and must not be flagged at Medium or above.",
+  "holes": [
+    {
+      "id": "H01",
+      "kind": "membership-self-join",
+      "target": { "object": "public.workspace_users", "file": "supabase/migrations/20261117090100_policies.sql" },
+      "summary": "Insert policy with check (user_id = auth.uid()): any signed-in user adds themselves to any workspace."
+    },
+    {
+      "id": "H02",
+      "kind": "membership-self-promotion",
+      "target": { "object": "public.workspace_users", "file": "supabase/migrations/20261117090100_policies.sql" },
+      "summary": "Update policy using (user_id = auth.uid()) with no column limit: a plain member points their own role_id at the owner role."
+    },
+    {
+      "id": "H03",
+      "kind": "cross-tenant-read",
+      "target": { "object": "public.documents", "file": "supabase/migrations/20261117090100_policies.sql" },
+      "summary": "Select policy using (true) for authenticated: every signed-in user reads every workspace's documents."
+    }
+  ],
+  "controls": [
+    { "object": "public.workspaces", "summary": "Members read their own workspace only." },
+    { "object": "public.projects", "summary": "Every command scoped with is_workspace_member(workspace_id)." },
+    { "object": "public.roles", "summary": "Shared role names, readable by signed-in users: a lookup table, not organization data." }
+  ]
+}
