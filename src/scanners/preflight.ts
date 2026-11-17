@@ -79,7 +79,15 @@ export interface PreflightFilter {
   findings: RawFinding[];
   /** Files under an archive-like folder whose findings were dropped. */
   archived: string[];
+  /** Browser env vars that are on/off flags or public by design, not reported as secrets. */
+  notSecrets: string[];
 }
+
+/** `VITE_DISABLE_LOGIN_WITH_PASSWORD`, `NEXT_PUBLIC_SHOW_PRICING`, `VITE_PASSWORD_MIN_LENGTH`: settings, not keys. */
+const FLAG_NAME =
+  /^(?:VITE_|NEXT_PUBLIC_|REACT_APP_|EXPO_PUBLIC_|PUBLIC_|NUXT_PUBLIC_)?(?:\w+_)?(?:DISABLE|ENABLE|SHOW|HIDE|ALLOW|REQUIRE|IS|HAS)_\w+$|_(?:ENABLED|DISABLED|LENGTH|MIN_LENGTH|MAX_LENGTH|POLICY)$/;
+/** Keys the browser must have: the Web Push VAPID public key (the private half is the secret). */
+const PUBLIC_BY_DESIGN = /VAPID(?:_PUBLIC)?_KEY$/;
 
 /**
  * Drops two kinds of vibe-preflight findings that real repos showed to be noise:
@@ -94,6 +102,7 @@ export async function filterPreflight(
 ): Promise<PreflightFilter> {
   const findings: RawFinding[] = [];
   const archived = new Set<string>();
+  const notSecrets = new Set<string>();
   for (const raw of raws) {
     const file = raw.location.kind === "file" ? raw.location.file : undefined;
     if (file?.endsWith(".sql") && archivedSql.test(file)) {
@@ -101,6 +110,13 @@ export async function filterPreflight(
       continue;
     }
     const name = raw.subject ?? "";
+    if (
+      raw.rule === "public-env-secret" &&
+      (FLAG_NAME.test(name) || (PUBLIC_BY_DESIGN.test(name) && !/PRIVATE/.test(name)))
+    ) {
+      notSecrets.add(name);
+      continue;
+    }
     if (
       raw.rule === "public-env-secret" &&
       file &&
@@ -112,5 +128,5 @@ export async function filterPreflight(
     }
     findings.push(raw);
   }
-  return { findings, archived: [...archived].sort() };
+  return { findings, archived: [...archived].sort(), notSecrets: [...notSecrets].sort() };
 }

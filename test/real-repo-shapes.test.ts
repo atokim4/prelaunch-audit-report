@@ -203,7 +203,9 @@ export const supabase = createClient(url, key);
 describe("secret scan of history", () => {
   // Built at runtime so this file holds no key header for secret scanners to trip on.
   const label = ["PRIVATE", "KEY"].join(" ");
-  const PEM_DOC = `Example:\n-----BEGIN ${label}-----\n...\n-----END ${label}-----\n`;
+  // A body that looks like a key: a header over "..." or "demo" is a placeholder and is not reported (run 14).
+  const body = ["MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", "BKcwggSjAgEAAoIBAQC7"].join("");
+  const PEM_DOC = `Example:\n-----BEGIN ${label}-----\n${body}\n-----END ${label}-----\n`;
 
   /** A repo where `file` was committed and then deleted, so only the history scan can see it. */
   async function historyOnly(file: string): Promise<string[]> {

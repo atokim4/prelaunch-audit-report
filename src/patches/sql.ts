@@ -154,6 +154,21 @@ export function functionBody(files: SqlFile[], fn: string): string | undefined {
   return found;
 }
 
+/** The return type of the last definition of `fn` (`boolean`, `setof public.notes`, `table`…), lower case. */
+export function functionReturns(files: SqlFile[], fn: string): string | undefined {
+  const head = new RegExp(String.raw`^create\s+(?:or\s+replace\s+)?function\s+${NAME}\s*\(`, "i");
+  let found: string | undefined;
+  for (const file of [...files].sort((a, b) => a.path.localeCompare(b.path))) {
+    for (const stmt of statements(file.text)) {
+      const match = stmt.match(head);
+      if (!match?.[1] || qualify(match[1]) !== fn) continue;
+      const returns = stmt.slice(match[0].length).match(/\)\s*returns\s+((?:setof\s+)?[\w."]+)/i)?.[1];
+      if (returns) found = returns.toLowerCase();
+    }
+  }
+  return found;
+}
+
 export interface Policy {
   name: string;
   table: string;

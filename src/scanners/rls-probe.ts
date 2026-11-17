@@ -46,8 +46,59 @@ export function toProof(table: TableProbe): Proof {
  */
 const PUBLIC_POLICY_NAME = /^(public|anyone|everyone|visitors?|guests?|anon\w*)\b/i;
 
+/** Columns that mark a row as meant for everyone: an active organizer, a published page. */
+const VISIBILITY_COLUMN = /^(?:is_)?(?:active|public|published|visible|listed|live)$/i;
+const VISIBLE_STATUS = /^(?:published|public|active|live|approved|listed)$/i;
+
+/** Top-level OR terms of a policy expression as Postgres prints it: `(is_active OR (id IN ( SELECT …)))`. */
+function orTerms(expression: string): string[] {
+  let text = expression.trim();
+  const wrapped = (t: string): boolean => {
+    if (!t.startsWith("(") || !t.endsWith(")")) return false;
+    let depth = 0;
+    for (let i = 0; i < t.length; i++) {
+      if (t[i] === "(") depth++;
+      else if (t[i] === ")" && --depth === 0 && i < t.length - 1) return false;
+    }
+    return true;
+  };
+  while (wrapped(text)) text = text.slice(1, -1).trim();
+  const terms: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "(") depth++;
+    else if (text[i] === ")") depth--;
+    else if (depth === 0 && /^\sOR\s/i.test(text.slice(i, i + 4))) {
+      terms.push(text.slice(start, i).trim());
+      start = i + 4;
+    }
+  }
+  terms.push(text.slice(start).trim());
+  return terms;
+}
+
+/**
+ * The visibility column a read policy opens rows on by itself, as one OR term: `is_active`,
+ * `(is_public = true)`, `(status = 'published'::text)`. Only columns of this table count.
+ */
+export function visibilityFlag(using: string | undefined, columns: string[]): string | undefined {
+  if (!using) return undefined;
+  const has = new Set(columns.map((c) => c.toLowerCase()));
+  for (const term of orTerms(using)) {
+    const bare = term.replace(/^\(+|\)+$/g, "").trim();
+    const flag = bare.match(/^(?:\w+\.)?(\w+)(?:\s*=\s*true)?$/i)?.[1];
+    if (flag && VISIBILITY_COLUMN.test(flag) && has.has(flag.toLowerCase())) return flag;
+    const status = bare.match(/^(?:\w+\.)?(\w+)\s*=\s*'(\w+)'(?:::[\w ]+)?$/i);
+    if (status?.[1] && has.has(status[1].toLowerCase()) && VISIBLE_STATUS.test(status[2] ?? "")) {
+      return `${status[1]} = '${status[2]}'`;
+    }
+  }
+  return undefined;
+}
+
 /** See Proof.publicListing. Any write, membership trick or personal column keeps the full rating. */
-function publicListingOf(table: TableProbe): Pick<Proof, "publicListing"> {
+function publicListingOf(table: TableProbe): Pick<Proof, "publicListing" | "publicListingFlag"> {
   const found = leaks(table);
   if (!table.tenant || !found.length) return {};
   if (found.some((c) => c.action !== "select" || c.column || c.scenario)) return {};
@@ -57,7 +108,15 @@ function publicListingOf(table: TableProbe): Pick<Proof, "publicListing"> {
       (p.command === "select" || p.command === "all") &&
       (p.roles.includes("anon") || (p.roles.includes("public") && PUBLIC_POLICY_NAME.test(p.name))),
   );
-  return open ? { publicListing: open.name } : {};
+  if (open) return { publicListing: open.name };
+  // A policy that opens the rows marked active or published to everyone (`to public`, the default).
+  for (const p of table.policies) {
+    if (p.command !== "select" && p.command !== "all") continue;
+    if (!p.roles.includes("anon") && !p.roles.includes("public")) continue;
+    const flag = visibilityFlag(p.using, table.columns);
+    if (flag) return { publicListing: p.name, publicListingFlag: flag };
+  }
+  return {};
 }
 
 /** See Proof.anonInsertByDesign. */

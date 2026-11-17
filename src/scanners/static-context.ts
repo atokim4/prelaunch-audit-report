@@ -1,4 +1,4 @@
-import { createdTables, functionBody, statements, type SqlFile } from "../patches/sql.ts";
+import { createdTables, functionBody, functionReturns, statements, type SqlFile } from "../patches/sql.ts";
 import { phiKind } from "../phi/columns.ts";
 import type { RawFinding } from "../types.ts";
 
@@ -50,9 +50,14 @@ export function addStaticContext(raws: RawFinding[], sql: SqlFile[]): void {
     } else if (raw.rule === "storage-public-bucket") {
       const bucket = raw.message.match(/bucket `([^`]+)`/i)?.[1] ?? "";
       raw.context = { publicContentBucket: PUBLIC_CONTENT_BUCKET.test(bucket) };
-    } else if (raw.rule === "definer-function-anon" && /default grant/i.test(raw.message)) {
+    } else if (raw.rule === "definer-function-anon") {
       const body = functionBody(sql, subject);
-      if (body !== undefined) raw.context = { checksCaller: CALLER.test(body) };
+      if (body === undefined) continue;
+      const checksCaller = CALLER.test(body);
+      if (/default grant/i.test(raw.message)) raw.context = { checksCaller };
+      // Granted to anon on purpose, but it only answers yes or no about the caller: a permission helper
+      // that policies call (`auth_can_admin_org(id)`), which visitors need to be able to run.
+      else if (checksCaller && functionReturns(sql, subject) === "boolean") raw.context = { callerBoolean: true };
     }
   }
 }
@@ -60,7 +65,10 @@ export function addStaticContext(raws: RawFinding[], sql: SqlFile[]): void {
 /** Static context that lowers a finding's severity, with the sentence that says why in the report. */
 export function contextNote(raw: RawFinding): string | undefined {
   if (raw.proof?.publicListing && !raw.phi?.length && raw.live?.verdict !== "leak") {
-    return `Visitors only read these organization rows, through policy "${raw.proof.publicListing}" written for visitors, and the table has no personal or health columns: it reads as a public listing (opening hours, services, a store's products). Confirm that, and that nothing private is added to it later.`;
+    const how = raw.proof.publicListingFlag
+      ? `through policy "${raw.proof.publicListing}", which opens the rows marked \`${raw.proof.publicListingFlag}\` to everyone on purpose,`
+      : `through policy "${raw.proof.publicListing}" written for visitors,`;
+    return `Visitors only read these organization rows, ${how} and the table has no personal or health columns: it reads as a public listing (opening hours, services, a store's products). Confirm that, and that nothing private is added to it later.`;
   }
   if (raw.proof?.anonInsertByDesign && raw.live?.verdict !== "leak") {
     return "The table has no owner column and visitors may insert only the columns a `grant insert (...) to anon` lists, so anonymous writes look intended (telemetry, a contact form). Nothing can be read or changed. Anyone can still fill it with junk: add a rate limit or a check on the values.";
@@ -75,6 +83,9 @@ export function contextNote(raw: RawFinding): string | undefined {
   }
   if (raw.rule === "storage-public-bucket" && c.publicContentBucket) {
     return "The bucket's name says it holds site content (logos, CMS images). Confirm nothing uploaded by users or patients ever lands in it.";
+  }
+  if (raw.rule === "definer-function-anon" && c.callerBoolean) {
+    return "The function is granted to visitors on purpose and returns only true or false about the calling user (it reads auth.uid()): the shape of a permission helper that policies call, which visitors must be able to run. A visitor runs it with no user id. Check it answers false for a visitor and does not take another user's id as an argument to answer about them.";
   }
   if (raw.rule === "definer-function-anon" && c.checksCaller) {
     return "The function reads auth.uid() or auth.jwt(), so a visitor runs it with no user id. Check what it does in that case, and revoke anon anyway.";

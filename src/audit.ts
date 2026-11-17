@@ -2,19 +2,21 @@ import { readFile, stat } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { isGitRepo, listFiles } from "./files.ts";
 import { countBySeverity, normalize } from "./normalize.ts";
-import { leaks, lostAccess, probeRls, type ProbeResult } from "./probe/rls-probe.ts";
+import { leaks, lostAccess, probeRls, PROBE_VERSION, type ProbeResult } from "./probe/rls-probe.ts";
 import { ARCHIVED_SQL, attachPatches, fixContext, patchedMigrations } from "./patches/index.ts";
 import { runLaunchAudit } from "./scanners/launch-audit.ts";
 import { mergeLive, runLiveProbe, type LiveOptions } from "./scanners/live-probe.ts";
 import { runNpmAudit } from "./scanners/npm-audit.ts";
 import { markPhi, runPhiScan } from "./scanners/phi.ts";
 import { expressWebhookFindings } from "./scanners/express.ts";
+import { nestWebhookFindings } from "./scanners/nest.ts";
 import { filterUnverifiedWebhooks } from "./scanners/webhook-context.ts";
 import { filterPreflight, runPreflight } from "./scanners/preflight.ts";
 import { addStaticContext, dynamicRlsTables } from "./scanners/static-context.ts";
-import { probeSources } from "./probe/sources.ts";
+import { isSchemaSql, probeSources } from "./probe/sources.ts";
+import { supabaseEvidence } from "./probe/supabase-presence.ts";
 import { markAdminGates } from "./scanners/admin-gate.ts";
-import { mergeProbe, runRlsProbe, toProof } from "./scanners/rls-probe.ts";
+import { mergeProbe, runRlsProbe, TABLE_RULES, toProof } from "./scanners/rls-probe.ts";
 import { runSecretScan } from "./scanners/secrets.ts";
 import { detectShape, edgeConfigFindings } from "./shape.ts";
 import type { AuditResult, LiveResult, PhiResult, Proof, RawFinding, ToolRun } from "./types.ts";
@@ -57,6 +59,20 @@ const NO_PENTEST =
 const NO_PENTEST_LIVE =
   "Manual penetration testing: every finding here comes from automated scanners, a local probe and read-only counts on your project. Nobody tried to break in by hand.";
 
+/** The probe's entry when the SQL is not a Supabase database. */
+function notSupabaseProbe(files: number): Awaited<ReturnType<typeof runRlsProbe>> {
+  return {
+    tool: {
+      name: "rls-probe",
+      version: PROBE_VERSION,
+      command: "prelaunch-audit rls-probe",
+      status: "skipped",
+      note: `Not run: the ${files} SQL schema file(s) belong to a plain Postgres database (no supabase/ folder, no @supabase package or Supabase roles in the SQL, no Supabase host in the env examples).`,
+    },
+    note: "Who can read and change each table: the database is not a Supabase project, so its tables are not open to the browser through the Data API. Access is decided by the app's own API code, which this report does not test.",
+  };
+}
+
 async function appName(repo: string): Promise<string> {
   try {
     const pkg = JSON.parse(await readFile(join(repo, "package.json"), "utf8")) as { name?: unknown };
@@ -81,10 +97,13 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
   const ctx = await fixContext(repo, await listFiles(repo, git), now);
   const shape = await detectShape(ctx.files, ctx.read);
 
+  // SQL with no Supabase around it (Prisma or Drizzle behind the app's own server): no anon role on the
+  // wire, so the probe's "a visitor changed user A's rows" would be untrue. Skipped and said so.
+  const notSupabase = ctx.probeSql.length > 0 && !(await supabaseEvidence(ctx.files, ctx.read, ctx.schemaSql));
   const [preflight, secrets, first, deps] = await Promise.all([
     runPreflight(repo),
     runSecretScan(repo),
-    runRlsProbe(ctx.probeSql),
+    notSupabase ? Promise.resolve(notSupabaseProbe(ctx.probeSql.length)) : runRlsProbe(ctx.probeSql),
     options.npmAudit === false ? undefined : runNpmAudit(repo),
   ]);
   // supabase/migrations that build on a schema.sql (the first migration was never saved) fail alone: try
@@ -117,9 +136,32 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
   }
   const kept = await filterPreflight(preflight.findings, ctx.read, ARCHIVED_SQL);
   preflight.findings = kept.findings;
+  if (kept.notSecrets.length) {
+    notChecked.push(
+      `Browser environment variables that are on/off settings or public by design (${kept.notSecrets.map((n) => `\`${n}\``).join(", ")}): not reported as secrets. Confirm none of them ever holds a key.`,
+    );
+  }
   if (kept.archived.length) {
     notChecked.push(
       `SQL in archive folders (${kept.archived.join(", ")}): treated as old copies that no longer run. If any of them still runs, it needs a review.`,
+    );
+  }
+  // SQL that is not schema (docs/, tests/, scripts/, seeds, QA runbooks) and temporary tables: never
+  // reachable through the Data API, so table rules about them are dropped and listed.
+  const notSchema = preflight.findings.filter((f) => {
+    if (!TABLE_RULES.has(f.rule) || f.location.kind !== "file" || !f.location.file.endsWith(".sql")) return false;
+    if (!isSchemaSql(f.location.file)) return true;
+    const table = (f.subject ?? "").replace(/^public\./i, "");
+    const text = ctx.schemaSql.find((x) => x.path === (f.location.kind === "file" ? f.location.file : ""))?.text ?? "";
+    return new RegExp(
+      String.raw`create\s+(?:local\s+|global\s+)?temp(?:orary)?\s+table\s+(?:if\s+not\s+exists\s+)?(?:"?public"?\.)?"?${table.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"?[\s(]`,
+      "i",
+    ).test(text);
+  });
+  if (notSchema.length) {
+    preflight.findings = preflight.findings.filter((f) => !notSchema.includes(f));
+    notChecked.push(
+      `Tables in SQL that is not part of the schema (docs, tests, scripts, seeds) or created as temporary tables (${[...new Set(notSchema.map((f) => `\`${f.subject ?? ""}\``))].join(", ")}): not reported, since they never exist in the deployed database.`,
     );
   }
   const dynamicRls = dynamicRlsTables(ctx.schemaSql);
@@ -171,6 +213,7 @@ export async function audit(options: AuditOptions): Promise<AuditResult> {
   tools.push(probe.tool);
   raws.push(...(await edgeConfigFindings(shape, ctx.read)));
   raws.push(...(await expressWebhookFindings(ctx.files, ctx.read, preflight.findings)));
+  raws.push(...(await nestWebhookFindings(ctx.files, ctx.read)));
   const webhooks = await filterUnverifiedWebhooks(raws.splice(0), ctx.files, ctx.read);
   raws.push(...webhooks.findings);
   notChecked.push(...webhooks.notes);

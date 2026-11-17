@@ -1,0 +1,6 @@
+{
+  "name": "nest-rawbody",
+  "private": true,
+  "type": "module",
+  "dependencies": { "@nestjs/core": "11.1.0", "body-parser": "2.4.0", "stripe": "19.3.1" }
+}

@@ -7,7 +7,9 @@ import type { RawFinding } from "../types.ts";
  *   (`billingService.constructWebhookEvent(req.body, sig)`) that calls `constructEvent`;
  * - the file names Stripe events but never reads a request body (a job handler, a client-side test tool),
  *   so it is not a webhook endpoint at all.
- * Both are dropped and said in the report's "not checked" list, with the file and the helper named.
+ * - the file is another service's webhook (GitHub, Clerk) that only stores a `stripe_customer_id` column:
+ *   nothing in it handles a Stripe event.
+ * All are dropped and said in the report's "not checked" list, with the file and the helper named.
  */
 
 const VERIFIED = /\bconstructEvent(?:Async)?\s*\(/;
@@ -15,6 +17,9 @@ const READS_SIGNATURE = /stripe-signature/i;
 /** A request body being read: Express/Next pages (`req.body`), fetch-style (`await req.json()`), Hono, Lambda. */
 const READS_BODY =
   /\b(?:req|request|ctx\.request|c\.req|context\.request)\s*\.\s*(?:body\b|rawBody\b|json\s*\(|text\s*\(|arrayBuffer\s*\(|formData\s*\()|\bawait\s+\w+\.(?:json|text|arrayBuffer)\s*\(\s*\)|\bevent\.body\b|\b(?:getRawBody|rawBody|buffer)\s*\(\s*req\b/;
+/** Something that handles Stripe: the SDK, its signature header, or a Stripe event type in quotes. */
+const HANDLES_STRIPE =
+  /stripe-signature|\b(?:from\s+|require\s*\(\s*|import\s*\(\s*)["'](?:npm:|https?:\/\/[^"']*\/)?stripe(?:@[^"'/]*)?(?:\/[^"']*)?["']|\bnew\s+Stripe\s*\(|\bstripe\s*\.\s*webhooks\b|["'`](?:checkout\.session|customer\.subscription|invoice|payment_intent|charge|customer|price|product|account|payout|setup_intent)\.[a-z_.]+["'`]/i;
 const SOURCE = /\.(ts|tsx|js|jsx|mjs|cjs|mts)$/;
 const TEST = /(^|\/)(tests?|__tests__|e2e)\/|\.(test|spec)\./;
 
@@ -82,12 +87,18 @@ export async function filterUnverifiedWebhooks(
   const dropped = new Set<RawFinding>();
   const delegated: string[] = [];
   const notHandlers: string[] = [];
+  const notStripe: string[] = [];
   for (const raw of raws) {
     if (raw.rule !== "stripe-webhook-unverified" || raw.location.kind !== "file") continue;
     const file = raw.location.file;
     const text = await read(file);
     if (!text) continue;
     const code = stripComments(text);
+    if (!HANDLES_STRIPE.test(code)) {
+      dropped.add(raw);
+      notStripe.push(`\`${file}\``);
+      continue;
+    }
     if (!READS_BODY.test(code)) {
       dropped.add(raw);
       notHandlers.push(`\`${file}\``);
@@ -113,6 +124,11 @@ export async function filterUnverifiedWebhooks(
   if (notHandlers.length) {
     notes.push(
       `Files that name Stripe events but never read a request body (${notHandlers.join(", ")}): not webhook endpoints, so not reported as unverified webhooks.`,
+    );
+  }
+  if (notStripe.length) {
+    notes.push(
+      `Webhooks of other services that only mention a Stripe field (${notStripe.join(", ")}): no Stripe SDK, signature header or event type in them, so not reported as unverified Stripe webhooks. Their own signature checks were not reviewed.`,
     );
   }
   return { findings: raws.filter((r) => !dropped.has(r)), notes };

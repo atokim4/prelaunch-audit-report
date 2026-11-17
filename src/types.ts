@@ -68,6 +68,8 @@ export interface StaticContext {
   tablePersonal?: boolean;
   /** The function reads the caller's identity (auth.uid() or auth.jwt()) in its body. */
   checksCaller?: boolean;
+  /** A definer function granted to anon explicitly that returns a boolean about auth.uid(). */
+  callerBoolean?: boolean;
   /** The user-editable plan column points to a plan table with no pricing column. */
   carePlan?: boolean;
   /** The public bucket's name says it holds site content. */
@@ -206,6 +208,8 @@ export interface Proof {
    * policy. Reads as a public listing.
    */
   publicListing?: string;
+  /** The visibility column that policy opens rows on (`using (is_active or …)`), when that is why it counts. */
+  publicListingFlag?: string;
   /** No owner, and the only leak is visitors inserting through a column-limited grant (telemetry, a form). */
   anonInsertByDesign?: boolean;
   verdict: AccessVerdict;

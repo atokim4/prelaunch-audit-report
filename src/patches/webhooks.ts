@@ -1,12 +1,16 @@
 import type { Fixer, FixContext, PatchDraft } from "./fixers.ts";
+import { nestRawBodyFix } from "./nest.ts";
 import {
   JSON_PARSER,
   RAW_PARSER,
   closingBrace,
   globalJsonParsers,
   isExpressFile,
+  jsonBeforeMount,
   jsonBeforeRoute,
   stripeRoute,
+  type ExternalJsonParser,
+  type GlobalJsonParser,
 } from "../scanners/express.ts";
 
 /**
@@ -305,11 +309,21 @@ const expressName = (code: string): string | undefined =>
   code.match(/import\s+(\w+)(?:\s*,\s*\{[^}]*\})?\s+from\s+["']express["']/)?.[1] ??
   code.match(/(?:const|let|var)\s+(\w+)\s*=\s*require\(\s*["']express["']\s*\)/)?.[1];
 
+/** `app.use(express.json())` rewritten to skip one path, kept on its own lines with the file's indent. */
+const skipPath = (parser: GlobalJsonParser, fullPath: string): string =>
+  [
+    `${parser.indent}// Stripe webhooks need the raw body: JSON parsing skips that route.`,
+    `${parser.indent}${parser.object}.use((req, res, next) =>`,
+    `${parser.indent}  req.path === ${JSON.stringify(fullPath)} ? next() : ${parser.parser}(req, res, next),`,
+    `${parser.indent});`,
+  ].join("\n");
+
 /**
  * Express: the webhook route gets `express.raw({ type: "application/json" })` (replacing a route-level
  * `express.json()`), an app-wide JSON parser added earlier in the same file skips the webhook path, and
- * the handler checks the signature on the Buffer. Bails out when a JSON parser elsewhere in the repo may
- * run first, since the order then depends on code this patch cannot see.
+ * the handler checks the signature on the Buffer. `external` is an app-wide parser in the file that mounts
+ * this router (found by following the mount): that file gets the same skip. Without it, bails out when a
+ * JSON parser elsewhere in the repo may run first, since the order then depends on code it cannot see.
  */
 async function expressFix(
   path: string,
@@ -317,6 +331,7 @@ async function expressFix(
   ctx: FixContext,
   mode: "unverified" | "parsed",
   line: number,
+  external?: ExternalJsonParser,
 ): Promise<PatchDraft | undefined> {
   const route = stripeRoute(before, line);
   const express = expressName(before);
@@ -378,21 +393,14 @@ async function expressFix(
   }
 
   // 3. App-wide JSON parsers that run first: in this file they skip the webhook path; elsewhere, give up.
-  const first = jsonBeforeRoute(before, route);
-  if (first) {
+  const first = external
+    ? { parser: external.parser, fullPath: external.fullPath as string | undefined }
+    : jsonBeforeRoute(before, route);
+  if (first && !external) {
     if (!first.fullPath) return undefined;
     const { parser } = first;
-    edits.push({
-      start: parser.index,
-      end: parser.index + parser.line.length,
-      text: [
-        `${parser.indent}// Stripe webhooks need the raw body: JSON parsing skips that route.`,
-        `${parser.indent}${parser.object}.use((req, res, next) =>`,
-        `${parser.indent}  req.path === ${JSON.stringify(first.fullPath)} ? next() : ${parser.parser}(req, res, next),`,
-        `${parser.indent});`,
-      ].join("\n"),
-    });
-  } else {
+    edits.push({ start: parser.index, end: parser.index + parser.line.length, text: skipPath(parser, first.fullPath) });
+  } else if (!external) {
     // No parser in this file runs first. One in another file may (an app that mounts this router after
     // `app.use(express.json())`), and the mount order is not visible from here.
     const parsesHere = globalJsonParsers(before).length > 0;
@@ -402,21 +410,30 @@ async function expressFix(
       if (other && isExpressFile(other) && globalJsonParsers(other).length) return undefined;
     }
   }
-  if (!edits.length) return undefined;
-  const after = valueImport(afterImports(splice(before, edits), top));
+  if (!edits.length && !external) return undefined;
+  const after = edits.length ? valueImport(afterImports(splice(before, edits), top)) : before;
+  const fileEdits = after === before ? [] : [{ path, before, after }];
+  if (external) {
+    const { parser, code } = external;
+    const mounted =
+      code.slice(0, parser.index) + skipPath(parser, external.fullPath) + code.slice(parser.index + parser.line.length);
+    fileEdits.push({ path: external.file, before: code, after: mounted });
+  }
   const steps = [
     `the webhook route reads the raw body with \`${raw}\``,
     ...(first
-      ? [`\`${first.parser.object}.use(${first.parser.parser})\` skips \`${first.fullPath ?? route.path}\``]
+      ? [
+          `\`${first.parser.object}.use(${first.parser.parser})\`${external ? ` in \`${external.file}\`` : ""} skips \`${first.fullPath ?? route.path}\``,
+        ]
       : []),
     mode === "unverified"
       ? "the handler checks the stripe-signature header with `constructEvent` on that Buffer and answers 400 to unsigned or tampered requests"
       : "`constructEvent` gets the Buffer itself",
   ];
   return {
-    edits: [{ path, before, after }],
+    edits: fileEdits,
     summary:
-      `${steps.join(", ")}. A Buffer.isBuffer guard answers 500 if a parser ever runs first again, so the mistake shows up in Stripe's delivery log instead of as silent signature failures.`.replace(
+      `${steps.join(", ")}.${/Buffer\.isBuffer/.test(newBody) ? " A Buffer.isBuffer guard answers 500 if a parser ever runs first again, so the mistake shows up in Stripe's delivery log instead of as silent signature failures." : ""}`.replace(
         /^./,
         (c) => c.toUpperCase(),
       ),
@@ -591,6 +608,20 @@ export const stripeWebhookParsedBody: Fixer = async (finding, ctx) => {
   const before = await ctx.read(path);
   if (!before) return undefined;
   if (PAGES_API.test(path)) return pagesFix(path, before, "parsed");
+  if (finding.subject?.startsWith("nest-raw-body:")) return nestRawBodyFix(path, ctx);
+  // The parser sits in the file that mounts the webhook router: patch both files.
+  const routeFile = finding.subject?.startsWith("express-route:")
+    ? finding.subject.slice("express-route:".length)
+    : undefined;
+  if (routeFile) {
+    const routeCode = await ctx.read(routeFile);
+    const route = routeCode ? stripeRoute(routeCode) : undefined;
+    if (!routeCode || !route) return undefined;
+    const external = await jsonBeforeMount(ctx.files, ctx.read, routeFile, route);
+    if (external?.file !== path) return undefined;
+    const at = routeCode.slice(0, route.start).split("\n").length;
+    return expressFix(routeFile, routeCode, ctx, "parsed", at, external);
+  }
   if (isExpressFile(before)) return expressFix(path, before, ctx, "parsed", finding.location.line);
   return fetchParsedFix(path, before);
 };

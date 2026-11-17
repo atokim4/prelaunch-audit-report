@@ -78,10 +78,15 @@ function gradeSupabaseJwt(token: string): "live" | "ignore" {
   }
 }
 
-/** Placeholders in docs and .env.example files: sk_live_xxxxxxxx, sk_test_your_key_here… */
+/**
+ * Placeholders in docs and .env.example files (sk_live_xxxxxxxx, sk_test_your_key_here…) and made-up keys in
+ * tests (sk_live_51OzTestKey1234567890…, whsec_abcdef1234567890…): a run of ten digits or letters in order
+ * does not occur in a random key.
+ */
 function isPlaceholder(value: string): boolean {
   const body = value.replace(/^[a-z]+[_-](?:live_|test_|secret_|proj-|ant-)?/i, "");
   if (/x{6,}|your|example|placeholder|changeme|dummy|<|>/i.test(body)) return true;
+  if (/0123456789|1234567890|abcdefghij/i.test(body)) return true;
   return new Set(body).size < 8;
 }
 
@@ -97,15 +102,31 @@ export interface SecretHit {
   line: number;
 }
 
+/**
+ * A PEM header followed by a key body: at least 32 base64 characters before the END line, on the next lines
+ * or inside one string with escaped newlines. A header with only the word "demo" under it, in a test, is
+ * not a key.
+ */
+function hasKeyBody(text: string, after: number): boolean {
+  const end = text.indexOf("-----END", after);
+  const body = text.slice(after, end < 0 ? after + 4096 : end).replace(/\\[nr]|["'`+,\s]/g, "");
+  return /[A-Za-z0-9+/=]{32,}/.test(body);
+}
+
 export function findSecrets(text: string): SecretHit[] {
   const hits: SecretHit[] = [];
   const lines = text.split("\n");
+  let offset = 0;
   lines.forEach((lineText, index) => {
+    const lineStart = offset;
+    offset += lineText.length + 1;
     for (const pattern of PATTERNS) {
       for (const match of lineText.matchAll(pattern.regex)) {
         const value = match[0];
         const grade = pattern.grade(value);
         if (grade === "ignore" || isPlaceholder(value)) continue;
+        if (pattern.kind === "private-key" && !hasKeyBody(text, lineStart + (match.index ?? 0) + value.length))
+          continue;
         hits.push({ kind: pattern.kind, label: pattern.label, grade, value, line: index + 1 });
       }
     }
@@ -191,9 +212,21 @@ async function scanHistory(repo: string, inTree: Set<string>): Promise<RawFindin
   if (result.code !== 0) throw new Error(`git log failed: ${result.stderr.trim()}`);
   const seen = new Set<string>();
   const findings: RawFinding[] = [];
+  // Consecutive added lines of one file in one commit are scanned together, so a key block keeps its body.
+  const blocks: { commit: string; file: string; line: number; lines: string[] }[] = [];
   for (const added of addedLines(result.stdout)) {
-    if (SKIP_FILES.test(added.file)) continue;
-    for (const hit of findSecrets(added.text)) {
+    const last = blocks[blocks.length - 1];
+    if (last?.commit === added.commit && last.file === added.file && last.line + last.lines.length === added.line) {
+      last.lines.push(added.text);
+    } else {
+      blocks.push({ commit: added.commit, file: added.file, line: added.line, lines: [added.text] });
+    }
+  }
+  for (const block of blocks) {
+    if (SKIP_FILES.test(block.file)) continue;
+    const added = { ...block, text: block.lines.join("\n") };
+    for (const found of findSecrets(added.text)) {
+      const hit = { ...found, line: block.line + found.line - 1 };
       if (inTree.has(hit.value) || seen.has(hit.value)) continue;
       seen.add(hit.value);
       findings.push({
@@ -201,7 +234,7 @@ async function scanHistory(repo: string, inTree: Set<string>): Promise<RawFindin
         rule: "secret-in-history",
         toolSeverity: hit.grade,
         message: `${hit.label} (${mask(hit.value)}) added to ${added.file} in commit ${added.commit.slice(0, 7)} and no longer in the current files.`,
-        location: { kind: "file", file: added.file, line: added.line },
+        location: { kind: "file", file: added.file, line: hit.line },
         subject: `secret:${hit.value}`,
       });
     }

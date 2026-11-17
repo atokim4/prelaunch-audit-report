@@ -1,0 +1,6 @@
+{
+  "name": "express-mounted-cjs",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": { "express": "5.3.0", "stripe": "19.3.1" }
+}

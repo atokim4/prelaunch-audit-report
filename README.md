@@ -349,9 +349,17 @@ constraints or triggers reject those values is listed as "not tried"; it tests t
 `service_role`; functions called over `/rest/v1/rpc/` are checked statically, not called; and SQL in docs, seeds or a folder it
 does not recognise as schema is read statically (rules, PHI map), not run.
 
-Stripe webhooks: the Express check reads one file at a time for middleware order, so a webhook router mounted
-after an `app.use(express.json())` in another file is only caught by vibe-preflight's simpler rule (raw parser
-nowhere in the repo), and gets no patch because the order isn't visible. Handlers passed by name
+The probe only runs on a Supabase database (a `supabase/` folder, a `@supabase` package, Supabase roles or
+`auth.uid()` in the SQL, or a Supabase host in an env example). Prisma or Drizzle migrations behind the app's own
+Express or Nest server are not probed: nothing there is open to the browser through the Data API, and who reads
+a table is up to the API code, which this tool doesn't test.
+
+Stripe webhooks: the Express check follows a router one mount deep (`app.use("/webhooks", webhooksRouter)` in
+the file that has `app.use(express.json())`, through an import or an inline `require()`); longer mount chains
+are only caught by vibe-preflight's simpler rule and get no patch. On NestJS it catches one shape:
+`rawBody: true` next to body parsers the app registers itself, with a controller that reads `req.rawBody`.
+Nest middleware routes that don't match (`forRoutes("payment/(.*)")` on newer Nest), Vercel functions outside
+Next.js, and Bun's crypto with the sync `constructEvent` are not checked. Handlers passed by name
 (`app.post("/webhook", express.raw(…), handleWebhook)`) are checked only by vibe-preflight's rule on the
 handler's own file, and get no patch. A helper that verifies
 the signature is trusted after reading its source; it is not run.
@@ -390,10 +398,15 @@ the code rules. Each patch is a unified diff that applies with `git apply` from 
   route-level `express.json()`), an app-wide `express.json()` registered earlier in the same file skips the
   webhook's full path (mount path included for a router), and the handler checks the signature on the Buffer.
   A `Buffer.isBuffer` guard answers 500 if a parser ever runs first again, so it shows up in Stripe's delivery
-  log. When the JSON parser lives in another file the order isn't visible, so there is no patch, only the
-  written fix. Besides vibe-preflight's rules, the tool has its own Express check: a webhook route with no
+  log. When the JSON parser sits in the file that mounts the webhook router (server.js with the route in
+  routes/webhooks.js), that file gets the skip with the full mounted path. With the parser anywhere else the
+  order isn't visible, so there is no patch, only the written fix. Besides vibe-preflight's rules, the tool has its own Express check: a webhook route with no
   signature check in a file the scanner doesn't read as a webhook, and a correct route that an earlier
   app-wide `express.json()` empties.
+- NestJS with `rawBody: true` and its own body parsers: each JSON and raw parser the app registers gets a
+  `verify` option that keeps the bytes on `req.rawBody`, which the webhook controller already reads. Nest
+  isn't installed in the tests; a stand-in `NestFactory` gives `main.ts` a plain Express app, and the Stripe
+  package checks real signatures on what the patched parsers keep (test/nest-rawbody.test.ts).
 - Stripe webhook in Next.js pages/api: `export const config = { api: { bodyParser: false } }`, a small reader
   for the raw bytes, `constructEvent` on them; a sync handler becomes async.
 - Parsed body in a route handler or edge function: `await req.json()` becomes `await req.text()`, and when the
@@ -661,6 +674,54 @@ show the new code working on real repos.
 
 Real gaps in these repos go to their maintainers, through the channel each repo asks for, and not into this
 README.
+
+## Real Stripe webhook bugs, before and after the maintainers' fix (v0.8.1)
+
+The Express and pages/api patches above had only met fixtures, so I went looking for real broken webhooks. A
+GitHub search for Stripe's two raw-body error messages ("No signatures found matching the expected signature
+for payload", "Webhook payload must be provided as a string or a Buffer") since 2026-09-01 gave 26 issues and
+PRs. I audited the parent commit of six merged fixes and the current code of two open issues, statically, with
+nothing installed from those repos. Then I compared each patch with what the maintainers did.
+
+- Found and patched, same root cause and same fix point as the maintainers: an Express events API whose
+  `app.use(express.json())` in server.js ran before the webhooks router (the maintainers changed exactly that
+  line), and a NestJS app where `rawBody: true` did nothing next to its own body parsers (the maintainers added
+  the same `verify` option). Both needed new code: v0.8.0 missed them.
+- Found and patched, still open upstream: a booking API with the same Express shape. Someone else already has a
+  PR open for it, so I didn't send one.
+- Missed: a Vercel function outside Next.js (its fix was about how that runtime hands over the body), and a
+  NestJS middleware path that newer Nest stopped matching. Both are listed under "What it does not check".
+- Not raw-body bugs, nothing to find: a handler that crashed with a 500 on a bad signature, and one that already
+  had the fix at HEAD.
+
+The same run turned up wrong findings on those repos, which mattered more than the misses. Four of them are
+Prisma apps with no Supabase at all, and v0.8.0 ran their migrations through the Supabase probe anyway: 201
+Criticals of "a visitor without an account can change user A's rows", all wrong. Also wrong: made-up keys in a
+log-redaction test, a key header over the word "demo", a GitHub webhook read as an unverified Stripe one, and an
+on/off flag whose name ends in `_PASSWORD`.
+
+I also ran three clinic and multi-organization Supabase repos pushed the day before. v0.8.0 and the first
+v0.8.1 build agreed on them, but reading the Criticals by hand, four of the five in one repo were wrong: two
+temporary tables in a QA script under docs/, a yes/no permission helper granted to visitors on purpose, and a
+public organizer directory (`using (is_active or …)`) whose patch would have hidden it from visitors. The
+positive check had caught that patch (exit 3). The fifth, a function that tells visitors how many race places are
+left, stays for a person to judge.
+
+| Repo (commit audited)                       | v0.8.0 C/H/M/L | v0.8.1 C/H/M/L | Webhook bug found           |
+| ------------------------------------------- | -------------- | -------------- | --------------------------- |
+| Express events API (parent of fix)          | 11/0/0/0       | 0/0/1/0        | yes, patched                |
+| NestJS social app (parent of fix)           | 103/0/0/1      | 0/0/1/0        | yes, patched                |
+| Express booking API (open issue, HEAD)      | 0/0/0/1        | 0/0/1/1        | yes, patched                |
+| Next.js pages/api tasks app (parent of fix) | 83/2/0/0       | 0/1/0/0        | no raw-body bug             |
+| NestJS marketplace (parent of fix)          | 8/0/0/0        | 0/0/0/0        | no raw-body bug             |
+| NestJS form builder (parent of fix)         | 1/1/0/0        | 0/1/0/0        | missed (Nest route matcher) |
+| Vercel functions site (parent of fix)       | 0/0/0/13       | 0/0/0/13       | missed (Vercel runtime)     |
+| Express calendar API (open issue, HEAD)     | 0/0/0/0        | 0/0/0/0        | already fixed at HEAD       |
+| Supabase clinic receptionist (HEAD)         | 0/3/1/10       | 0/3/1/10       | no webhook                  |
+| Supabase dental CRM (HEAD)                  | 0/0/0/3        | 0/0/0/3        | no webhook                  |
+| Supabase multi-organization events (HEAD)   | 5/2/7/24       | 1/2/8/25       | no webhook                  |
+
+Each fix has a test with a control, and taking the fix out makes its test fail.
 
 ## Development
 

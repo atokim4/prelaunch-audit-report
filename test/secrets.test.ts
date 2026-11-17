@@ -31,6 +31,27 @@ describe("findSecrets", () => {
     expect(findSecrets(`key: ${["sk", "live", "a".repeat(28)].join("_")}`)).toEqual([]);
   });
 
+  // Real shape (CircleSfera logging-redaction.spec.ts): made-up keys to test a log redactor. Control: a
+  // random-looking key in the same file is still found.
+  // Real shape (a Firebase admin test): a key header over the word "demo". Control: a header over a body.
+  it("skips a private key header with no key body under it", () => {
+    const label = ["PRIVATE", "KEY"].join(" ");
+    const block = (body: string) => `private_key: "-----BEGIN ${label}-----\\n${body}\\n-----END ${label}-----\\n"`;
+    expect(findSecrets(block("demo"))).toEqual([]);
+    const body = ["MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", "BKcwggSjAgEAAoIBAQC7"].join("");
+    expect(findSecrets(block(body)).map((h) => h.kind)).toEqual(["private-key"]);
+  });
+
+  it("skips made-up keys with a run of digits or letters in order, keeps random ones", () => {
+    const fake = [
+      ["sk", "live", "51OzTestKey123456789012345678"].join("_"),
+      ["whsec", "abcdef1234567890abcdef1234567890"].join("_"),
+      ["rk", "test", "51OzRestrictedKey1234567890"].join("_"),
+    ];
+    expect(findSecrets(fake.map((k) => `const k = '${k}';`).join("\n"))).toEqual([]);
+    expect(findSecrets(`const k = '${stripeLive}';`).map((h) => h.grade)).toEqual(["live"]);
+  });
+
   it("reports only service_role JWTs, not anon keys or the Supabase CLI demo key", () => {
     const service = jwt({ iss: "supabase", ref: "abcdefghijklmnop", role: "service_role" });
     const anon = jwt({ iss: "supabase", ref: "abcdefghijklmnop", role: "anon" });

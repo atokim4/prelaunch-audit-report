@@ -1,0 +1,6 @@
+{
+  "name": "express-mounted-esm",
+  "private": true,
+  "type": "module",
+  "dependencies": { "express": "5.3.0", "stripe": "19.3.1" }
+}

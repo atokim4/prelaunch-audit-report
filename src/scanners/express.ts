@@ -158,6 +158,77 @@ export function jsonBeforeRoute(
   return undefined;
 }
 
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Where an import or require in `from` points, as a repo path among `files`. */
+function resolveImport(from: string, spec: string, files: Set<string>): string | undefined {
+  if (!spec.startsWith(".")) return undefined;
+  const parts = from.split("/").slice(0, -1);
+  for (const part of spec.split("/")) {
+    if (part === "..") parts.pop();
+    else if (part !== ".") parts.push(part);
+  }
+  const base = parts.join("/");
+  // TypeScript ESM imports name the emitted file: "./routes/webhooks.js" for routes/webhooks.ts.
+  const stem = base.replace(/\.[cm]?js$/, "");
+  const tries = [
+    base,
+    ...[".js", ".ts", ".mjs", ".cjs", ".mts"].map((ext) => stem + ext),
+    `${base}/index.js`,
+    `${base}/index.ts`,
+  ];
+  return tries.find((t) => files.has(t));
+}
+
+export interface ExternalJsonParser {
+  /** The file with the app-wide parser and the mount. */
+  file: string;
+  code: string;
+  parser: GlobalJsonParser;
+  /** Mount path + route path. */
+  fullPath: string;
+}
+
+/**
+ * The route's router is mounted in another file (`app.use("/webhooks", webhooksRouter)` in server.js) after
+ * an app-wide `app.use(express.json())` there: the JSON parser runs first and the route's own
+ * `express.raw()` gets nothing. Follows one level of mounting: an import binding or an inline `require()`.
+ */
+export async function jsonBeforeMount(
+  files: string[],
+  read: (path: string) => Promise<string | undefined>,
+  routeFile: string,
+  route: ExpressRoute,
+): Promise<ExternalJsonParser | undefined> {
+  const known = new Set(files);
+  for (const file of files) {
+    if (file === routeFile || !/\.(ts|js|mjs|cjs|mts)$/.test(file) || file.includes("node_modules/")) continue;
+    const code = await read(file);
+    if (!code || !isExpressFile(code)) continue;
+    const parsers = globalJsonParsers(code);
+    if (!parsers.length) continue;
+    const bindings = [
+      ...code.matchAll(/import\s+(\w+)(?:\s*,\s*\{[^}]*\})?\s+from\s+["']([^"']+)["']/g),
+      ...code.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*require\(\s*["']([^"']+)["']\s*\)/g),
+    ]
+      .filter((m) => resolveImport(file, m[2] ?? "", known) === routeFile)
+      .map((m) => escapeRegExp(m[1] ?? ""));
+    const inline = [...code.matchAll(/require\(\s*["']([^"']+)["']\s*\)/g)]
+      .filter((m) => resolveImport(file, m[1] ?? "", known) === routeFile)
+      .map((m) => escapeRegExp(m[0]));
+    for (const target of [...bindings.map((b) => String.raw`\b${b}\b`), ...inline]) {
+      const mount = new RegExp(String.raw`\b(\w+)\.use\(\s*(["'\`])([^"'\`]+)\2\s*,\s*${target}\s*\)`).exec(code);
+      if (!mount) continue;
+      const parser = parsers.find((p) => p.object === mount[1] && p.index < mount.index);
+      if (!parser) continue;
+      const fullPath =
+        `${(mount[3] ?? "").replace(/\/$/, "")}/${route.path.replace(/^\//, "")}`.replace(/\/$/, "") || "/";
+      return { file, code, parser, fullPath };
+    }
+  }
+  return undefined;
+}
+
 const lineOf = (code: string, index: number): number => code.slice(0, index).split("\n").length;
 
 /**
@@ -211,6 +282,20 @@ export async function expressWebhookFindings(
       continue;
     }
     const first = jsonBeforeRoute(code, route);
+    if (!first && !globalJsonParsers(code).length) {
+      const external = await jsonBeforeMount(files, read, file, route);
+      if (external && !flagged.has(`stripe-webhook-parsed-body|${external.file}`)) {
+        out.push({
+          source: "project-config",
+          rule: "stripe-webhook-parsed-body",
+          toolSeverity: "warning",
+          message: `\`${external.parser.object}.use(${external.parser.parser})\` in \`${external.file}\` runs before the router of \`${file}\` is mounted, so \`POST ${external.fullPath}\` gets parsed JSON instead of the raw body${RAW_PARSER.test(route.middleware) ? " (the route's own `express.raw()` then has nothing left to read)" : ""}.`,
+          location: { kind: "file", file: external.file, line: lineOf(external.code, external.parser.index) },
+          subject: `express-route:${file}`,
+        });
+      }
+      continue;
+    }
     if (first) {
       add(
         "stripe-webhook-parsed-body",
